@@ -405,6 +405,19 @@ MIGRATIONS: list[str] = [
     """,
 ]
 
+# When a company was last profiled: the newer of the explicit check stamp
+# (set on every attempt, reachable or not) and its latest profile observation
+# (written by any path, including ones that never stamp the column).
+_LAST_PROFILED_JOIN = """LEFT JOIN (
+                       SELECT company_id, MAX(observed_at) AS last_seen
+                       FROM observations WHERE collector = 'profile'
+                       GROUP BY company_id
+                   ) p ON p.company_id = c.id"""
+_LAST_PROFILED = (
+    "(CASE WHEN p.last_seen IS NULL OR c.profile_checked_at > p.last_seen"
+    " THEN c.profile_checked_at ELSE p.last_seen END)"
+)
+
 # Column whitelists for dynamic UPDATEs (prevents SQL injection via kwargs).
 _CAMPAIGN_COLUMNS = frozenset({
     "name", "channel", "instantly_campaign_id",
@@ -1179,7 +1192,8 @@ class StateManager:
         of retrying the same top-N-by-created_at companies every cycle.
         ``profile_checked_at`` is set on every attempt regardless of outcome
         (see ProfileCollector.run), so an unreachable site still counts as
-        checked and rotates out instead of being retried forever.
+        checked and rotates out instead of being retried forever. A profile
+        observation written any other way still counts too, whichever is newer.
 
         Businesses with no domain are excluded — there is no site to read.
         They are not a failure, they are the NO_WEBSITE cohort.
@@ -1187,12 +1201,13 @@ class StateManager:
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
-                """SELECT c.id, c.name, c.domain
+                f"""SELECT c.id, c.name, c.domain
                    FROM companies c
+                   {_LAST_PROFILED_JOIN}
                    WHERE c.domain != ''
-                     AND (c.profile_checked_at IS NULL
-                          OR c.profile_checked_at < datetime('now', ?))
-                   ORDER BY c.profile_checked_at IS NOT NULL, c.profile_checked_at
+                     AND ({_LAST_PROFILED} IS NULL
+                          OR {_LAST_PROFILED} < datetime('now', ?))
+                   ORDER BY {_LAST_PROFILED} IS NOT NULL, {_LAST_PROFILED}
                    LIMIT ?""",
                 (f"-{int(stale_days)} days", int(limit)),
             ) as cursor:
@@ -1201,10 +1216,11 @@ class StateManager:
     async def count_companies_needing_profile(self, stale_days: int = 90) -> int:
         async with self._connect() as db:
             async with db.execute(
-                """SELECT COUNT(*) FROM companies c
+                f"""SELECT COUNT(*) FROM companies c
+                   {_LAST_PROFILED_JOIN}
                    WHERE c.domain != ''
-                     AND (c.profile_checked_at IS NULL
-                          OR c.profile_checked_at < datetime('now', ?))""",
+                     AND ({_LAST_PROFILED} IS NULL
+                          OR {_LAST_PROFILED} < datetime('now', ?))""",
                 (f"-{int(stale_days)} days",),
             ) as cursor:
                 row = await cursor.fetchone()
