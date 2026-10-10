@@ -25,6 +25,7 @@ import os
 import random
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Optional
 
 import dns.resolver
@@ -230,6 +231,55 @@ def _hunter_api_key() -> str:
     return os.getenv("HUNTER_API_KEY", "").strip()
 
 
+# Hunter's free tier is 25 domain-searches/month for the whole account, and
+# every call spends one no matter how many people it returns. Paid plans set
+# HUNTER_MONTHLY_SEARCHES to their own allowance. Every domain-search call in
+# Harvey draws from this one counter, so the pattern lookup and Scout's
+# named-contact strategy can't each assume they have the full quota.
+HUNTER_FREE_MONTHLY_SEARCHES = 25
+
+
+def _hunter_monthly_cap() -> int:
+    raw = os.getenv("HUNTER_MONTHLY_SEARCHES", "").strip()
+    if not raw:
+        return HUNTER_FREE_MONTHLY_SEARCHES
+    try:
+        return max(int(raw), 0)
+    except ValueError:
+        return HUNTER_FREE_MONTHLY_SEARCHES
+
+
+def _hunter_usage_key() -> str:
+    return f"hunter_domain_search_count:{datetime.now(timezone.utc):%Y-%m}"
+
+
+async def hunter_searches_remaining(state) -> int:
+    """Domain-searches left this calendar month (UTC). Without a state
+    store there is nothing to count against, so the full cap is reported."""
+    cap = _hunter_monthly_cap()
+    if state is None:
+        return cap
+    try:
+        used = int(await state.get_setting(_hunter_usage_key(), "0") or "0")
+    except (ValueError, TypeError):
+        used = 0
+    except Exception as e:
+        logger.debug(f"Hunter usage read failed: {e}")
+        return 0
+    return max(cap - used, 0)
+
+
+async def record_hunter_search(state) -> None:
+    """Count one domain-search against this month's budget. Called before
+    the request, so a call that fails mid-flight is still counted."""
+    if state is None:
+        return
+    try:
+        await state.increment_setting(_hunter_usage_key())
+    except Exception as e:
+        logger.debug(f"Hunter usage write failed: {e}")
+
+
 async def hunter_domain_people(
     domain: str, api_key: str, limit: int = 10
 ) -> Optional[list[dict]]:
@@ -238,9 +288,9 @@ async def hunter_domain_people(
     and its own verification verdict). Returns the raw ``emails`` list, or
     None on any failure (network, non-200, bad JSON, or no data).
 
-    Costs one domain-search credit per call regardless of ``limit`` — the
-    free tier is 25/month, so callers must budget calls, not rely on this
-    failing gracefully to protect the quota.
+    Costs one domain-search credit per call regardless of ``limit``, so
+    callers must check hunter_searches_remaining() and record_hunter_search()
+    first rather than rely on this failing gracefully to protect the quota.
     """
     try:
         async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
@@ -290,7 +340,8 @@ async def derive_pattern(
                 return inferred, "known_email", 0.9
 
     key = _hunter_api_key()
-    if key:
+    if key and await hunter_searches_remaining(state) > 0:
+        await record_hunter_search(state)
         result = await _hunter_domain_pattern(domain, key)
         if result:
             return result[0], "hunter_domain_search", result[1]

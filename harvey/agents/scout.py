@@ -59,12 +59,10 @@ MAX_RESULTS_PER_QUERY = 20
 MAX_COMPANIES_PER_CYCLE = 10
 MAX_PROSPECTS_PER_CYCLE = 25
 
-# Hunter's free tier is 25 domain-searches/month total, and each call costs
-# a credit regardless of how many people it returns — a heartbeat running
-# every 15 minutes would blow through that in under an hour uncapped, so
-# usage is tracked explicitly (see _prospect_via_hunter) rather than trusted
-# to fail gracefully once exhausted.
-HUNTER_MONTHLY_CAP = 25
+# Hunter domain-searches per heartbeat. The monthly budget itself is shared
+# with email-pattern lookups and set by HUNTER_MONTHLY_SEARCHES (see
+# integrations/email_finder.py); this just paces it, since a heartbeat every
+# 15 minutes would spend a free-tier month in a few hours otherwise.
 HUNTER_DOMAINS_PER_CYCLE = 1
 
 # Rotate a small pool of realistic desktop user-agents. Scrapers that always
@@ -134,8 +132,8 @@ class Scout:
         strategies = []
         # Hunter first, if configured: real named people with a real
         # verification verdict beats a scrape guess, but the free tier's
-        # 25/month cap means it only ever covers a handful of companies —
-        # self-skips once the monthly quota (tracked in settings) is spent.
+        # monthly budget (HUNTER_MONTHLY_SEARCHES, 25 by default) is small —
+        # self-skips once it's spent.
         strategies.append(("hunter", self._prospect_via_hunter))
         # Backfill next: companies already on file (e.g. from `harvey
         # discover`) but with zero prospects. Scrapes each company's own
@@ -484,21 +482,18 @@ class Scout:
         """Pull Hunter's actual named-people data for companies with zero
         prospects — real name/title/email/verification, not a scrape guess.
 
-        Hunter's free tier is 25 domain-searches/month for the whole
-        account, so this draws from the same rotating pool as the team-page
-        backfill but at a much smaller, explicitly quota-tracked pace.
+        Draws from the same rotating pool as the team-page backfill, but at
+        a much smaller pace and against the shared monthly Hunter budget.
         """
         api_key = getattr(self.env, "hunter_api_key", "") or ""
         if not api_key:
             return 0
 
-        month_key = datetime.now(timezone.utc).strftime("%Y-%m")
-        setting_key = f"hunter_domain_search_count:{month_key}"
-        try:
-            used = int(await self.state.get_setting(setting_key, "0") or "0")
-        except ValueError:
-            used = 0
-        remaining = HUNTER_MONTHLY_CAP - used
+        from harvey.integrations.email_finder import (
+            hunter_domain_people, hunter_searches_remaining, record_hunter_search,
+        )
+
+        remaining = await hunter_searches_remaining(self.state)
         if remaining <= 0:
             return 0
 
@@ -511,8 +506,6 @@ class Scout:
         if not companies:
             return 0
 
-        from harvey.integrations.email_finder import hunter_domain_people
-
         default_industry = (
             self.config.icp.industries[0] if self.config.icp.industries else ""
         )
@@ -522,12 +515,10 @@ class Scout:
             if not domain:
                 continue
 
+            if await hunter_searches_remaining(self.state) <= 0:
+                break
+            await record_hunter_search(self.state)
             people = await hunter_domain_people(domain, api_key)
-            used += 1
-            try:
-                await self.state.set_setting(setting_key, str(used))
-            except Exception as e:
-                logger.debug(f"set_setting failed for {setting_key}: {e}")
             try:
                 await self.state.mark_prospects_checked(company["id"])
             except Exception as e:
@@ -574,9 +565,6 @@ class Scout:
                 )
                 if count >= MAX_PROSPECTS_PER_CYCLE:
                     return count
-
-            if used >= HUNTER_MONTHLY_CAP:
-                break
 
         return count
 
