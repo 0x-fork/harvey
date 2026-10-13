@@ -195,6 +195,32 @@ def test_dashboard_serves_its_files(client):
     assert client.get("/static/app.js").status_code == 200
 
 
+@pytest.mark.parametrize("filename, url, media_type", [
+    ("index.html", "/", "text/html"),
+    ("app.css", "/static/app.css", "text/css"),
+    ("app.js", "/static/app.js", "text/javascript"),
+    ("icon.svg", "/static/icon.svg", "image/svg+xml"),
+])
+def test_dashboard_text_is_utf8_with_windows_default_encoding(
+    client, monkeypatch, tmp_path, filename, url, media_type,
+):
+    """UTF-8 assets must survive a CP1252 host without crashes or mojibake."""
+    content = "/* ═ café — 日本語 */"
+    (tmp_path / filename).write_bytes(content.encode("utf-8"))
+    monkeypatch.setattr(dash, "WEB_DIR", tmp_path)
+    read_text = Path.read_text
+
+    def windows_read_text(path, encoding=None, errors=None, **kwargs):
+        return read_text(path, encoding=encoding or "cp1252", errors=errors, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", windows_read_text)
+    response = client.get(url)
+    assert response.status_code == 200
+    assert response.text == content
+    assert response.content == content.encode("utf-8")
+    assert response.headers["content-type"].startswith(media_type)
+
+
 def test_static_route_refuses_to_escape_the_web_directory(client):
     assert client.get("/static/..%2f..%2fharvey.yaml").status_code == 404
     assert client.get("/static/nope.css").status_code == 404

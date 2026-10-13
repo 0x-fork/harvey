@@ -1317,7 +1317,7 @@ async def static_file(path: str):
             headers={"Cache-Control": "public, max-age=604800"},
         )
     return PlainTextResponse(
-        target.read_text(),
+        target.read_text(encoding="utf-8"),
         media_type=TEXT_TYPES.get(target.suffix, "text/plain"),
         headers={"Cache-Control": "no-store"},
     )
@@ -1325,7 +1325,7 @@ async def static_file(path: str):
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
-    return (WEB_DIR / "index.html").read_text()
+    return (WEB_DIR / "index.html").read_text(encoding="utf-8")
 
 
 def start_dashboard(host: str = "127.0.0.1", port: int = 5555):
