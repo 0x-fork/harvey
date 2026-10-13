@@ -403,7 +403,20 @@ MIGRATIONS: list[str] = [
         SELECT DISTINCT company_id FROM observations WHERE collector = 'profile'
     );
     """,
+    # ── v11: which subscription each call ran on (claude | codex) ──
+    """
+    -- Every row before this migration was a Claude call.
+    ALTER TABLE usage_events ADD COLUMN provider TEXT DEFAULT 'claude';
+    CREATE INDEX IF NOT EXISTS idx_usage_events_provider ON usage_events(provider);
+
+    -- claude_calls keeps meaning Claude calls; Codex calls count separately
+    -- so one subscription's budget never consumes the other's.
+    ALTER TABLE usage_log ADD COLUMN codex_calls INTEGER DEFAULT 0;
+    """,
 ]
+
+BRAIN_PROVIDERS = ("claude", "codex")
+_USAGE_LOG_COLUMN = {"claude": "claude_calls", "codex": "codex_calls"}
 
 # When a company was last profiled: the newer of the explicit check stamp
 # (set on every attempt, reachable or not) and its latest profile observation
@@ -1638,22 +1651,25 @@ class StateManager:
 
     # ── Usage Tracking ──
 
-    async def get_usage_today(self) -> int:
+    async def get_usage_today(self, provider: str = "claude") -> int:
+        """Brain calls made today on one provider's subscription."""
+        column = _USAGE_LOG_COLUMN[provider]
         today = date.today().isoformat()
         async with self._connect() as db:
             async with db.execute(
-                "SELECT claude_calls FROM usage_log WHERE date = ?", (today,)
+                f"SELECT {column} FROM usage_log WHERE date = ?", (today,)
             ) as cursor:
                 row = await cursor.fetchone()
-                return row[0] if row else 0
+                return (row[0] or 0) if row else 0
 
-    async def increment_usage(self):
+    async def increment_usage(self, provider: str = "claude"):
+        column = _USAGE_LOG_COLUMN[provider]
         today = date.today().isoformat()
         async with self._connect() as db:
             await db.execute(
-                """INSERT INTO usage_log (id, date, claude_calls)
+                f"""INSERT INTO usage_log (id, date, {column})
                    VALUES (?, ?, 1)
-                   ON CONFLICT(date) DO UPDATE SET claude_calls = claude_calls + 1""",
+                   ON CONFLICT(date) DO UPDATE SET {column} = {column} + 1""",
                 (_new_id(), today),
             )
             await db.commit()
@@ -1678,27 +1694,30 @@ class StateManager:
         is_error: bool = False,
         source: str = "result_json",
         created_at: str | None = None,
+        provider: str = "claude",
     ) -> bool:
-        """Insert one usage row (one model within one Claude call).
+        """Insert one usage row (one model within one brain call).
 
         Returns False when the row was skipped as a duplicate (request_key
         uniqueness makes transcript reconciliation idempotent).
         """
+        if provider not in BRAIN_PROVIDERS:
+            raise ValueError(f"unknown brain provider: {provider!r}")
         async with self._connect() as db:
             cursor = await db.execute(
                 """INSERT OR IGNORE INTO usage_events
                    (id, created_at, agent, task, session_id, request_key, model,
                     input_tokens, output_tokens, cache_read_tokens,
                     cache_creation_tokens, cost_usd, duration_ms, num_turns,
-                    is_error, source)
+                    is_error, source, provider)
                    VALUES (?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?, ?,
-                           ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     _new_id(), created_at, agent, task, session_id, request_key,
                     model, int(input_tokens or 0), int(output_tokens or 0),
                     int(cache_read_tokens or 0), int(cache_creation_tokens or 0),
                     float(cost_usd or 0.0), int(duration_ms or 0),
-                    int(num_turns or 0), 1 if is_error else 0, source,
+                    int(num_turns or 0), 1 if is_error else 0, source, provider,
                 ),
             )
             await db.commit()
@@ -1750,6 +1769,9 @@ class StateManager:
             "CASE WHEN model = '' THEN 'unknown' ELSE model END", "model", days
         )
 
+    async def usage_by_provider(self, days: int = 30) -> list[dict]:
+        return await self._usage_grouped("provider", "provider", days)
+
     async def usage_by_day(self, days: int = 30) -> list[dict]:
         sql = (
             f"SELECT date(created_at) AS day, {self._USAGE_SUM} "
@@ -1799,17 +1821,19 @@ class StateManager:
             ) as cursor:
                 open_conversations = (await cursor.fetchone())[0]
             async with db.execute(
-                "SELECT claude_calls FROM usage_log WHERE date = ?", (today,)
+                "SELECT claude_calls, codex_calls FROM usage_log WHERE date = ?", (today,)
             ) as cursor:
                 usage_row = await cursor.fetchone()
-                usage_today = usage_row[0] if usage_row else 0
+                usage_today = (usage_row[0] or 0) if usage_row else 0
+                codex_today = (usage_row[1] or 0) if usage_row else 0
 
         return {
             "prospects": prospect_counts,
             "draft_campaigns": draft_campaigns,
             "active_campaigns": active_campaigns,
             "open_conversations": open_conversations,
-            "usage_today": usage_today,
+            "usage_today": usage_today,  # Claude calls (kept for compatibility)
+            "usage_today_by_provider": {"claude": usage_today, "codex": codex_today},
             # Companies discovered but not yet read. The heartbeat profiles
             # these every cycle — it is free, so it never competes with the
             # Claude budget the rest of the loop is rationing.

@@ -1,4 +1,4 @@
-"""Interactive setup wizard — Claude walks you through everything Harvey needs."""
+"""Interactive setup wizard — walks you through everything Harvey needs."""
 
 import asyncio
 import getpass
@@ -8,7 +8,10 @@ from pathlib import Path
 
 import yaml
 
+from pydantic import ValidationError
+
 from harvey.brain import Brain
+from harvey.config import BrainConfig
 from harvey.state import StateManager
 
 logger = logging.getLogger("harvey.setup")
@@ -69,13 +72,50 @@ def _check_claude_cli() -> bool:
     return shutil.which("claude") is not None
 
 
+def _check_codex_cli() -> bool:
+    """Check if Codex CLI is installed and accessible."""
+    return shutil.which("codex") is not None
+
+
 async def _test_claude(brain: Brain) -> bool:
-    """Test that Claude Code headless mode works."""
+    """Test that the configured brain answers (Claude or Codex)."""
     response = await brain.think(
         "Respond with exactly: HARVEY_READY",
         session_id="harvey-setup-test",
     )
     return "HARVEY_READY" in response
+
+
+def _ask_brain_config() -> BrainConfig:
+    """Ask which subscription Harvey thinks with. Claude is the default."""
+    _print_harvey("I think with an AI subscription you already pay for:")
+    print("    claude — your Claude plan, via Claude Code (default)")
+    print("    codex  — your ChatGPT plan, via the Codex CLI")
+    while True:
+        provider = _ask("Which one? (claude/codex)", default="claude").lower()
+        if provider == "codex":
+            from harvey.codex import CodexError, require_supported_platform
+            try:
+                require_supported_platform()
+            except CodexError as e:
+                print(f"    ({e})")
+                continue
+        if provider in ("claude", "codex"):
+            break
+        print("    (type claude or codex)")
+    if provider == "codex":
+        from harvey.codex import SUGGESTED_MODEL
+        print(f"    {SUGGESTED_MODEL} is the Codex model Harvey has verified as text-only")
+        print("    (no code-execution tools). Press Enter to use it, or type another.")
+    while True:
+        if provider == "codex":
+            model = _ask("Model", default=SUGGESTED_MODEL, required=False)
+        else:
+            model = _ask("Model (leave blank for the default)", required=False)
+        try:
+            return BrainConfig(provider=provider, model=model)
+        except ValidationError:
+            print("    (that doesn't look like a model name — try again or leave blank)")
 
 
 async def _test_instantly(api_key: str) -> bool:
@@ -96,6 +136,7 @@ class SetupWizard:
     def __init__(self):
         self.env_vars: dict[str, str] = {}
         self.config: dict = {}
+        self.brain_config = BrainConfig()
 
     async def run(self):
         """Run the full interactive setup."""
@@ -145,7 +186,14 @@ class SetupWizard:
         await self._print_summary()
 
     async def _check_prerequisites(self):
-        """Verify Claude CLI is installed and working."""
+        """Pick the brain provider and verify its CLI is installed and working."""
+        self.brain_config = _ask_brain_config()
+        if self.brain_config.provider == "codex":
+            await self._check_codex()
+        else:
+            await self._check_claude()
+
+    async def _check_claude(self):
         # Check Claude CLI
         print("\n  Checking Claude Code CLI...", end=" ")
         if _check_claude_cli():
@@ -162,7 +210,7 @@ class SetupWizard:
         print("  Testing Claude headless mode...", end=" ", flush=True)
         state = StateManager()
         await state.init_db()
-        brain = Brain(state)
+        brain = Brain(state, self.brain_config)
         if await _test_claude(brain):
             print("✓ Working")
         else:
@@ -172,7 +220,58 @@ class SetupWizard:
             print("\n         Also verify your Max subscription is active.")
             if not _ask_yes_no("Continue anyway?", default=False):
                 raise SystemExit(1)
+        self._check_python_packages()
 
+    async def _check_codex(self):
+        from harvey.codex import (
+            CODEX_INSTALL_HINT, CodexError, check_cli_version, check_native_auth,
+        )
+
+        print("\n  Checking Codex CLI...", end=" ")
+        if _check_codex_cli():
+            print("✓ Found")
+        else:
+            print("✗ Not found")
+            _print_harvey("I need the Codex CLI to think with your ChatGPT plan:")
+            print(f"         {CODEX_INSTALL_HINT}")
+            print("\n         Then run 'codex login', choose 'Sign in with ChatGPT',")
+            print("         and re-run this setup.")
+            raise SystemExit(1)
+
+        print("  Checking Codex CLI version...", end=" ")
+        try:
+            print(f"✓ {check_cli_version()}")
+        except CodexError as e:
+            print("✗ Not supported")
+            _print_harvey(str(e))
+            raise SystemExit(1)
+
+        print("  Checking Codex ChatGPT login...", end=" ")
+        try:
+            check_native_auth()
+            print("✓ Found")
+        except CodexError as e:
+            print("✗ Not ready")
+            _print_harvey(str(e))
+            raise SystemExit(1)
+
+        # A real (subscription, not API-billed) call through the same
+        # isolated runtime Harvey uses for every prompt.
+        print("  Testing Codex (isolated, no tools)...", end=" ", flush=True)
+        state = StateManager()
+        await state.init_db()
+        brain = Brain(state, self.brain_config)
+        if await _test_claude(brain):
+            print("✓ Working")
+        else:
+            print("✗ Failed")
+            _print_harvey("Codex is installed but the test call failed. The log")
+            _print_harvey("above says why (login, plan limits, or isolation).")
+            if not _ask_yes_no("Continue anyway?", default=False):
+                raise SystemExit(1)
+        self._check_python_packages()
+
+    def _check_python_packages(self):
         # Check Python packages
         print("  Checking Python dependencies...", end=" ")
         missing = []
@@ -283,7 +382,7 @@ class SetupWizard:
             _print_harvey("and learn everything I can about your product.\n")
 
             from harvey.trainer import Trainer
-            trainer = Trainer()
+            trainer = Trainer(brain_config=self.brain_config)
             self.config = await trainer.train(url, str(CONFIG_FILE)) or {}
 
             if self.config:
@@ -520,6 +619,10 @@ class SetupWizard:
 
     def _write_config(self):
         """Write harvey.yaml (only if we have manual config — trainer writes its own)."""
+        from harvey.trainer import brain_section
+
+        if self.config:
+            self.config["brain"] = brain_section(self.brain_config)
         if self.config and not CONFIG_FILE.exists():
             with open(CONFIG_FILE, "w") as f:
                 yaml.dump(self.config, f, default_flow_style=False, sort_keys=False)
@@ -530,6 +633,7 @@ class SetupWizard:
                 with open(CONFIG_FILE) as f:
                     existing = yaml.safe_load(f) or {}
                 existing["usage"] = self.config.get("usage", existing.get("usage", {}))
+                existing["brain"] = self.config["brain"]
                 if "channels" in self.config:
                     existing.setdefault("channels", {})
                     if "email" in self.config["channels"]:
@@ -554,7 +658,9 @@ class SetupWizard:
 
         # Show what's configured
         checks = {
-            "Claude Code CLI": _check_claude_cli(),
+            ("Codex CLI (ChatGPT plan)" if self.brain_config.provider == "codex"
+             else "Claude Code CLI"): (_check_codex_cli() if self.brain_config.provider == "codex"
+                                      else _check_claude_cli()),
             "Instantly API": bool(self.env_vars.get("INSTANTLY_API_KEY")),
             "LinkedIn": bool(self.env_vars.get("LINKEDIN_EMAIL")),
             "Cloudflare Crawl": bool(self.env_vars.get("CLOUDFLARE_ACCOUNT_ID")),

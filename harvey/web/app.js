@@ -882,8 +882,24 @@ async function loadStats() {
     card('Prospects', p.total || 0, chips(p.by_status)) +
     card('Campaigns', c.total || 0, chips(c.by_status)) +
     card('Conversations', v.total || 0, chips(v.by_status)) +
-    card('Actions Logged', data.actions_total || 0,
-      '<span class="chip">Claude calls today <b>' + escHtml(String(data.claude_calls_today || 0)) + '</b></span>');
+    card('Actions Logged', data.actions_total || 0, brainCallChips(data));
+}
+
+// Calls today per subscription — each labelled with the provider it ran on.
+function brainCallChips(data) {
+  const chip = (label, n) => '<span class="chip">' + label + ' calls today <b>' + escHtml(String(n || 0)) + '</b></span>';
+  const codex = data.codex_calls_today || 0;
+  const st = data.brain_status || {};
+  // A paused brain must not look healthy: say so, and why.
+  const paused = st.status === 'paused'
+    ? '<span class="chip" title="' + escHtml(st.reason || '') + '">' +
+      escHtml(st.provider === 'codex' ? 'Codex' : 'Brain') + ' <b>paused</b>: ' +
+      escHtml((st.reason || '').slice(0, 120)) + '</span>'
+    : '';
+  if (data.brain_provider === 'codex') {
+    return paused + chip('Codex', codex) + (data.claude_calls_today ? chip('Claude', data.claude_calls_today) : '');
+  }
+  return paused + chip('Claude', data.claude_calls_today) + (codex ? chip('Codex', codex) : '');
 }
 
 function fmtTokens(n) {
@@ -904,33 +920,46 @@ function emailTag(p) {
   return ' <span class="badge t-' + m.tone + '" style="margin-left:6px">' + escHtml(m.label) + '</span>';
 }
 
+// Quota gauges for the ACTIVE provider only: Claude's are the numbers
+// `/usage` shows in Claude Code; Codex's are the ChatGPT plan's limits.
+// When they can't be read, say so rather than hiding the card.
+function quotaCardHtml(data) {
+  const provider = data && data.quota_provider;
+  if (!provider) return '';
+  const title = provider === 'codex' ? 'Codex (ChatGPT plan) Quota' : 'Claude Subscription Quota';
+  let html = '<h2>' + escHtml(title) + '</h2>';
+  if (!data.quota || !Object.keys(data.quota).length) {
+    const why = provider === 'codex'
+      ? "Quota unavailable: Harvey couldn't read your ChatGPT plan's limits (check codex login, the Codex CLI version, and network)."
+      : "Quota unavailable: Harvey couldn't read your Claude subscription's limits (check claude login and network).";
+    return html + '<p class="muted">' + escHtml(why) + ' Until it can, budgets count Harvey\'s own calls.</p>';
+  }
+  const labels = {five_hour: '5-hour window', seven_day: 'Weekly', primary: 'Primary window',
+                  secondary: 'Secondary window', limit_reached: 'Usage limit reached'};
+  for (const [key, w] of Object.entries(data.quota)) {
+    const pct = Math.min(100, Math.max(0, w.utilization || 0));
+    const color = pct >= 80 ? 'yellow' : 'green';
+    const resets = w.resets_at ? 'resets ' + formatDate(w.resets_at) : '';
+    html += '<div class="progress-wrap">' +
+      '<div class="progress-label">' +
+        '<span class="text">' + escHtml(labels[key] || key) + (resets ? ' &middot; ' + escHtml(resets) : '') + '</span>' +
+        '<span class="pct">' + pct.toFixed(0) + '%</span>' +
+      '</div>' +
+      '<div class="progress-bar"><div class="progress-fill ' + color + '" style="width:' + pct + '%"></div></div>' +
+    '</div>';
+  }
+  return html;
+}
+
 async function loadUsage() {
   const data = await api('/api/usage');
   const statsEl = document.getElementById('usage-stats');
   if (!data) { statsEl.innerHTML = offlineState(); return; }
 
-  // Quota gauges — the same numbers `/usage` shows in Claude Code.
   const quotaEl = document.getElementById('usage-quota');
-  if (data.quota && Object.keys(data.quota).length) {
-    const labels = {five_hour: '5-hour window', seven_day: 'Weekly'};
-    let qHtml = '<h2>Claude Subscription Quota</h2>';
-    for (const [key, w] of Object.entries(data.quota)) {
-      const pct = Math.min(100, Math.max(0, w.utilization || 0));
-      const color = pct >= 80 ? 'yellow' : 'green';
-      const resets = w.resets_at ? 'resets ' + formatDate(w.resets_at) : '';
-      qHtml += '<div class="progress-wrap">' +
-        '<div class="progress-label">' +
-          '<span class="text">' + escHtml(labels[key] || key) + (resets ? ' &middot; ' + escHtml(resets) : '') + '</span>' +
-          '<span class="pct">' + pct.toFixed(0) + '%</span>' +
-        '</div>' +
-        '<div class="progress-bar"><div class="progress-fill ' + color + '" style="width:' + pct + '%"></div></div>' +
-      '</div>';
-    }
-    quotaEl.innerHTML = qHtml;
-    quotaEl.style.display = 'block';
-  } else {
-    quotaEl.style.display = 'none';
-  }
+  const qHtml = quotaCardHtml(data);
+  quotaEl.innerHTML = qHtml;
+  quotaEl.style.display = qHtml ? 'block' : 'none';
 
   // Totals cards — usage-first (calls is the headline; tokens as chips).
   // No dollars: on a subscription plan usage isn't billed per token.
@@ -991,9 +1020,12 @@ async function loadUsage() {
   const anyRows = (data.by_agent || []).length || (data.by_task || []).length;
   if (!anyRows) {
     tablesEl.innerHTML = emptyState('&#9680;', 'No usage recorded yet',
-      'Once Harvey starts making Claude calls, every one is logged here with exact calls and tokens by agent and task. Run <b>harvey usage --reconcile</b> to backfill from Claude Code transcripts.');
+      'Once Harvey starts making model calls (Claude or Codex), every one is logged here with exact calls and tokens by provider, agent and task.');
   } else {
+    const providers = data.by_provider || [];
+    const showProviders = providers.length > 1 || (providers.length === 1 && providers[0].provider !== 'claude');
     tablesEl.innerHTML =
+      (showProviders ? table('By Provider (30 days)', providers, 'Provider') : '') +
       table('By Agent (30 days)', data.by_agent, 'Agent') +
       table('By Task (30 days)', data.by_task, 'Task') +
       table('By Model (30 days)', data.by_model, 'Model');

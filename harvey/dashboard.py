@@ -550,9 +550,10 @@ async def get_stats():
         action_count = actions[0]["count"] if actions else 0
 
         usage = await query_db(
-            "SELECT claude_calls FROM usage_log WHERE date = date('now')"
+            "SELECT claude_calls, codex_calls FROM usage_log WHERE date = date('now')"
         )
-        usage_today = usage[0]["claude_calls"] if usage else 0
+        usage_today = (usage[0]["claude_calls"] or 0) if usage else 0
+        codex_today = (usage[0]["codex_calls"] or 0) if usage else 0
 
         return {
             "prospects": {"total": prospect_total, "by_status": prospect_map},
@@ -560,6 +561,9 @@ async def get_stats():
             "conversations": {"total": sum(convo_map.values()), "by_status": convo_map},
             "actions_total": action_count,
             "claude_calls_today": usage_today,
+            "codex_calls_today": codex_today,
+            "brain_provider": _active_provider(),
+            "brain_status": await _brain_status(),
         }
     except Exception as e:
         return {"error": str(e)}
@@ -574,13 +578,53 @@ _USAGE_SUM = (
     "ROUND(COALESCE(SUM(cost_usd), 0), 4) AS cost_usd"
 )
 
-_quota_client = None
+_quota_clients: dict = {}
+
+
+def _active_brain():
+    """The brain config harvey.yaml selects (None if unreadable)."""
+    try:
+        from harvey.config import load_brain_config
+        return load_brain_config()
+    except Exception:
+        return None
+
+
+async def _brain_status() -> dict:
+    """Last recorded brain health transition ({} if none): lets the
+    dashboard say "Codex paused: <why>" instead of looking healthy."""
+    from harvey.brain import BRAIN_STATUS_KEY, active_brain_status
+    rows = await query_db("SELECT value FROM settings WHERE key = ?", (BRAIN_STATUS_KEY,))
+    # Only the configured provider's health (a stale Codex pause isn't
+    # Claude's).
+    return active_brain_status(rows[0]["value"], _active_provider()) if rows else {}
+
+
+def _active_provider() -> str:
+    brain = _active_brain()
+    return brain.provider if brain else ""
+
+
+def _quota_client_for(provider: str, model: str = ""):
+    """One cached quota reader per provider (and Codex model). Each reads
+    only its own subscription, so a Claude gauge is never shown as Codex or
+    vice versa, and Codex shows the bucket metering the configured model."""
+    key = (provider, model if provider == "codex" else "")
+    if key not in _quota_clients:
+        if provider == "codex":
+            from harvey.codex import CodexClient, CodexQuotaClient
+            _quota_clients[key] = CodexQuotaClient(CodexClient(model=model))
+        elif provider == "claude":
+            from harvey.integrations.quota import QuotaClient
+            _quota_clients[key] = QuotaClient()
+        else:
+            return None
+    return _quota_clients[key]
 
 
 @app.get("/api/usage")
 async def get_usage():
     """Token/cost accounting + live subscription quota for the Usage tab."""
-    global _quota_client
 
     totals = {}
     for label, where in (
@@ -601,23 +645,31 @@ async def get_usage():
     by_agent = await query_db(grouped("CASE WHEN agent = '' THEN 'other' ELSE agent END", "agent"))
     by_task = await query_db(grouped("CASE WHEN task = '' THEN 'other' ELSE task END", "task"))
     by_model = await query_db(grouped("CASE WHEN model = '' THEN 'unknown' ELSE model END", "model"))
+    by_provider = await query_db(grouped("provider", "provider"))
     by_day = await query_db(
         f"SELECT date(created_at) AS day, {_USAGE_SUM} FROM usage_events "
         f"WHERE created_at >= datetime('now', '-30 days') "
         f"GROUP BY day ORDER BY day ASC"
     )
 
+    brain = _active_brain()
+    provider = brain.provider if brain else ""
     quota = None
     try:
-        from harvey.integrations.quota import QuotaClient
-        if _quota_client is None:
-            _quota_client = QuotaClient()
-        quota = await _quota_client.get_utilization()
+        client = _quota_client_for(provider, brain.model if brain else "")
+        if client is not None:
+            quota = await client.get_utilization()
     except Exception as e:
         logger.debug("Quota lookup failed: %s", e)
 
     return {
+        "provider": provider,
         "quota": quota,
+        # Whose quota this is, even when it couldn't be read, so the UI shows
+        # "unavailable" for the active provider instead of hiding the gauge.
+        "quota_provider": provider,
+        "quota_status": ("available" if quota else "unavailable") if provider else "",
+        "by_provider": by_provider,
         "totals": totals,
         "by_day": by_day,
         "by_agent": by_agent,
@@ -1265,7 +1317,7 @@ async def static_file(path: str):
             headers={"Cache-Control": "public, max-age=604800"},
         )
     return PlainTextResponse(
-        target.read_text(),
+        target.read_text(encoding="utf-8"),
         media_type=TEXT_TYPES.get(target.suffix, "text/plain"),
         headers={"Cache-Control": "no-store"},
     )
@@ -1273,7 +1325,7 @@ async def static_file(path: str):
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
-    return (WEB_DIR / "index.html").read_text()
+    return (WEB_DIR / "index.html").read_text(encoding="utf-8")
 
 
 def start_dashboard(host: str = "127.0.0.1", port: int = 5555):

@@ -38,6 +38,9 @@ CYCLE_TIMEOUT_SECONDS = 600
 # quiet hours actually ended.
 QUIET_HOURS_POLL_SECONDS = 300
 
+# Phase-1 tasks that read replies; sending waits for all of them to succeed.
+REPLY_READERS = ("handle_replies", "read_replies")
+
 
 def in_quiet_hours(config: HarveyConfig) -> bool:
     """Check if we're currently in quiet hours."""
@@ -106,6 +109,40 @@ async def decide_next_action(
     return action
 
 
+async def _run_agents(tasks: list) -> dict:
+    """Run (name, coroutine) pairs in parallel; return {name: outcome}.
+
+    Errors are caught per task so one bad agent never takes down the cycle,
+    and the whole batch is bounded so one HUNG agent (no exception, just
+    never returns) can't either. A task's outcome is what it returned, or
+    the exception it raised; a task cut off by the bound has no outcome.
+    """
+    if not tasks:
+        return {}
+    if len(tasks) > 1:
+        logger.info(f"Running {len(tasks)} agents in parallel: {[t[0] for t in tasks]}")
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(*[t[1] for t in tasks], return_exceptions=True),
+            timeout=CYCLE_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        logger.error(
+            f"Cycle timed out after {CYCLE_TIMEOUT_SECONDS}s with "
+            f"{[t[0] for t in tasks]} still running — cancelled, "
+            "moving on to the next heartbeat instead of hanging forever."
+        )
+        results = []
+    outcomes = {}
+    for (name, _), result in zip(tasks, results):
+        if isinstance(result, asyncio.CancelledError):
+            raise result
+        if isinstance(result, Exception):
+            logger.error(f"Agent {name} failed: {result}", exc_info=result)
+        outcomes[name] = result
+    return outcomes
+
+
 async def _interruptible_sleep(seconds: float, stop_event: asyncio.Event) -> bool:
     """Sleep up to `seconds`, waking immediately on shutdown.
 
@@ -136,7 +173,12 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
         return
     env = load_env()
     state = StateManager()
-    brain = Brain(state)
+    brain = Brain(state, config.brain)
+    logger.info(
+        f"Thinking with {brain.provider_label}"
+        + (f" ({brain.model})" if brain.model else "")
+        + ". Change brain.provider in harvey.yaml to switch."
+    )
 
     await state.init_db()
     logger.info("Database initialized.")
@@ -181,13 +223,27 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
                     break
                 continue
 
-            # 2. Check usage budget (real subscription quota when readable,
+            # 2. Is the brain usable at all? (Codex: CLI version, isolation,
+            # login, account and model checked without a prompt.) If not, do nothing
+            # this cycle — no replies consumed, nothing written or sent —
+            # and say why, rather than running agents that would each fail.
+            problem = await brain.preflight()
+            if problem:
+                logger.error(
+                    f"Harvey is paused: {problem} Nothing was sent or changed. "
+                    f"Re-checking in {config.usage.heartbeat_interval_minutes} minutes."
+                )
+                if await _interruptible_sleep(interval, stop_event):
+                    break
+                continue
+
+            # 3. Check usage budget (real subscription quota when readable,
             # else Harvey's own call counter)
             if not await brain.is_within_budget(
                 max_calls, max_percent=config.usage.max_daily_claude_percent
             ):
                 logger.info(
-                    f"Claude usage limit reached "
+                    f"{brain.provider_label} usage limit reached "
                     f"({config.usage.max_daily_claude_percent}% of quota or "
                     f"{max_calls} calls). Sleeping 1h, then re-checking."
                 )
@@ -195,12 +251,12 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
                     break
                 continue
 
-            # 3. Decide what to do
+            # 4. Decide what to do
             logger.info("Checking pipeline state...")
             summary = await state.get_state_summary()
             action = await decide_next_action(brain, state, config, summary=summary)
 
-            # 4. Execute — run independent agents in parallel where possible
+            # 5. Execute — run independent agents in parallel where possible
             # Handler is always safe to run alongside other agents
             tasks = []
             has_open_convos = summary.get("open_conversations", 0) > 0
@@ -218,16 +274,22 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
                 tasks.append(("write_campaign", writer.run()))
                 if has_open_convos:
                     tasks.append(("handle_replies", handler.run()))
-            elif action == "send_campaign":
-                tasks.append(("send_campaign", sender.run()))
             elif action == "idle":
                 tasks.append(("analyze", analyst.run()))
 
-            # Native mail providers drain the outbox every cycle — due sends
-            # and approved replies must go out on schedule regardless of the
-            # cycle's primary action.
-            if sender.is_native and not any(n == "send_campaign" for n, _ in tasks):
-                tasks.append(("send_outbox", sender.run()))
+            # Sending happens in a second phase, after every agent above has
+            # finished: the handler's stop-on-reply must cancel follow-ups to
+            # people who just replied before anything is sent. Native mail
+            # providers drain the outbox every cycle, so their mailbox is
+            # read every cycle too (handle_replies above only runs when a
+            # conversation is already open).
+            send_tasks = []
+            if action == "send_campaign":
+                send_tasks.append(("send_campaign", sender.run))
+            elif sender.is_native:
+                send_tasks.append(("send_outbox", sender.run))
+            if sender.is_native and not any(n == "handle_replies" for n, _ in tasks):
+                tasks.append(("read_replies", handler.run()))
 
             # Profiling rides along every cycle. It is three HTTP requests per
             # business with no model call, so it costs nothing against the
@@ -236,31 +298,27 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
             if summary.get("unprofiled", 0):
                 tasks.append(("profile", run_profile_stage(state, limit=25)))
 
-            if len(tasks) > 1:
-                logger.info(f"Running {len(tasks)} agents in parallel: {[t[0] for t in tasks]}")
+            outcomes = await _run_agents(tasks)
 
-            # Run all tasks, catch errors per-task so one bad agent never
-            # takes down the cycle — and bound the whole batch so one
-            # HUNG agent (no exception, just never returns) can't either.
-            try:
-                results = await asyncio.wait_for(
-                    asyncio.gather(*[t[1] for t in tasks], return_exceptions=True),
-                    timeout=CYCLE_TIMEOUT_SECONDS,
-                )
-            except asyncio.TimeoutError:
-                logger.error(
-                    f"Cycle timed out after {CYCLE_TIMEOUT_SECONDS}s with "
-                    f"{[t[0] for t in tasks]} still running — cancelled, "
-                    "moving on to the next heartbeat instead of hanging forever."
-                )
-                results = []
-            for (name, _), result in zip(tasks, results):
-                if isinstance(result, asyncio.CancelledError):
-                    raise result
-                if isinstance(result, Exception):
-                    logger.error(f"Agent {name} failed: {result}", exc_info=result)
+            # Phase 2: send — only after every reply-reading task this cycle
+            # finished reading and handling replies (it returns True; a
+            # failure, exception or timeout doesn't), and only if the brain
+            # didn't stop being usable meanwhile. Otherwise a reply may be
+            # unread, so its stop-on-reply hasn't run: queued emails wait.
+            if send_tasks:
+                unread = [n for n, _ in tasks
+                          if n in REPLY_READERS and outcomes.get(n) is not True]
+                paused = brain.paused_reason
+                if paused or unread:
+                    reason = paused or "replies couldn't all be read and handled."
+                    logger.error(
+                        f"Not sending this cycle: {reason} Queued emails wait "
+                        "until replies can be read again."
+                    )
+                else:
+                    await _run_agents([(name, run()) for name, run in send_tasks])
 
-            # 5. Log the action (best-effort; never kills the loop)
+            # 6. Log the action (best-effort; never kills the loop)
             try:
                 await state.log_action(action_type=action, agent="main")
             except Exception as e:
@@ -268,7 +326,7 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
 
             consecutive_errors = 0
 
-            # 6. Sleep until next heartbeat
+            # 7. Sleep until next heartbeat
             logger.info(
                 f"Cycle complete. Sleeping for {config.usage.heartbeat_interval_minutes} minutes."
             )

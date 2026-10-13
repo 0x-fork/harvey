@@ -5,6 +5,52 @@ Notable changes to Harvey. Dates are release dates; the format follows
 follow [semver](https://semver.org/), with the caveat that Harvey is pre-1.0 and
 minor versions can still change behaviour.
 
+## [Unreleased]
+
+### Added
+
+- **Opt-in Codex brain (ChatGPT plan).** Set `brain.provider: codex` (or pick
+  it in `harvey setup`, or `harvey train --provider codex`) to think with the
+  Codex CLI on a ChatGPT subscription instead of Claude. Claude remains the
+  default and there is no automatic fallback between providers. Each call
+  runs a throwaway, isolated `codex app-server` with no tools; Harvey verifies
+  the lockdown from Codex's own reports before sending any prompt, aborts on
+  any attempted tool use, refuses API-key logins and custom endpoints
+  (checked before your login is exposed to Codex), and never changes your own
+  Codex settings or login: each call gets a private copy of the login without
+  its refresh token, so an expired login must be renewed with Codex itself or
+  `codex login`. Requires Codex CLI 0.159.3; other versions are refused. See
+  the README section "Using a ChatGPT plan instead (Codex)".
+- `brain.model` picks the model for either provider, for Harvey only. For
+  Codex use `gpt-5.5` (suggested by `harvey setup`): the verified text-only
+  model. Blank auto-selection only picks listed models without code-execution
+  tools, and on current ChatGPT accounts there are none; code-mode models are
+  refused.
+- If Codex can't be used (expired or renewal-due login, unsupported CLI,
+  unsafe Codex config, rejected model, plan usage limit), Harvey pauses the
+  heartbeat instead of running agents that would fail: replies stay unread
+  and unescalated, queued emails wait, and the reason shows in the log,
+  `harvey status` and the dashboard. It resumes on its own once the cause is
+  fixed. `harvey status --check` runs the same check (no prompt sent) on demand
+  and exits non-zero when it fails. The Codex provider supports macOS and
+  Linux; it is refused on Windows (use Claude there).
+
+### Changed
+
+- Each heartbeat now sends email after the agents that read and answer
+  replies have finished, and native mail providers (Gmail/SMTP) read the
+  mailbox every cycle, so a reply always cancels its queued follow-ups before
+  that cycle's sends (previously the two could run at the same time, and a
+  reply arriving with no open conversation waited for a later cycle). This
+  applies to Claude and Codex alike.
+- A reply is only recorded once its reply draft (if it needs one) is
+  written, so a brain outage part-way never half-records it. If a working
+  brain returns no usable draft, the conversation is flagged for a human
+  instead of being left open with no answer.
+- Usage is tracked per provider. The budget gate, `harvey usage`, `harvey
+  status` and the dashboard read and label the active provider's own quota;
+  existing usage history is kept and attributed to Claude.
+
 ## [0.2.1] — 2026-10-13
 
 A security release. Update if you run Harvey.
