@@ -60,7 +60,13 @@ class Brain:
             "claude", "-p", prompt,
             # JSON output carries exact token/cost accounting per call.
             "--output-format", "json",
-            "--dangerously-skip-permissions",
+            # No tools at all: Harvey only ever needs text back, and prompts
+            # carry untrusted text (prospect replies, scraped pages). With no
+            # tools, an injected instruction has nothing to act with.
+            # --tools "" removes the built-in tools; --strict-mcp-config stops
+            # the operator's own MCP servers and connectors from loading.
+            "--tools", "",
+            "--strict-mcp-config",
         ]
         if session_id:
             # The CLI only accepts UUIDs for --session-id; callers pass
