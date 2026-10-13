@@ -24,6 +24,20 @@ logger = logging.getLogger("harvey")
 ERROR_BACKOFF_BASE = 60
 ERROR_BACKOFF_CAP = 900
 
+# Hard ceiling on one cycle's parallel agents. return_exceptions=True on
+# gather() only isolates a task that raises — a task that hangs (a socket or
+# lock that never resolves) blocks gather() forever, taking the whole
+# heartbeat loop down silently with it. This is the only thing standing
+# between one stuck agent and Harvey freezing for hours with no agent
+# knowing it's dead — found in production after exactly that happened.
+CYCLE_TIMEOUT_SECONDS = 600
+
+# Cap on a single quiet-hours sleep chunk. See the quiet-hours block in
+# heartbeat() for why this exists — a system sleep/wake cycle during one
+# multi-hour asyncio.wait_for left Harvey silently stalled well past when
+# quiet hours actually ended.
+QUIET_HOURS_POLL_SECONDS = 300
+
 
 def in_quiet_hours(config: HarveyConfig) -> bool:
     """Check if we're currently in quiet hours."""
@@ -150,7 +164,20 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
             if in_quiet_hours(config):
                 sleep_for = seconds_until_quiet_hours_end(config)
                 logger.info(f"Quiet hours. Sleeping for {sleep_for // 60} minutes.")
-                if await _interruptible_sleep(sleep_for, stop_event):
+                # Sleep in short polled chunks rather than one multi-hour
+                # wait: found in production that a system sleep/wake cycle
+                # during a long asyncio.wait_for left the process silently
+                # stalled for the rest of the quiet-hours window (11+ hours
+                # in one case) instead of resuming once the Mac woke up.
+                # Re-checking wall-clock quiet hours every few minutes
+                # bounds the worst case to QUIET_HOURS_POLL_SECONDS instead
+                # of however long the missed timer would have run.
+                shutting_down = False
+                while in_quiet_hours(config):
+                    if await _interruptible_sleep(QUIET_HOURS_POLL_SECONDS, stop_event):
+                        shutting_down = True
+                        break
+                if shutting_down:
                     break
                 continue
 
@@ -212,11 +239,21 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
             if len(tasks) > 1:
                 logger.info(f"Running {len(tasks)} agents in parallel: {[t[0] for t in tasks]}")
 
-            # Run all tasks, catch errors per-task so one bad agent
-            # never takes down the cycle
-            results = await asyncio.gather(
-                *[t[1] for t in tasks], return_exceptions=True
-            )
+            # Run all tasks, catch errors per-task so one bad agent never
+            # takes down the cycle — and bound the whole batch so one
+            # HUNG agent (no exception, just never returns) can't either.
+            try:
+                results = await asyncio.wait_for(
+                    asyncio.gather(*[t[1] for t in tasks], return_exceptions=True),
+                    timeout=CYCLE_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"Cycle timed out after {CYCLE_TIMEOUT_SECONDS}s with "
+                    f"{[t[0] for t in tasks]} still running — cancelled, "
+                    "moving on to the next heartbeat instead of hanging forever."
+                )
+                results = []
             for (name, _), result in zip(tasks, results):
                 if isinstance(result, asyncio.CancelledError):
                     raise result
@@ -259,30 +296,32 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
 
 def _needs_setup() -> bool:
     """Check if Harvey needs first-time setup."""
-    from pathlib import Path
     from harvey.paths import PROJECT_ROOT
-    project_root = PROJECT_ROOT
-    env_file = project_root / ".env"
-    config_file = project_root / "harvey.yaml"
+    from harvey.config import _find_config_file, ConfigFileNotFoundError
+
+    env_file = PROJECT_ROOT / ".env"
 
     # If .env doesn't exist, definitely needs setup
     if not env_file.exists():
         return True
 
-    # If config still has placeholder values, needs setup
-    if config_file.exists():
-        try:
-            with open(config_file) as f:
-                import yaml
-                config = yaml.safe_load(f)
-            if not isinstance(config, dict):
-                return True
-            company = (config.get("persona") or {}).get("company", "")
-            if company in ("Your Company", ""):
-                return True
-        except Exception:
+    # harvey.local.yaml wins over the tracked harvey.yaml template, same
+    # resolution order the real config loader uses (see config.py).
+    try:
+        config_file = _find_config_file()
+    except ConfigFileNotFoundError:
+        return True
+
+    try:
+        with open(config_file) as f:
+            import yaml
+            config = yaml.safe_load(f)
+        if not isinstance(config, dict):
             return True
-    else:
+        company = (config.get("persona") or {}).get("company", "")
+        if company in ("Your Company", ""):
+            return True
+    except Exception:
         return True
 
     return False

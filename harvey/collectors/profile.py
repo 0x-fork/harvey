@@ -206,10 +206,26 @@ class ProfileCollector:
             return ""
         return resp.text
 
-    async def _first_present(self, domain: str, paths) -> tuple[str, str]:
+    async def _resolve_site(self, domain: str) -> tuple[str, str]:
+        """Return (working base url, homepage html), or ("", "") if none work.
+
+        Tries https/http and bare/www variants — a plain https guess marks
+        plenty of live, real small-business sites "unreachable" simply
+        because they never got a TLS cert, or only answer on www.
+        """
+        for base in (
+            f"https://{domain}", f"https://www.{domain}",
+            f"http://{domain}", f"http://www.{domain}",
+        ):
+            html = await self._get(base)
+            if html:
+                return base, html
+        return "", ""
+
+    async def _first_present(self, site: str, paths) -> tuple[str, str]:
         """Return (url, html) for the first path that returns content."""
         for path in paths:
-            url = f"https://{domain}{path}"
+            url = f"{site}{path}"
             html = await self._get(url)
             if html and len(html) > 500:
                 return url, html
@@ -328,7 +344,6 @@ class ProfileCollector:
         """Collect every confirmed profile signal for one business."""
         obs: list[dict] = []
         domain = domain.lower().replace("www.", "").strip("/")
-        site = f"https://{domain}"
 
         def add(code, *, num=None, text="", conf=1.0, url=""):
             if not self.wants(code):
@@ -339,7 +354,7 @@ class ProfileCollector:
                 "evidence_url": url or site,
             })
 
-        home = await self._get(site)
+        site, home = await self._resolve_site(domain)
         if not home:
             # A failure IS an observation — silent failures look like clean results.
             logger.info(f"profile: {domain} unreachable")
@@ -402,13 +417,13 @@ class ProfileCollector:
             if re.search(r"(?is)<form\b", _strip_code(home)):
                 add("CONTACT_FORM_URL", text=site, url=site)
             else:
-                curl, chtml = await self._first_present(domain, CONTACT_PATHS)
+                curl, chtml = await self._first_present(site, CONTACT_PATHS)
                 if chtml and re.search(r"(?is)<form\b", _strip_code(chtml)):
                     add("CONTACT_FORM_URL", text=curl, url=curl)
 
         # careers page → hiring intent
         if self.wants("HIRING_ROLE"):
-            curl, chtml = await self._first_present(domain, CAREERS_PATHS)
+            curl, chtml = await self._first_present(site, CAREERS_PATHS)
             if chtml:
                 roles = []
                 for m in re.finditer(
@@ -427,7 +442,7 @@ class ProfileCollector:
 
         # team page → people
         if self.wants("CONTACT_FOUND") or self.wants("DECISION_MAKER_TITLE"):
-            turl, thtml = await self._first_present(domain, TEAM_PATHS)
+            turl, thtml = await self._first_present(site, TEAM_PATHS)
             if thtml:
                 for person in self.detect_people(thtml):
                     label = f"{person['first_name']} {person['last_name']}"
@@ -439,6 +454,12 @@ class ProfileCollector:
                             text=f"{label} — {person['title']}", url=turl)
 
         return obs
+
+    async def _mark_checked(self, company_id: str):
+        try:
+            await self.state.mark_company_profiled(company_id)
+        except Exception as e:
+            logger.debug(f"mark_company_profiled failed for {company_id}: {e}")
 
     async def run(self, companies: list[dict], run_id: str = "") -> int:
         """Profile many businesses, flushing observations after each one.
@@ -455,7 +476,12 @@ class ProfileCollector:
                 obs = await self.profile_company(company["id"], domain)
             except Exception as e:
                 logger.warning(f"profile failed for {domain}: {e}")
+                await self._mark_checked(company["id"])
                 continue
+            # Marked regardless of outcome — an unreachable site still counts
+            # as checked, or the same handful gets retried every cycle
+            # forever instead of rotating through the rest of the backlog.
+            await self._mark_checked(company["id"])
             if obs:
                 total += await self.state.add_observations(obs, run_id=run_id)
                 logger.info(f"profile: {domain} → {len(obs)} observation(s)")

@@ -496,6 +496,29 @@ Return as JSON:
   "disqualifiers": ["signals that someone is NOT a good fit 1", "disqualifier 2"]
 }}
 
+For any city in "geography", always include the state/province and country if
+the name could plausibly refer to more than one place — write "Solon, Ohio"
+not "Solon" (there's also a Solon in France), "Springfield, Illinois" not
+"Springfield" (30+ US cities share that name). These strings get geocoded
+automatically for local-business discovery, and an unqualified name silently
+resolves to the wrong place on Earth instead of failing loudly.
+
+"titles" MUST be literal job titles exactly as they'd appear on a business
+card or LinkedIn profile ("Owner", "CEO", "President", "Plant Manager",
+"Practice Manager") — never a customer-segment or persona label ("Business
+Owner Segment", "Decision Maker", "Healthcare Professional"). Harvey matches
+a found contact's title against this list by substring, so a descriptive
+label instead of a real title means every real contact silently fails to
+match and gets discarded. If the buyer is an INDIVIDUAL bought into by
+persona rather than a role at a target company (e.g. this product targets
+physicians, business owners, or executives directly as people, not a
+"Director of X" at a company you sell software to), list every real job
+title that persona plausibly holds — a "business owner" persona should
+produce ["Owner", "President", "CEO", "Founder", "Managing Partner"], a
+"physician" persona should produce ["Physician", "MD", "Doctor"], and so on.
+Prefer more titles over fewer; a missed real title costs a contact forever,
+an extra one costs nothing.
+
 Be specific — don't guess generically. Base this on what the website actually says about their customers."""
 
         result = await self.brain.think_json(prompt, session_id="harvey-trainer")

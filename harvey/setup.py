@@ -319,7 +319,12 @@ class SetupWizard:
         titles = [t.strip() for t in titles if t.strip()]
 
         company_size = _ask("Target company size", default="10-200 employees")
-        geography = _ask("Target geography", default="United States").split(",")
+        geography = _ask(
+            "Target geography (for a city, include the state/country, "
+            "e.g. 'Solon, Ohio' — an unqualified city name can silently "
+            "geocode to the wrong place)",
+            default="United States",
+        ).split(",")
         geography = [g.strip() for g in geography if g.strip()]
 
         _print_harvey("Now let's talk about your offer — what happens when someone's interested?\n")

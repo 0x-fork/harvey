@@ -59,6 +59,12 @@ MAX_RESULTS_PER_QUERY = 20
 MAX_COMPANIES_PER_CYCLE = 10
 MAX_PROSPECTS_PER_CYCLE = 25
 
+# Hunter domain-searches per heartbeat. The monthly budget itself is shared
+# with email-pattern lookups and set by HUNTER_MONTHLY_SEARCHES (see
+# integrations/email_finder.py); this just paces it, since a heartbeat every
+# 15 minutes would spend a free-tier month in a few hours otherwise.
+HUNTER_DOMAINS_PER_CYCLE = 1
+
 # Rotate a small pool of realistic desktop user-agents. Scrapers that always
 # send one UA are trivially fingerprinted and blocked.
 USER_AGENTS = [
@@ -124,6 +130,17 @@ class Scout:
 
         # Each strategy is isolated so one failing does not abort the cycle.
         strategies = []
+        # Hunter first, if configured: real named people with a real
+        # verification verdict beats a scrape guess, but the free tier's
+        # monthly budget (HUNTER_MONTHLY_SEARCHES, 25 by default) is small —
+        # self-skips once it's spent.
+        strategies.append(("hunter", self._prospect_via_hunter))
+        # Backfill next: companies already on file (e.g. from `harvey
+        # discover`) but with zero prospects. Scrapes each company's own
+        # site directly, so it costs no search-query budget and isn't at
+        # the mercy of Serper/Bing flakiness — cheapest, most reliable win
+        # available before spending any queries.
+        strategies.append(("known_companies", self._prospect_via_known_companies))
         if self.config.channels.linkedin.enabled and self.env.linkedin_email:
             strategies.append(("linkedin", self._prospect_via_linkedin))
         # Job boards first: hiring is the strongest intent signal, and the
@@ -451,6 +468,168 @@ class Scout:
         if results:
             logger.debug(f"Google returned {len(results)} results")
         return results[:MAX_RESULTS_PER_QUERY]
+
+    # ── Strategy -1: Hunter named contacts (quota-gated) ──
+
+    _HUNTER_STATUS_MAP = {
+        "valid": "verified",
+        "accept_all": "risky",
+        "invalid": "invalid",
+        "disposable": "invalid",
+    }
+
+    async def _prospect_via_hunter(self) -> int:
+        """Pull Hunter's actual named-people data for companies with zero
+        prospects — real name/title/email/verification, not a scrape guess.
+
+        Draws from the same rotating pool as the team-page backfill, but at
+        a much smaller pace and against the shared monthly Hunter budget.
+        """
+        api_key = getattr(self.env, "hunter_api_key", "") or ""
+        if not api_key:
+            return 0
+
+        from harvey.integrations.email_finder import (
+            hunter_domain_people, hunter_searches_remaining, record_hunter_search,
+        )
+
+        remaining = await hunter_searches_remaining(self.state)
+        if remaining <= 0:
+            return 0
+
+        batch_size = min(remaining, HUNTER_DOMAINS_PER_CYCLE)
+        try:
+            companies = await self.state.companies_needing_prospects(limit=batch_size)
+        except Exception as e:
+            logger.debug(f"companies_needing_prospects failed: {e}")
+            return 0
+        if not companies:
+            return 0
+
+        default_industry = (
+            self.config.icp.industries[0] if self.config.icp.industries else ""
+        )
+        count = 0
+        for company in companies:
+            domain = (company.get("domain") or "").strip()
+            if not domain:
+                continue
+
+            if await hunter_searches_remaining(self.state) <= 0:
+                break
+            await record_hunter_search(self.state)
+            people = await hunter_domain_people(domain, api_key)
+            try:
+                await self.state.mark_prospects_checked(company["id"])
+            except Exception as e:
+                logger.debug(f"mark_prospects_checked failed for {domain}: {e}")
+
+            for person in people or []:
+                if not isinstance(person, dict):
+                    continue
+                title = person.get("position") or ""
+                if not self._title_matches_icp(title):
+                    continue
+
+                verification = person.get("verification") or {}
+                hunter_status = (verification.get("status") or "").lower()
+                email_status = self._HUNTER_STATUS_MAP.get(hunter_status, "guess")
+
+                prospect = Prospect(
+                    first_name=person.get("first_name") or "",
+                    last_name=person.get("last_name") or "",
+                    email=person.get("value") or "",
+                    email_status=email_status,
+                    email_verified=(email_status == "verified"),
+                    linkedin_url=person.get("linkedin") or "",
+                    company=company.get("name") or self._domain_to_name(domain),
+                    company_id=company["id"],
+                    title=title,
+                    seniority=person.get("seniority") or self._infer_seniority(title),
+                    industry=company.get("industry") or default_industry,
+                    source="hunter_domain_search",
+                    source_url=f"https://{domain}",
+                )
+
+                if not prospect.is_valid():
+                    continue
+                if await self._is_duplicate_prospect(prospect):
+                    continue
+
+                await self.state.add_prospect(prospect)
+                self._remember_prospect(prospect)
+                count += 1
+                logger.info(
+                    f"Scout: Added {prospect.full_name()} ({prospect.title}) "
+                    f"at {prospect.company} [hunter]"
+                )
+                if count >= MAX_PROSPECTS_PER_CYCLE:
+                    return count
+
+        return count
+
+    # ── Strategy 0: Known companies with zero prospects ──
+
+    async def _prospect_via_known_companies(self) -> int:
+        """Scrape team pages for companies already on file with no contacts.
+
+        Company-only sources (`harvey discover`, directory scraping, etc.)
+        add rows to `companies` without ever finding a named person there.
+        Left alone, those companies never get a contacts pass — every other
+        strategy here skips a domain the moment it recognizes it, since
+        they're built to discover companies and people together, not to
+        revisit one after the other. This strategy is the backfill.
+        """
+        default_industry = (
+            self.config.icp.industries[0] if self.config.icp.industries else ""
+        )
+
+        try:
+            companies = await self.state.companies_needing_prospects(
+                limit=MAX_COMPANIES_PER_CYCLE
+            )
+        except Exception as e:
+            logger.debug(f"companies_needing_prospects failed: {e}")
+            return 0
+
+        if not companies:
+            return 0
+
+        logger.info(f"Scout: Backfilling contacts for {len(companies)} known companies...")
+
+        count = 0
+        for company in companies:
+            domain = (company.get("domain") or "").strip()
+            if not domain:
+                continue
+
+            contacts = await self._contacts_from_company(
+                company_id=company["id"],
+                domain=domain,
+                company_name=company.get("name") or self._domain_to_name(domain),
+                industry=company.get("industry") or default_industry,
+                source="known_company_backfill",
+            )
+
+            # Mark it checked regardless of outcome, so a company with no
+            # scrapable team page rotates out instead of being retried
+            # every cycle forever.
+            try:
+                await self.state.mark_prospects_checked(company["id"])
+            except Exception as e:
+                logger.debug(f"mark_prospects_checked failed for {domain}: {e}")
+
+            for prospect in contacts:
+                await self.state.add_prospect(prospect)
+                count += 1
+                logger.info(
+                    f"Scout: Added {prospect.full_name()} ({prospect.title}) "
+                    f"at {prospect.company} [backfill]"
+                )
+                if count >= MAX_PROSPECTS_PER_CYCLE:
+                    return count
+
+        return count
 
     # ── Strategy 1: LinkedIn ──
 
@@ -1071,13 +1250,34 @@ Respond ONLY with the JSON array."""
         )
         return await self.state.add_company(company)
 
+    async def _resolve_base_url(
+        self, domain: str, retries: int = 1
+    ) -> tuple[str, httpx.Response | None]:
+        """Return (working base url, its response) for the first scheme/www
+        variant that actually answers, or ("", None) if none do.
+
+        A bare `https://{domain}` guess marks plenty of live, real small
+        businesses "unreachable" simply because they never got a TLS cert,
+        or only answer on www — costing us the whole company or team-page
+        scrape for a site that was never actually down.
+        """
+        for base in (
+            f"https://{domain}", f"https://www.{domain}",
+            f"http://{domain}", f"http://www.{domain}",
+        ):
+            resp = await self._fetch(base, timeout=SCRAPE_TIMEOUT, retries=retries)
+            if resp is not None:
+                return base, resp
+        return "", None
+
     async def _scrape_company_info(self, domain: str) -> dict:
         """Scrape a company's homepage for basic info. Pure Python."""
         info = {"name": "", "description": "", "website": f"https://{domain}"}
 
-        resp = await self._fetch(f"https://{domain}", timeout=SCRAPE_TIMEOUT, retries=2)
+        base, resp = await self._resolve_base_url(domain, retries=2)
         if resp is None:
             return info
+        info["website"] = base
 
         # Keep the raw HTML so signal detection reuses this fetch.
         info["_homepage_html"] = resp.text
@@ -1120,8 +1320,12 @@ Respond ONLY with the JSON array."""
                       "/leadership", "/about/team", "/company/team", "/staff"]
         members = []
 
+        base, _ = await self._resolve_base_url(domain)
+        if not base:
+            return members
+
         for path in team_paths:
-            url = f"https://{domain}{path}"
+            url = f"{base}{path}"
             resp = await self._fetch(url, timeout=SCRAPE_TIMEOUT, retries=1)
             if resp is None:
                 continue

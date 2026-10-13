@@ -219,3 +219,38 @@ async def test_find_email_inconclusive_is_guess_not_verified(state, monkeypatch)
     result = await find_email("Jane", "Doe", "acme.com", env=Env(), state=state)
     assert result.status == "guess"
     assert not result.verified
+
+
+# ── shared Hunter domain-search budget ──
+
+
+@pytest.mark.asyncio
+async def test_hunter_budget_defaults_to_free_tier(state, monkeypatch):
+    monkeypatch.delenv("HUNTER_MONTHLY_SEARCHES", raising=False)
+    assert await ef.hunter_searches_remaining(state) == 25
+    await ef.record_hunter_search(state)
+    assert await ef.hunter_searches_remaining(state) == 24
+
+
+@pytest.mark.asyncio
+async def test_hunter_budget_follows_paid_plan_setting(state, monkeypatch):
+    monkeypatch.setenv("HUNTER_MONTHLY_SEARCHES", "500")
+    assert await ef.hunter_searches_remaining(state) == 500
+
+
+@pytest.mark.asyncio
+async def test_derive_pattern_spends_and_respects_hunter_budget(state, monkeypatch):
+    monkeypatch.setattr(ef, "_hunter_api_key", lambda: "k")
+    monkeypatch.setenv("HUNTER_MONTHLY_SEARCHES", "1")
+    calls = []
+
+    async def fake_hunter(domain, key):
+        calls.append(domain)
+        return "{f}.{l}", 0.8
+
+    monkeypatch.setattr(ef, "_hunter_domain_pattern", fake_hunter)
+    _, source, _ = await derive_pattern("first-co.com", state=state)
+    assert source == "hunter_domain_search"
+    _, source, _ = await derive_pattern("second-co.com", state=state)
+    assert source == "default"
+    assert calls == ["first-co.com"]

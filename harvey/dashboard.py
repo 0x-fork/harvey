@@ -28,6 +28,18 @@ CONFIG_FILE = PROJECT_ROOT / "harvey.yaml"
 PID_FILE = PROJECT_ROOT / "data" / "harvey.pid"
 LOG_FILE = PROJECT_ROOT / "data" / "harvey.log"
 
+
+def _resolve_config_file() -> Path:
+    """harvey.local.yaml wins when present — same resolution as config.py's
+    loader, so the dashboard doesn't judge setup complete against the
+    tracked harvey.yaml template while the real trained config sits in the
+    gitignored local override."""
+    from harvey.config import _find_config_file, ConfigFileNotFoundError
+    try:
+        return Path(_find_config_file())
+    except ConfigFileNotFoundError:
+        return CONFIG_FILE
+
 app = FastAPI(title="Harvey Dashboard")
 
 # Harvey process tracking
@@ -164,9 +176,10 @@ async def get_setup_status():
 
     # 5. Config valid
     config_valid = False
-    if CONFIG_FILE.exists():
+    config_path = _resolve_config_file()
+    if config_path.exists():
         try:
-            with open(CONFIG_FILE) as f:
+            with open(config_path) as f:
                 cfg = yaml.safe_load(f)
             company = cfg.get("persona", {}).get("company", "")
             product = cfg.get("product", {}).get("name", "")
@@ -174,7 +187,7 @@ async def get_setup_status():
         except Exception:
             pass
     checks.append({
-        "id": "config", "label": "Harvey configured (harvey.yaml)",
+        "id": "config", "label": f"Harvey configured ({config_path.name})",
         "done": config_valid,
         "required": True,
         "help": "Train Harvey on your product. Use the trainer or set up manually through Claude.",
@@ -224,9 +237,9 @@ async def get_setup_status():
 
 
 def _current_provider() -> str:
-    """Read channels.email.provider from harvey.yaml (best-effort)."""
+    """Read channels.email.provider from the active config (best-effort)."""
     try:
-        with open(CONFIG_FILE) as f:
+        with open(_resolve_config_file()) as f:
             cfg = yaml.safe_load(f) or {}
         return ((cfg.get("channels") or {}).get("email") or {}).get("provider", "instantly")
     except Exception:
