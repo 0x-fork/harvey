@@ -5,6 +5,47 @@ Notable changes to Harvey. Dates are release dates; the format follows
 follow [semver](https://semver.org/), with the caveat that Harvey is pre-1.0 and
 minor versions can still change behaviour.
 
+## [0.2.1] — 2026-10-13
+
+A security release. Update if you run Harvey.
+
+### Security
+
+- **Claude now runs with no tools.** Every Claude call used to run with
+  `--dangerously-skip-permissions`, and prompts include text Harvey doesn't
+  control: prospect email replies and scraped web pages. Instructions hidden
+  in that text could make Claude run commands, read or write files, or use
+  the operator's connected MCP servers. Calls now run with `--tools ""` and
+  `--strict-mcp-config`; Harvey only ever needed text back, so nothing else
+  changes. Reported privately by [@hackchang](https://github.com/hackchang).
+  If you ran an earlier version with live replies coming in, check the
+  account that ran Harvey for unexpected files or activity.
+
+### Fixed
+
+- `harvey run` no longer drops into the setup wizard when the trained config
+  lives in `harvey.local.yaml`; the dashboard reads it too.
+- A heartbeat cycle is capped at 10 minutes, so one hung agent can't freeze
+  Harvey, and quiet hours are re-checked every 5 minutes so a Mac waking from
+  sleep resumes on time.
+- Sites that only answer on plain HTTP or `www.` are no longer marked
+  unreachable.
+- Profile and contact backfills rotate through every company instead of
+  retrying the same few forever.
+- The trainer writes full place names ("Solon, Ohio") and real job titles, so
+  discovery doesn't geocode to the wrong city and found contacts aren't
+  silently discarded.
+
+### Added
+
+- Contacts are backfilled for companies found without any, from their own team
+  pages and, if a key is set, Hunter's named-people search.
+- `HUNTER_MONTHLY_SEARCHES` (default 25) sets one Hunter budget shared by every
+  domain search.
+
+Thanks to [@sshaw0729-dotcom](https://github.com/sshaw0729-dotcom) for the
+fixes above (#2).
+
 ## [0.2.0] — 2026-09-13
 
 The release that made Harvey worth running. The previous version could write
