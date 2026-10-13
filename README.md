@@ -1,10 +1,10 @@
 # Harvey
 
-**An autonomous sales agent that runs on your Claude Code subscription.**
+**An autonomous sales agent that runs on your Claude Code or Codex subscription.**
 
 Harvey finds businesses worth selling to, learns something specific about each one, writes cold email that references it, sends it, reads the replies, and works the conversation toward a meeting. It runs on your machine, in a loop, on its own.
 
-The unusual part: **there is no API bill.** Harvey drives the `claude` CLI in headless mode, so every decision, every email, every reply it handles is billed against the Claude Pro or Max subscription you already pay for. Not an API key. Not per-token. The subscription.
+The unusual part: **there is no model API bill.** Harvey uses your Claude Pro or Max subscription through Claude Code, or your ChatGPT subscription through Codex. Model calls use the plan you already pay for, without an API key or per-token API billing. Claude is the default; [Codex is an opt-in provider on macOS and Linux](#using-a-chatgpt-plan-instead-codex).
 
 ```
 $ harvey run
@@ -57,19 +57,15 @@ anything, and approving mail one message at a time:
 
 Every other autonomous sales agent bills you per token. That is the whole reason they cost what they cost: an agent that thinks in a loop, all day, is an agent that burns API credits in a loop, all day. Vendors solve this by thinking less — shorter prompts, cheaper models, fewer passes.
 
-Harvey sidesteps it. It shells out to the `claude` CLI:
+Harvey uses the subscription-backed CLI for the provider you choose: `claude` for Claude Code, or an isolated `codex app-server` for Codex. Both return text with model tools disabled. Harvey handles the prospecting and mail operations itself.
 
-```python
-claude -p "<prompt>" --output-format json --dangerously-skip-permissions
-```
-
-That is the same subscription-billed path `claude` uses interactively. So Harvey can afford to think properly: full skills library in context, careful personalization per prospect, real reply handling.
+Your selected subscription covers model calls, subject to its usage limits. That lets Harvey use its skills library for personalization and reply handling without a separate model API bill.
 
 **What this costs you:**
 
 | | |
 |---|---|
-| Claude Pro or Max | you already pay for it |
+| Claude Pro/Max or a ChatGPT plan with Codex access | your existing subscription |
 | Finding businesses | **$0** on the default source, or ~$0.37 per 1,000 on the cheapest paid one |
 | Reading their websites | **$0** — three HTTP requests each, no model call |
 | Writing and sending | your subscription + a mailbox (~$7/mo Google Workspace) |
@@ -77,9 +73,9 @@ That is the same subscription-billed path `claude` uses interactively. So Harvey
 
 For comparison, the tools Harvey replaces start at $250–500/month — and they are weakest precisely where Harvey is strongest: small local businesses with 5–50 people, where single-provider contact coverage caps out around 30% and micro-businesses are frequently absent entirely.
 
-**Harvey also budgets itself.** It reads your live subscription quota the same way `/usage` does, and throttles so it always leaves headroom for your own interactive Claude work. Set `max_daily_claude_percent: 80` and Harvey will stop before it starts costing you your own rate limit.
+**Harvey also budgets itself.** It reads the active provider's subscription quota and throttles to leave headroom for your own Claude or Codex work. Set `max_daily_claude_percent: 80` for either provider—the setting's name predates Codex support. If quota cannot be read, Harvey reports it as unavailable and falls back to its daily call budget.
 
-> **Honest caveat.** Running an agent against a subscription is a grey area worth understanding for yourself. Anthropic's terms permit personal automation of your own account; they prohibit reselling access or sharing credentials. Harvey runs locally as you, with your login. Don't turn it into a service for other people.
+Harvey runs locally with your own login. Check the terms and usage limits of the provider you choose.
 
 ---
 
@@ -95,7 +91,7 @@ Harvey runs a heartbeat: wake up, check the budget, decide what most needs doing
               (sleep)         (sleep)
 ```
 
-It decides deterministically, not by asking Claude what to do — that would burn a call on something derivable from four counts:
+It decides deterministically, not by asking a model what to do — that would burn a call on something derivable from four counts:
 
 ```
 handle replies  >  send campaigns  >  write campaigns  >  prospect  >  idle (analyze)
@@ -299,7 +295,7 @@ Harvey feels like one agent. Underneath it's five, each loaded with different sk
 
 | Agent | What it does |
 |---|---|
-| **Scout** | Scores and personalizes what the collectors found. Python does the searching and the email resolution; Claude is used only where judgment is actually needed — which is what keeps the token cost sane. |
+| **Scout** | Scores and personalizes what the collectors found. Python does the searching and the email resolution; the selected model is used only where judgment is actually needed — which is what keeps the token cost sane. |
 | **Writer** | Generates 3-email sequences. Email 1 under 75 words, email 2 under 75, email 3 under 40. Hard ban list on AI-sounding language. |
 | **Sender** | Renders merge variables per prospect and stages each email into the outbox with a send time. Drains due and approved items with human-like pacing, enforcing the daily cap and stop-on-reply. |
 | **Handler** | Polls for replies, dedups them, classifies intent, advances the conversation stage, and queues responses through the same approval ladder. Detects bounces, marks the address invalid, cancels that prospect's queued sends, and trips a global kill switch past a bounce-rate threshold. |
@@ -341,7 +337,7 @@ Plain HTML, CSS and JavaScript served from `harvey/web/`. No build step, no fram
 - **Companies / Contacts** — everything found, with CSV export
 - **Outbox** — the decisions desk
 - **Conversations** — every reply and how Harvey handled it
-- **Usage** — real Claude quota gauges and per-agent token counts. No dollar figures: you're on a subscription, you aren't billed per token, and pretending otherwise would be theater.
+- **Usage** — Claude or Codex quota gauges and per-agent token counts. No dollar figures: you're on a subscription, you aren't billed per token, and pretending otherwise would be theater.
 
 Three rules hold the interface together:
 
@@ -450,7 +446,7 @@ What to know:
 - **Models.** Use `model: gpt-5.5`. It's the model Harvey has verified as text-only with Codex 0.159.3 (no code mode, no extra tools), and it works on ChatGPT plans even though Codex's live catalog hides it from the model picker. Codex's newer "code mode" models (`gpt-6-*`, `gpt-5.6-*`) always carry built-in code-execution tools that no setting removes, so Harvey refuses them. If you leave `model` blank, Harvey only auto-selects a model the catalog *lists* and that has no code mode or extra tools. On current ChatGPT accounts no listed model qualifies, so a blank `model` fails with an error naming the hidden models you can set explicitly, plus each model's reason. If you set `model`, Harvey uses exactly that model or fails; it never substitutes another. Naming a code-mode model gives an error listing the models that work.
 - **Quota.** The budget gate and dashboard read your ChatGPT plan's real rate-limit windows from Codex, for the limit bucket that applies to your model, and compare them to `usage.max_daily_claude_percent`. If Codex reports that usage is blocked, or a call fails on the plan's usage limit, Harvey treats the plan as full (even when no window is reported) and stops Codex calls for an hour. If the limits can't be read, the dashboard and `harvey usage` say "Quota unavailable" and the budget falls back to Harvey's own daily call count. Usage is recorded per provider; Codex calls are logged with tokens but no dollar cost, because the plan isn't billed per token.
 - **When Codex can't be used, Harvey pauses rather than guessing.** Before each heartbeat, Harvey checks everything a call needs except the prompt itself: the Codex CLI version, the isolation, your login (expired or due for renewal), your ChatGPT account, and that your configured model can run with no tools. No prompt is sent, so nothing is used from your plan beyond a quick account check. If something is wrong, the whole cycle is skipped: no reply is read or marked handled, nothing is drafted or sent. The log line, `harvey status`, and the dashboard's Actions card say "Codex paused" and why. If Codex stops working part-way through a cycle (for example the plan hits its usage limit), the reply being handled is left exactly as it was for a clean retry, not escalated, half-recorded or lost, and that cycle sends nothing. Fix the cause (usually `codex login`), and Harvey resumes on its next heartbeat: a renewed login or reinstalled CLI is noticed immediately, a usage-limit pause ends after an hour, and other fixes are picked up within 30 minutes. `harvey status --check` runs the same check on demand and exits non-zero if it fails. Brief failures (a crash or timeout) just skip one cycle. Harvey never falls back to Claude or an API key.
-- **Requirements.** **macOS or Linux**, Codex CLI **0.159.3** exactly, and Node.js for its npm package. **Windows isn't supported for Codex:** Harvey refuses it there before reading your login; use the Claude provider on Windows. Harvey checks the Codex version before every call and refuses any other version, including newer ones, because a different Codex can add tools Harvey's lockdown doesn't know about. Support for a new version comes with a Harvey update. Live use with a real ChatGPT account has been verified on macOS; Linux uses the same code and is covered by Harvey's tests, but hasn't yet been run against a real account. The Docker image ships the Claude CLI only, so Codex isn't supported in Docker. To re-verify the lockdown offline against your installed CLI, with no credentials or network: `HARVEY_CODEX_CLI_TESTS=1 pytest tests/test_codex_cli_surface.py`.
+- **Requirements.** **macOS or Linux**, Codex CLI **0.159.3** exactly, and Node.js for its npm package. **Windows isn't supported for Codex:** Harvey refuses it there before reading your login; use the Claude provider on Windows. Harvey checks the Codex version before every call and refuses any other version, including newer ones, because a different Codex can add tools Harvey's lockdown doesn't know about. Support for a new version comes with a Harvey update. Live use with a real ChatGPT account has been verified on macOS and ARM64 Linux. The offline suites also passed on x86-64 Linux under CPU emulation; CI covers Linux and macOS. The Docker image ships the Claude CLI only, so Codex isn't supported in Docker. To re-verify the lockdown offline against your installed CLI, with no credentials or network: `HARVEY_CODEX_CLI_TESTS=1 pytest tests/test_codex_cli_surface.py`.
 - **Overhead.** Each call checks the CLI version, starts Codex once without your login to verify its configuration, reads the model catalog, then starts it again to run the prompt; each heartbeat's check does the same without the prompt. That adds a few seconds per call, and one Brain's Codex calls run one at a time.
 
 ---
@@ -512,7 +508,8 @@ Harvey automates outreach, but **you are the sender.** Cold email is legal in mo
 ```
 harvey/
 ├── main.py              # heartbeat loop
-├── brain.py             # Claude CLI wrapper + skills loading + usage recording
+├── brain.py             # Claude/Codex provider selection + skills + usage
+├── codex.py             # Isolated Codex subscription runtime
 ├── state.py             # SQLite schema, migrations, observations, cohorts
 ├── signals.py           # the 23-signal catalog Harvey proposes
 ├── pipeline.py          # DISCOVER → PROFILE chaining
@@ -538,7 +535,7 @@ tests/                   # 242 tests
 
 **You decide what a good prospect is.** Harvey proposes signals; you confirm them. A prospect list you can't explain is a prospect list you shouldn't send to.
 
-**If it can be gotten deterministically, don't use a model.** Rank position, tech detection, junk filtering, the priority decision, the pre-send gate — all plain code. Claude is reserved for the parts that genuinely need judgment. That's why this runs on a subscription at all.
+**If it can be gotten deterministically, don't use a model.** Rank position, tech detection, junk filtering, the priority decision, the pre-send gate — all plain code. Claude or Codex is reserved for the parts that need judgment. That's why this runs on a subscription at all.
 
 **A failure is an observation, not silence.** "No team page found" is a finding. "Overpass is throttling" is a finding. Silent failures look exactly like clean results, which is how a broken run gets mistaken for an empty market.
 
