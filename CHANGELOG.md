@@ -5,7 +5,7 @@ Notable changes to Harvey. Dates are release dates; the format follows
 follow [semver](https://semver.org/), with the caveat that Harvey is pre-1.0 and
 minor versions can still change behaviour.
 
-## [Unreleased]
+## [0.3.0] — 2026-10-13
 
 ### Added
 
@@ -50,6 +50,11 @@ minor versions can still change behaviour.
 - Usage is tracked per provider. The budget gate, `harvey usage`, `harvey
   status` and the dashboard read and label the active provider's own quota;
   existing usage history is kept and attributed to Claude.
+
+### Fixed
+
+- Dashboard HTML and text assets now use UTF-8 explicitly, fixing Windows
+  decoding failures. Regression tests cover HTML, CSS, JavaScript and SVG.
 
 ## [0.2.1] — 2026-10-13
 
