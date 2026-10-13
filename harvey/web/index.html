@@ -188,7 +188,7 @@
 
 <!-- Usage -->
 <div id="usage" class="section">
-  <div class="section-head"><h2>Usage</h2><p>Actual Claude usage — your subscription quota, calls, and tokens per agent and task. Subscription plans aren't billed per token, so no dollar costs here.</p></div>
+  <div class="section-head"><h2>Usage</h2><p>Actual model usage — your active subscription's quota (Claude or Codex), calls, and tokens per provider, agent and task. Subscription plans aren't billed per token, so no dollar costs here.</p></div>
   <div id="usage-quota" class="card" style="display:none"></div>
   <div class="stats-grid" id="usage-stats"></div>
   <div class="card" id="usage-daily" style="display:none"></div>
@@ -320,7 +320,7 @@
   <div class="help-section">
     <h2>What is Harvey?</h2>
     <p>Harvey is an autonomous AI sales agent. Once set up, Harvey runs on its own: finds people who match your ideal customer, writes personalized cold emails, sends them through your email platform, reads every reply, handles objections, and works toward booking a meeting. You review everything through this dashboard.</p>
-    <p>Harvey runs on your Claude Max subscription, so there are no extra AI costs. Everything stays on your machine in one folder.</p>
+    <p>Harvey runs on your Claude Max subscription (or, if you opt in, your ChatGPT plan through Codex), so there are no extra AI costs. Everything stays on your machine in one folder.</p>
   </div>
 
   <div class="help-section">
@@ -399,6 +399,11 @@
     <details>
       <summary>Claude headless mode fails</summary>
       <div class="faq-body">Make sure you've run <code>claude login</code> in your terminal and have an active Claude Max subscription. Harvey uses your existing subscription, not a separate API key.</div>
+    </details>
+
+    <details>
+      <summary>Codex calls fail</summary>
+      <div class="faq-body">With <code>brain.provider: codex</code>, set <code>brain.model: gpt-5.5</code> (the verified text-only model; a blank model fails on current ChatGPT accounts and code-mode models are refused), run <code>codex login</code> and choose "Sign in with ChatGPT" (API-key logins are refused). Harvey never renews your Codex login: if the log says it has expired or is due for renewal, use Codex once or run <code>codex login</code>. Harvey needs Codex CLI 0.159.3 on macOS or Linux (Codex isn't supported on Windows; use Claude there) and refuses other versions. While Codex can't be used, Harvey pauses (the Actions card shows "Codex paused" and why), leaves replies and queued emails untouched, and resumes once it's fixed; <code>harvey status --check</code> checks on demand. If the log says isolation could not be verified, a Codex config layer is forcing a tool, hook, MCP server or custom endpoint back on — Harvey refuses to send prompts until it is removed. Harvey never falls back to Claude on its own.</div>
     </details>
 
     <details>

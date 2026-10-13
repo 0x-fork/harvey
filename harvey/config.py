@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 from datetime import time as _time
 from pathlib import Path
 
@@ -152,12 +153,65 @@ class UsageConfig(BaseModel):
         return v
 
 
+BRAIN_PROVIDERS = ("claude", "codex")
+CODEX_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+
+# Model names are passed to a CLI, so they must look like a model name and
+# never like a flag ("-x") or anything a shell would treat specially.
+_MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,127}$")
+
+
+class BrainConfig(BaseModel):
+    """Which subscription Harvey thinks with.
+
+    ``claude`` (default) runs Claude Code headless on your Claude plan.
+    ``codex`` runs Codex on your ChatGPT plan. There is never an automatic
+    fallback between them, and an explicit ``model`` only affects Harvey —
+    your own Claude Code / Codex settings are never read or changed.
+    """
+
+    provider: str = "claude"
+    model: str = ""  # empty = the provider's own default
+    reasoning_effort: str = ""  # codex only; empty = model default
+
+    @field_validator("provider", mode="before")
+    @classmethod
+    def _valid_provider(cls, v) -> str:
+        v = str(v or "claude").strip().lower()
+        if v not in BRAIN_PROVIDERS:
+            raise ValueError(
+                f"'{v}' is not a supported brain provider. "
+                f"Use one of: {', '.join(BRAIN_PROVIDERS)}."
+            )
+        return v
+
+    @field_validator("model", mode="before")
+    @classmethod
+    def _valid_model(cls, v) -> str:
+        v = str(v or "").strip()
+        if v and not _MODEL_NAME_RE.match(v):
+            raise ValueError(f"'{v}' is not a valid model name.")
+        return v
+
+    @field_validator("reasoning_effort", mode="before")
+    @classmethod
+    def _valid_effort(cls, v) -> str:
+        v = str(v or "").strip().lower()
+        if v and v not in CODEX_REASONING_EFFORTS:
+            raise ValueError(
+                f"'{v}' is not a valid reasoning effort. "
+                f"Use one of: {', '.join(CODEX_REASONING_EFFORTS)}."
+            )
+        return v
+
+
 class HarveyConfig(BaseModel):
     persona: PersonaConfig
     product: ProductConfig
     icp: ICPConfig
     channels: ChannelsConfig = ChannelsConfig()
     usage: UsageConfig = UsageConfig()
+    brain: BrainConfig = BrainConfig()
 
 
 class EnvConfig(BaseModel):
@@ -233,6 +287,40 @@ def load_config(config_path: str | None = None) -> HarveyConfig:
             "Fix the fields above or re-run 'harvey setup'."
         )
         raise
+
+
+def load_brain_config(config_path: str | None = None) -> BrainConfig:
+    """Read just the ``brain:`` section, without validating the rest.
+
+    Training runs before a product is configured (the template harvey.yaml
+    still has placeholder values), but it must still think with the
+    provider the user chose. A missing file or section means the Claude
+    default; an invalid section raises rather than silently switching
+    providers.
+    """
+    if config_path is None:
+        try:
+            config_path = _find_config_file()
+        except ConfigFileNotFoundError:
+            return BrainConfig()
+    try:
+        with open(config_path) as f:
+            data = yaml.safe_load(f)
+    except FileNotFoundError:
+        return BrainConfig()
+    except (yaml.YAMLError, OSError) as e:
+        raise ConfigError(f"Could not read the brain settings in {config_path}: {e}")
+    section = data.get("brain") if isinstance(data, dict) else None
+    if section is None:
+        return BrainConfig()
+    if not isinstance(section, dict):
+        raise ConfigError(f"'brain' in {config_path} must be a mapping.")
+    try:
+        return BrainConfig(**section)
+    except ValidationError as e:
+        raise ConfigError(
+            f"Invalid brain settings in {config_path}:\n{_format_validation_error(e)}"
+        )
 
 
 def load_env() -> EnvConfig:

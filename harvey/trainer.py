@@ -17,6 +17,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 from harvey.brain import Brain
+from harvey.config import BrainConfig, load_brain_config
 from harvey.state import StateManager
 
 logger = logging.getLogger("harvey.trainer")
@@ -309,10 +310,23 @@ class FallbackCrawler:
         return f"{parsed.scheme}://{parsed.netloc}{path}"
 
 
+def brain_section(brain_config: BrainConfig) -> dict:
+    """The ``brain:`` block to write back, so retraining keeps the choice."""
+    section = {"provider": brain_config.provider}
+    if brain_config.model:
+        section["model"] = brain_config.model
+    if brain_config.reasoning_effort:
+        section["reasoning_effort"] = brain_config.reasoning_effort
+    return section
+
+
 class Trainer:
-    def __init__(self):
+    def __init__(self, brain_config: BrainConfig | None = None):
+        # Without an explicit choice, train with whatever provider the
+        # existing config selects (Claude when none does).
+        self.brain_config = brain_config or load_brain_config()
         self.state = StateManager()
-        self.brain = Brain(self.state)
+        self.brain = Brain(self.state, self.brain_config)
         self.scraped_pages: dict[str, str] = {}
 
     async def train(
@@ -324,7 +338,7 @@ class Trainer:
         """Train Harvey on a product website.
 
         1. Deep crawl the site (Cloudflare /crawl or fallback)
-        2. Analyze all content with Claude
+        2. Analyze all content with the configured brain
         3. Extract product info, ICP, objections, competitive intel
         4. Generate complete config + product knowledge skill
         """
@@ -762,6 +776,7 @@ What prospects do instead of buying a solution like ours:
                     "timezone": "America/New_York",
                 },
             },
+            "brain": brain_section(self.brain_config),
         }
 
 

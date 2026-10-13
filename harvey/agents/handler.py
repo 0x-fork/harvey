@@ -10,7 +10,7 @@ sending domain while nobody's watching.
 import logging
 from datetime import datetime, timezone
 
-from harvey.brain import Brain
+from harvey.brain import Brain, BrainUnavailable
 from harvey.config import HarveyConfig, EnvConfig
 from harvey.integrations.instantly import InstantlyClient
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
@@ -101,26 +101,31 @@ class Handler:
         )
 
     async def run(self):
-        """Check for new replies and handle them."""
+        """Check for new replies and handle them.
+
+        Returns True only if every reply could be fetched and handled. The
+        heartbeat sends nothing in a cycle where this isn't True, because a
+        reply that wasn't read can't have cancelled its queued follow-ups.
+        """
         logger.info("Handler: Checking for replies...")
 
         # Load foundational skills for this agent
         self.skills = self.brain.load_skills_for_agent("handler")
 
         if not self.config.channels.email.enabled:
-            return
+            return True
 
         if self.is_native:
-            await self._run_native()
-            return
+            return await self._run_native()
 
         # 1. Fetch active campaigns
         active_campaigns = await self.state.get_campaigns_by_status("active")
         if not active_campaigns:
             logger.info("Handler: No active campaigns to monitor.")
-            return
+            return True
 
         total_handled = 0
+        complete = True
 
         for campaign in active_campaigns:
             if not campaign.instantly_campaign_id:
@@ -131,6 +136,7 @@ class Handler:
                 replies = await self.instantly.get_replies(campaign.instantly_campaign_id)
             except Exception as e:
                 logger.error(f"Handler: Failed to fetch replies for {campaign.name}: {e}")
+                complete = False
                 continue
             if not replies:
                 continue
@@ -142,13 +148,18 @@ class Handler:
                     handled = await self._handle_reply(reply, campaign)
                     if handled:
                         total_handled += 1
+                except BrainUnavailable as e:
+                    logger.error(f"Handler: stopping; replies are left for later ({e}).")
+                    return False
                 except Exception as e:
                     logger.error(f"Handler: Error processing reply: {e}")
+                    complete = False
 
         if total_handled:
             logger.info(f"Handler: Processed {total_handled} replies.")
         else:
             logger.info("Handler: No new replies.")
+        return complete
 
     async def _handle_reply(self, reply: dict, campaign) -> bool:
         """Process a single reply. Returns True if a new reply was handled."""
@@ -166,13 +177,19 @@ class Handler:
 
         logger.info(f"Handler: Reply from {lead_email}")
 
+        consumed = True
         try:
             await self._process_reply(lead_email, reply_text, reply_uuid, campaign.id)
+        except BrainUnavailable:
+            # Nothing was decided or recorded about this reply yet, so leave
+            # it for the next cycle instead of losing it to a provider outage.
+            consumed = False
+            raise
         finally:
-            # ALWAYS mark processed — even on early exits (opt-out, OOO,
-            # unknown prospect) — so the same reply is never re-handled
+            # Otherwise ALWAYS mark processed — even on early exits (opt-out,
+            # OOO, unknown prospect) — so the same reply is never re-handled
             # or double-replied on the next cycle.
-            if reply_uuid:
+            if reply_uuid and consumed:
                 await self.state.mark_reply_processed(reply_uuid)
         return True
 
@@ -215,40 +232,49 @@ class Handler:
             intent = await self._classify_intent(reply_text, prospect)
         logger.info(f"Handler: Intent for {lead_email}: {intent}")
 
-        # 2. Get or create conversation
+        # 2. The conversation as it will be, in memory only. Nothing about
+        # this reply is stored until every model call it needs has succeeded:
+        # if the provider goes down part-way (BrainUnavailable), the reply is
+        # left unprocessed and the retry starts from the same stored state,
+        # so the thread never gets the message twice or its stage advanced
+        # twice. (Stop-on-reply above is idempotent and stays first.)
         existing_convos = await self.state.get_conversations_by_status("open")
-        convo = next(
+        stored = next(
             (c for c in existing_convos if c.prospect_id == prospect.id), None
         )
-
-        if not convo:
+        if stored is not None:
+            convo = stored.model_copy(deep=True)
+        else:
             convo = Conversation(
                 id="",
                 prospect_id=prospect.id,
                 campaign_id=campaign_id,
                 channel="email",
-                thread=[
-                    Message(sender="prospect", content=reply_text),
-                ],
                 intent=intent,
                 status="open",
             )
+        convo.thread.append(Message(sender="prospect", content=reply_text))
+        convo.intent = intent
+        old_stage = convo.stage
+        convo.stage = self._determine_stage(intent, convo.stage, reply_text)
+
+        # 2b. Draft the reply now, while nothing is stored yet.
+        response = ""
+        if intent in AUTO_REPLY_INTENTS:
+            response = await self._generate_response(intent, reply_text, prospect, convo)
+
+        # 2c. Store the conversation in one write.
+        if stored is None:
             convo.id = await self.state.add_conversation(convo)
         else:
-            convo.thread.append(Message(sender="prospect", content=reply_text))
-            convo.intent = intent
             await self.state.update_conversation(
                 convo.id,
                 thread_json=convo.thread_json(),
                 intent=intent,
+                stage=convo.stage,
             )
-
-        # 2b. Advance conversation stage based on intent
-        new_stage = self._determine_stage(intent, convo.stage, reply_text)
-        if new_stage != convo.stage:
-            logger.info(f"Handler: Stage for {lead_email}: {convo.stage} -> {new_stage}")
-            await self.state.update_conversation(convo.id, stage=new_stage)
-            convo.stage = new_stage
+        if convo.stage != old_stage:
+            logger.info(f"Handler: Stage for {lead_email}: {old_stage} -> {convo.stage}")
 
         # 3. Route based on intent
         if intent == "unsubscribe":
@@ -293,10 +319,21 @@ class Handler:
             logger.warning(f"Handler: No auto-reply policy for intent '{intent}'. Skipping reply.")
             return
 
-        # For interested, objection, question, wrong_person — generate a reply
-        response = await self._generate_response(intent, reply_text, prospect, convo)
+        # For interested, objection, question, wrong_person — the reply drafted above
         if not response:
-            logger.warning(f"Handler: Could not generate response for {lead_email}")
+            # No usable draft from a working provider: hand it to a human
+            # rather than leave an answered-looking thread with no reply.
+            await self.state.update_conversation(convo.id, status="needs_human")
+            await self.state.log_action(
+                action_type="escalation",
+                agent="handler",
+                details={"prospect_email": lead_email, "reason": "no usable reply draft",
+                         "reply_preview": reply_text[:200]},
+            )
+            logger.warning(
+                f"Handler: Could not generate a response for {lead_email}. "
+                "Flagged for human review."
+            )
             return
 
         # Send the response — natively through the outbox approval ladder,
@@ -328,25 +365,28 @@ class Handler:
 
     # ── Native provider path (Gmail / SMTP) ──
 
-    async def _run_native(self):
-        """Poll the mailbox, split bounces from human replies, handle both."""
+    async def _run_native(self) -> bool:
+        """Poll the mailbox, split bounces from human replies, handle both.
+        Returns True only if the mailbox was read and every message handled."""
         if not self.provider.is_configured():
             logger.debug(
                 f"Handler: provider '{self.provider.name}' not configured yet."
             )
-            return
+            return True  # nothing to read; the sender can't send through it either
 
         try:
             inbound = await self.provider.get_replies()
         except Exception as e:
             logger.error(f"Handler: fetching replies failed: {e}")
-            return
+            return False
 
         handled = 0
+        complete = True
         for msg in inbound:
             dedup_key = msg.provider_id or msg.message_id
             if not dedup_key or await self.state.is_reply_processed(dedup_key):
                 continue
+            consumed = True
             try:
                 if msg.is_bounce:
                     await self._handle_bounce(msg)
@@ -362,15 +402,23 @@ class Handler:
                         },
                     )
                 handled += 1
+            except BrainUnavailable as e:
+                consumed = False
+                complete = False
+                logger.error(f"Handler: stopping; replies are left for later ({e}).")
+                break
             except Exception as e:
                 logger.error(f"Handler: error processing {msg.from_email}: {e}")
+                complete = False
             finally:
-                await self.state.mark_reply_processed(dedup_key)
+                if consumed:
+                    await self.state.mark_reply_processed(dedup_key)
 
         if handled:
             logger.info(f"Handler: processed {handled} inbound message(s).")
         else:
             logger.info("Handler: no new replies.")
+        return complete
 
     async def _handle_bounce(self, msg):
         """A bounce is a data bug AND a reputation threat. Fix both."""
@@ -477,6 +525,11 @@ Respond with ONLY the category label, nothing else."""
             agent="handler", task="classify_intent",
         )
         if not result:
+            paused = getattr(self.brain, "paused_reason", "")
+            if paused:
+                # The provider is down (login, setup, usage limit), not this
+                # reply: don't escalate it, leave it unprocessed.
+                raise BrainUnavailable(paused)
             # Classifier failed. Do NOT auto-reply blind — flag for a human.
             logger.warning("Handler: Intent classifier returned nothing. Escalating.")
             return "escalate"
@@ -605,6 +658,11 @@ Write a reply that:"""
             agent="handler", task="generate_response",
         )
         if not response:
+            paused = getattr(self.brain, "paused_reason", "")
+            if paused:
+                # The provider went down mid-reply; nothing is stored yet,
+                # so leave the reply for a clean retry.
+                raise BrainUnavailable(paused)
             return ""
         response = response.strip()
         # Guard against the model returning meta-text instead of an email
