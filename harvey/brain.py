@@ -20,6 +20,7 @@ SKILLS_DIR = PROJECT_ROOT / "skills"
 DEFAULT_TIMEOUT_SECONDS = 300  # a single Claude call should never hang forever
 DEFAULT_MAX_RETRIES = 2  # retries on transient failures (non-zero exit, timeout)
 RETRY_BASE_DELAY = 5.0  # seconds; doubles per attempt
+_MAX_ARGV_PROMPT_CHARS = 8000  # longer prompts go via stdin (Windows argv limit)
 
 # stderr fragments that indicate retrying is pointless
 _NON_RETRYABLE_PATTERNS = (
@@ -56,8 +57,13 @@ class Brain:
         ``agent``/``task`` label the call in the usage_events ledger so the
         dashboard can attribute tokens and cost to specific work.
         """
-        cmd = [
-            "claude", "-p", prompt,
+        # Windows caps a command line at ~32k chars and surfaces the overflow
+        # as FileNotFoundError (WinError 206), so long prompts go via stdin.
+        prompt_via_stdin = len(prompt) > _MAX_ARGV_PROMPT_CHARS
+        cmd = ["claude", "-p"]
+        if not prompt_via_stdin:
+            cmd.append(prompt)
+        cmd += [
             # JSON output carries exact token/cost accounting per call.
             "--output-format", "json",
             # No tools at all: Harvey only ever needs text back, and prompts
@@ -96,13 +102,17 @@ class Brain:
                     *cmd,
                     # DEVNULL: the CLI reads inherited stdin as prompt input,
                     # stealing the terminal (and any piped answers) from Harvey.
-                    stdin=asyncio.subprocess.DEVNULL,
+                    stdin=(asyncio.subprocess.PIPE if prompt_via_stdin
+                           else asyncio.subprocess.DEVNULL),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
                 try:
                     stdout, stderr = await asyncio.wait_for(
-                        process.communicate(), timeout=timeout
+                        process.communicate(
+                            prompt.encode("utf-8") if prompt_via_stdin else None
+                        ),
+                        timeout=timeout,
                     )
                 except asyncio.TimeoutError:
                     logger.error(f"Claude call timed out after {timeout:.0f}s. Killing process.")
