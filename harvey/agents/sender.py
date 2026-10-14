@@ -440,6 +440,22 @@ class Sender:
         due = await self.state.get_outbox(
             status="approved", due_before=now, limit=budget * 3
         )
+        if self.precleared is not None:
+            # Cold emails held by an unavailable compliance check stay
+            # approved at the front of the queue and could fill the page
+            # above, so fetch replies (and any other unchecked kind) on their
+            # own too. Bounded: one extra query of the same size.
+            seen = {item["id"] for item in due}
+            unchecked = await self.state.get_outbox(
+                status="approved", due_before=now, limit=budget * 3,
+                exclude_kind="sequence",
+            )
+            extra = [item for item in unchecked if item["id"] not in seen]
+            if extra:
+                due = sorted(
+                    due + extra,
+                    key=lambda i: (i.get("send_at") or "", i.get("created_at") or ""),
+                )
         if not due:
             return
 

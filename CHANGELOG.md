@@ -14,10 +14,11 @@ minor versions can still change behaviour.
   have each new recipient checked before the first cold email against UK
   PECR, US CAN-SPAM, Canada's CASL, Germany's UWG and France's rules. Any
   verdict but `ok_to_email` fails that outbox item with the rule and the next
-  step. If the check can't be made (daily allowance used up, network down),
-  cold emails wait for a later cycle while replies still go out. One check per
-  address, cached for 30 days, and the receipt id is logged with each send.
-  Native providers only. Off by default.
+  step. If the check can't be made (daily allowance used up, network down, a
+  malformed response), cold emails wait for a later cycle while replies still
+  go out. One check per address, cached for 30 days; changing the sender
+  country, address source or product description triggers a fresh check. The
+  receipt id is logged with each send. Native providers only. Off by default.
 
 ## [0.3.0] — 2026-10-13
 

@@ -6,6 +6,7 @@ checked. No network: every Precleared call goes to an httpx.MockTransport."""
 import json
 import os
 import tempfile
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import aiosqlite
@@ -282,3 +283,96 @@ async def test_replies_are_never_checked(state):
 
     assert calls == []
     assert len(provider.sent) == 1
+
+
+# ── review regressions (PR #8) ──
+
+
+@pytest.mark.asyncio
+async def test_changed_decision_inputs_require_a_new_check(state):
+    calls = []
+    initial = PreclearedClient("US", address_source="published", pitch="Delivery software",
+                               transport=mock_precleared(calls, OK_BODY))
+    assert (await initial.clear("person@example.com", state)).allowed
+
+    updated = PreclearedClient("GB", address_source="unknown", pitch="Unrelated offer",
+                               transport=mock_precleared(calls, CONSENT_BODY))
+    result = await updated.clear("person@example.com", state)
+
+    assert not result.allowed, f"Stale approval reused; upstream calls={len(calls)}"
+    assert result.verdict == "consent_needed"
+    assert result.receipt_id == "cc_rcpt_NO0000000001"
+    assert len(calls) == 2
+    # The new verdict replaced the old one, so asking again with the new facts is cached.
+    assert not (await updated.clear("person@example.com", state)).allowed
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_legacy_address_only_cache_entry_is_not_reused(state):
+    await state.set_setting(SETTINGS_PREFIX + "person@example.com", json.dumps({
+        "verdict": "ok_to_email", "reason": "", "receipt_id": "cc_rcpt_OLD0000000001",
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }))
+    calls = []
+    client = PreclearedClient("GB", transport=mock_precleared(calls, CONSENT_BODY))
+
+    result = await client.clear("person@example.com", state)
+
+    assert not result.allowed
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_held_cold_backlog_does_not_starve_replies(state):
+    pid = await seed_prospect(state)
+    for step in range(24):
+        await queue(state, pid, step=step + 1)
+    reply_pid = await seed_prospect(state, email="reply@example.com", status="replied")
+    await queue(state, reply_pid, kind="reply", to="reply@example.com")
+    provider = FakeProvider()
+    sender = with_check(make_sender(state, provider), mock_precleared([], status=429))
+
+    await sender._drain_due()
+    await sender._drain_due()
+
+    assert [m["to"] for m in provider.sent] == ["reply@example.com"]
+    assert len(await state.get_outbox(status="approved")) == 24
+    assert await state.get_outbox(status="failed") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [[], "ok_to_email", {"verdict": "maybe"}, {"reasons": []}])
+async def test_malformed_response_holds_cold_email_and_reply_still_sends(state, body):
+    pid = await seed_prospect(state)
+    await queue(state, pid)
+    reply_pid = await seed_prospect(state, email="reply@example.com", status="replied")
+    await queue(state, reply_pid, kind="reply", to="reply@example.com")
+    provider = FakeProvider()
+    sender = with_check(make_sender(state, provider), mock_precleared([], body=body))
+
+    await sender._drain_due()
+
+    assert [m["to"] for m in provider.sent] == ["reply@example.com"]
+    assert await state.get_outbox(status="failed") == []
+    assert [i["to_email"] for i in await state.get_outbox(status="approved")] == ["jane@acme.com"]
+    # Nothing cached from a malformed answer, so the next cycle asks again.
+    assert await state.get_setting(SETTINGS_PREFIX + "jane@acme.com") == ""
+
+
+@pytest.mark.asyncio
+async def test_unexpected_optional_field_shapes_are_ignored(state):
+    body = {
+        "verdict": "consent_needed",
+        "reasons": {"text": "not a list"},
+        "next_step": 5,
+        "receipt": "cc_rcpt_not_an_object",
+    }
+    client = PreclearedClient("GB", transport=mock_precleared([], body=body))
+
+    result = await client.clear("person@example.com", state)
+
+    assert not result.allowed and not result.held
+    assert result.verdict == "consent_needed"
+    assert result.reason == ""
+    assert result.receipt_id == ""
