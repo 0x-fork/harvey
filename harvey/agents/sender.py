@@ -21,6 +21,7 @@ from harvey.config import HarveyConfig, EnvConfig
 from harvey.gate import pre_send_check
 from harvey.integrations.instantly import InstantlyClient
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
+from harvey.integrations.precleared import PreclearedClient
 from harvey.state import StateManager
 
 logger = logging.getLogger("harvey.sender")
@@ -62,6 +63,8 @@ class Sender:
         self.config = config
         self.instantly = InstantlyClient(env.instantly_api_key)
         self.provider = get_mail_provider(config, env)
+        # Optional per-recipient compliance check; None unless enabled.
+        self.precleared = PreclearedClient.from_config(config, env)
         # Disabled in tests to skip inter-send sleeps.
         self.send_pacing = True
 
@@ -442,9 +445,15 @@ class Sender:
 
         allow_risky = getattr(self.config.channels.email, "send_to_risky", False)
         sent = 0
+        # Set when Precleared can't be asked (allowance used up, network):
+        # cold emails wait for a later cycle, replies still go out.
+        compliance_paused = False
         for item in due:
             if sent >= budget:
                 break
+            needs_check = self.precleared is not None and item["kind"] == "sequence"
+            if needs_check and compliance_paused:
+                continue
 
             prospect = await self.state.get_prospect(item["prospect_id"])
             if prospect is None:
@@ -475,6 +484,30 @@ class Sender:
                     f"{gate.reasons}"
                 )
                 continue
+
+            # Optional compliance check (compliance.precleared): one per
+            # address, before the first cold email. Replies are never checked.
+            receipt_id = ""
+            if needs_check:
+                clearance = await self.precleared.clear(item["to_email"], self.state)
+                if clearance.held:
+                    compliance_paused = True
+                    logger.warning(
+                        f"Sender: compliance check unavailable, holding cold "
+                        f"email until a later cycle: {clearance.reason}"
+                    )
+                    continue
+                if not clearance.allowed:
+                    await self.state.update_outbox_item(
+                        item["id"], status="failed",
+                        error=f"precleared: {clearance.verdict}: {clearance.reason}"[:300],
+                    )
+                    logger.warning(
+                        f"Sender: Precleared held back email to {item['to_email']}: "
+                        f"{clearance.verdict} ({clearance.reason})"
+                    )
+                    continue
+                receipt_id = clearance.receipt_id
 
             result = await self.provider.send_email(
                 item["to_email"], item["subject"], item["body"],
@@ -510,13 +543,16 @@ class Sender:
                         )
                 except Exception as e:
                     logger.debug(f"Sender: convo append failed: {e}")
+            details = {
+                "to": item["to_email"], "step": item["step"],
+                "kind": item["kind"], "provider": self.provider.name,
+            }
+            if receipt_id:
+                details["precleared_receipt"] = receipt_id
             await self.state.log_action(
                 action_type="email_sent",
                 agent="sender",
-                details={
-                    "to": item["to_email"], "step": item["step"],
-                    "kind": item["kind"], "provider": self.provider.name,
-                },
+                details=details,
             )
             logger.info(
                 f"Sender: sent step {item['step']} to {item['to_email']} "
