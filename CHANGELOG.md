@@ -5,6 +5,20 @@ Notable changes to Harvey. Dates are release dates; the format follows
 follow [semver](https://semver.org/), with the caveat that Harvey is pre-1.0 and
 minor versions can still change behaviour.
 
+## [Unreleased]
+
+### Added
+
+- **Optional per-recipient compliance check (Precleared).** Set
+  `compliance.precleared.enabled: true` with `sender_country: GB` or `US` to
+  have each new recipient checked before the first cold email against UK
+  PECR, US CAN-SPAM, Canada's CASL, Germany's UWG and France's rules. Any
+  verdict but `ok_to_email` fails that outbox item with the rule and the next
+  step. If the check can't be made (daily allowance used up, network down),
+  cold emails wait for a later cycle while replies still go out. One check per
+  address, cached for 30 days, and the receipt id is logged with each send.
+  Native providers only. Off by default.
+
 ## [0.3.0] — 2026-10-13
 
 ### Added
