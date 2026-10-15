@@ -64,3 +64,15 @@ usage:
     start: "22:00"
     end: "07:00"
     timezone: "America/New_York"
+
+# Optional: check each new recipient with Precleared (precleared.dev) before
+# the first cold email: may cold marketing email go to this address under UK
+# PECR, US CAN-SPAM, Canada's CASL, Germany's UWG and France's rules? Any other
+# answer holds the email back, with the reason in the Outbox. One check per
+# address; 10 a day free without a key, 25 with a free key (PRECLEARED_API_KEY
+# in .env). Applies to the native providers (gmail, smtp).
+compliance:
+  precleared:
+    enabled: false
+    sender_country: ""          # GB or US: where your business is based
+    address_source: "unknown"   # published | bought | scraped | given | unknown

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, ValidationError, field_validator
+from pydantic import BaseModel, ValidationError, field_validator, model_validator
 
 from harvey.paths import PROJECT_ROOT
 
@@ -103,6 +103,57 @@ class LinkedInChannelConfig(BaseModel):
 class ChannelsConfig(BaseModel):
     email: EmailChannelConfig = EmailChannelConfig()
     linkedin: LinkedInChannelConfig = LinkedInChannelConfig()
+
+
+PRECLEARED_ADDRESS_SOURCES = ("published", "bought", "scraped", "given", "unknown")
+
+
+class PreclearedConfig(BaseModel):
+    """Optional per-recipient cold-email check through Precleared.
+
+    Off by default. When on, each new recipient is checked once, before the
+    first cold email, against UK PECR, US CAN-SPAM, Canada's CASL, Germany's
+    UWG and France's rules. Any verdict other than ok_to_email holds the
+    email back with the reason. See harvey/integrations/precleared.py.
+    """
+
+    enabled: bool = False
+    # Where your business is based: GB or US. Required when enabled.
+    sender_country: str = ""
+    # Where prospect addresses come from, in Precleared's terms. Harvey
+    # builds most addresses from a learned pattern, so the honest default
+    # is "unknown"; use "published" only if yours are copied from the
+    # businesses' own websites.
+    address_source: str = "unknown"
+
+    @field_validator("sender_country", mode="before")
+    @classmethod
+    def _upper_country(cls, v) -> str:
+        return str(v or "").strip().upper()
+
+    @field_validator("address_source", mode="before")
+    @classmethod
+    def _valid_source(cls, v) -> str:
+        v = str(v or "unknown").strip().lower()
+        if v not in PRECLEARED_ADDRESS_SOURCES:
+            raise ValueError(
+                f"'{v}' is not a valid address_source. "
+                f"Use one of: {', '.join(PRECLEARED_ADDRESS_SOURCES)}."
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _country_when_enabled(self):
+        if self.enabled and self.sender_country not in ("GB", "US"):
+            raise ValueError(
+                "compliance.precleared.sender_country must be GB or US "
+                "when the check is enabled."
+            )
+        return self
+
+
+class ComplianceConfig(BaseModel):
+    precleared: PreclearedConfig = PreclearedConfig()
 
 
 class QuietHoursConfig(BaseModel):
@@ -212,6 +263,7 @@ class HarveyConfig(BaseModel):
     channels: ChannelsConfig = ChannelsConfig()
     usage: UsageConfig = UsageConfig()
     brain: BrainConfig = BrainConfig()
+    compliance: ComplianceConfig = ComplianceConfig()
 
 
 class EnvConfig(BaseModel):
@@ -237,6 +289,8 @@ class EnvConfig(BaseModel):
     imap_port: int = 993
     imap_username: str = ""
     imap_password: str = ""
+    # Optional: only used when compliance.precleared.enabled is true.
+    precleared_api_key: str = ""
 
 
 def _format_validation_error(e: ValidationError) -> str:
@@ -347,6 +401,7 @@ def load_env() -> EnvConfig:
         imap_port=int(os.getenv("IMAP_PORT", "993").strip() or 993),
         imap_username=os.getenv("IMAP_USERNAME", "").strip(),
         imap_password=os.getenv("IMAP_PASSWORD", "").strip(),
+        precleared_api_key=os.getenv("PRECLEARED_API_KEY", "").strip(),
     )
     return env
 
