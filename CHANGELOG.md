@@ -18,6 +18,16 @@ minor versions can still change behaviour.
   days of the inbox without marking anything read, refuses to act as any
   mailbox other than `persona.email`, and holds sending when the inbox can't
   be read. See [docs/microsoft365.md](docs/microsoft365.md).
+- **Optional per-recipient compliance check (Precleared).** Set
+  `compliance.precleared.enabled: true` with `sender_country: GB` or `US` to
+  have each new recipient checked before the first cold email against UK
+  PECR, US CAN-SPAM, Canada's CASL, Germany's UWG and France's rules. Any
+  verdict but `ok_to_email` fails that outbox item with the rule and the next
+  step. If the check can't be made (daily allowance used up, network down, a
+  malformed response), cold emails wait for a later cycle while replies still
+  go out. One check per address, cached for 30 days; changing the sender
+  country, address source or product description triggers a fresh check. The
+  receipt id is logged with each send. Native providers only. Off by default.
 
 ## [0.3.0] — 2026-10-13
 
