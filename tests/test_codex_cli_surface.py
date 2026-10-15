@@ -125,6 +125,9 @@ def mock_codex(monkeypatch, tmp_path):
     port = server.server_address[1]
 
     native = _fake_native_login(tmp_path)
+    # Brain constructs its own CodexClient: keep those clients on the fake
+    # login too, never the operator's real CODEX_HOME or ~/.codex.
+    monkeypatch.setenv("CODEX_HOME", str(native))
 
     extra = {"toml": ""}
     lockdown = hc.build_private_config_toml
