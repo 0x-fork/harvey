@@ -71,7 +71,8 @@ class ICPConfig(BaseModel):
 class EmailChannelConfig(BaseModel):
     enabled: bool = True
     # "instantly" (legacy), "gmail" (Gmail/Workspace via API — recommended),
-    # or "smtp" (any SMTP+IMAP mailbox: AgentMail, Fastmail, ...)
+    # "microsoft" (Microsoft 365 / Outlook via Graph), or "smtp" (any
+    # SMTP+IMAP mailbox: AgentMail, Fastmail, ...)
     provider: str = "instantly"
     max_daily_sends: int = 50
     # When True, also send to catch-all ("risky") domains, not just verified
@@ -237,6 +238,9 @@ class EnvConfig(BaseModel):
     imap_port: int = 993
     imap_username: str = ""
     imap_password: str = ""
+    # Microsoft 365 (channels.email.provider: microsoft)
+    m365_client_id: str = ""
+    m365_tenant_id: str = ""
 
 
 def _format_validation_error(e: ValidationError) -> str:
@@ -347,6 +351,8 @@ def load_env() -> EnvConfig:
         imap_port=int(os.getenv("IMAP_PORT", "993").strip() or 993),
         imap_username=os.getenv("IMAP_USERNAME", "").strip(),
         imap_password=os.getenv("IMAP_PASSWORD", "").strip(),
+        m365_client_id=os.getenv("M365_CLIENT_ID", "").strip(),
+        m365_tenant_id=os.getenv("M365_TENANT_ID", "").strip(),
     )
     return env
 

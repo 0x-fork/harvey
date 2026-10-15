@@ -107,7 +107,7 @@ Profiling and outbox draining ride along on **every** cycle regardless, because 
 
 - **Python 3.11+** — check with `python3 --version`. macOS ships 3.9; if that's what you have, `brew install python@3.13` first.
 - An active **Claude Pro or Max** subscription, with the CLI logged in (`claude login`) — or, opt-in, a **ChatGPT plan with the Codex CLI** ([see below](#using-a-chatgpt-plan-instead-codex))
-- A mailbox to send from — Gmail/Workspace recommended, on a *dedicated secondary domain*
+- A mailbox to send from — Gmail/Workspace recommended, on a *dedicated secondary domain*. Microsoft 365 works too ([setup](docs/microsoft365.md))
 
 ### Easiest: let Claude set it up
 
@@ -390,7 +390,7 @@ persona:      { name, company, role, email, tone }
 product:      { name, description, pricing, key_benefits, objection_responses, offer }
 icp:          { industries, titles, company_size, geography, hiring_signals, geo_coordinates }
 channels:
-  email:      { provider: gmail | smtp | instantly, max_daily_sends, require_approval,
+  email:      { provider: gmail | microsoft | smtp | instantly, max_daily_sends, require_approval,
                 send_to_risky, max_bounce_rate }
 usage:        { max_daily_claude_percent, heartbeat_interval_minutes, quiet_hours }
 brain:        { provider: claude | codex, model, reasoning_effort }   # optional; claude by default
@@ -415,6 +415,7 @@ harvey outbox                # review queued email
 harvey export                # deliverable prospects → CSV
 harvey sending pause|resume  # kill switch
 harvey gmail auth            # one-time Gmail OAuth
+harvey microsoft auth|test  # one-time Microsoft 365 sign-in (docs/microsoft365.md)
 ```
 
 
@@ -547,7 +548,7 @@ tests/                   # 242 tests
 
 ## Roadmap
 
-**Done:** heartbeat loop · observation data model with governed vocabulary · user-confirmed signal catalog · cohort builder · discovery provider menu with cost estimates · free HTTP profiler with agency detection · pattern-first email finding with honest status · native mail providers (Gmail API, SMTP+IMAP) · outbox approval ladder · deterministic pre-send gate · bounce detection and kill switch · reply handling with intent classification · subscription quota tracking · website trainer · web dashboard · CSV export
+**Done:** heartbeat loop · observation data model with governed vocabulary · user-confirmed signal catalog · cohort builder · discovery provider menu with cost estimates · free HTTP profiler with agency detection · pattern-first email finding with honest status · native mail providers (Gmail API, Microsoft 365 via Graph, SMTP+IMAP) · outbox approval ladder · deterministic pre-send gate · bounce detection and kill switch · reply handling with intent classification · subscription quota tracking · website trainer · web dashboard · CSV export
 
 **Next:** people enrichment from public registries · consent-gated voice callbacks · calendar integration for auto-booking · scheduled re-observation so signal *changes* trigger outreach · multi-product support
 
