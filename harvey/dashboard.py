@@ -150,6 +150,11 @@ async def get_setup_status():
             (PROJECT_ROOT / "data" / "gmail_token.json").is_file()
         provider_help = ("Set GMAIL_CLIENT_ID/SECRET in Settings, then run "
                          "'harvey gmail auth' in your terminal.")
+    elif provider == "microsoft":
+        provider_done = _has("M365_CLIENT_ID") and \
+            (PROJECT_ROOT / "data" / "m365_token.json").is_file()
+        provider_help = ("Set M365_CLIENT_ID and M365_TENANT_ID in .env, then run "
+                         "'harvey microsoft auth' in your terminal.")
     elif provider == "smtp":
         provider_done = _has("SMTP_HOST", "SMTP_USERNAME", "SMTP_PASSWORD")
         provider_help = "Enter your SMTP host, username, and password in Settings."

@@ -9,6 +9,15 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Microsoft 365 mail provider.** Set `channels.email.provider: microsoft` to
+  send and read through a Microsoft 365 / Outlook mailbox via Microsoft Graph,
+  for domains whose mail lives in Exchange Online (which no longer accepts
+  passwords over IMAP). Signs in once with OAuth + PKCE (`harvey microsoft
+  auth`; no client secret, no stored password), drafts then sends so the
+  Message-ID is known, threads replies with `createReply`, reads the last 7
+  days of the inbox without marking anything read, refuses to act as any
+  mailbox other than `persona.email`, and holds sending when the inbox can't
+  be read. See [docs/microsoft365.md](docs/microsoft365.md).
 - **Optional per-recipient compliance check (Precleared).** Set
   `compliance.precleared.enabled: true` with `sender_country: GB` or `US` to
   have each new recipient checked before the first cold email against UK

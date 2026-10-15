@@ -392,6 +392,28 @@ def cmd_gmail(args):
         asyncio.run(_test())
 
 
+def cmd_microsoft(args):
+    """Microsoft 365 provider utilities (auth / test)."""
+    from harvey.config import load_env
+
+    env = load_env()
+    if args.microsoft_action == "auth":
+        from harvey.integrations.microsoft import run_auth_flow
+        ok = run_auth_flow(env.m365_client_id, env.m365_tenant_id)
+        sys.exit(0 if ok else 1)
+
+    if args.microsoft_action == "test":
+        from harvey.config import load_config
+        from harvey.integrations.microsoft import MicrosoftProvider
+
+        async def _test():
+            provider = MicrosoftProvider(load_config(), env)
+            ok, detail = await provider.test_connection()
+            print(f"\n  {'✓' if ok else '✗'} {detail}\n")
+            sys.exit(0 if ok else 1)
+        asyncio.run(_test())
+
+
 def cmd_outbox(args):
     """Review and approve queued outgoing emails."""
     from harvey.state import StateManager
@@ -710,6 +732,12 @@ def main():
     sub.add_argument("gmail_action", choices=["auth", "test"],
                      help="auth: one-time OAuth; test: verify connection")
     sub.set_defaults(func=cmd_gmail)
+
+    # harvey microsoft auth|test
+    sub = subparsers.add_parser("microsoft", help="Microsoft 365 provider setup")
+    sub.add_argument("microsoft_action", choices=["auth", "test"],
+                     help="auth: one-time sign-in; test: verify connection")
+    sub.set_defaults(func=cmd_microsoft)
 
     # harvey outbox
     sub = subparsers.add_parser("outbox", help="Review/approve queued emails")

@@ -6,6 +6,8 @@ thread. Two native providers ship:
 - ``gmail``  — a Google Workspace / Gmail mailbox via the Gmail REST API
   (recommended: a real mailbox on a dedicated secondary domain is the
   most deliverable way to send <50 cold emails/day).
+- ``microsoft`` — a Microsoft 365 / Outlook mailbox via Microsoft Graph
+  (OAuth; Exchange Online no longer accepts passwords over IMAP).
 - ``smtp``   — any mailbox that speaks SMTP + IMAP (AgentMail, Fastmail,
   a Workspace app-mailbox, self-hosted). Configuration via .env.
 
@@ -19,7 +21,7 @@ from dataclasses import dataclass, field
 
 logger = logging.getLogger("harvey.mail")
 
-NATIVE_PROVIDERS = ("gmail", "smtp")
+NATIVE_PROVIDERS = ("gmail", "smtp", "microsoft")
 
 
 @dataclass
@@ -96,4 +98,7 @@ def get_mail_provider(config, env) -> MailProvider | None:
     if provider == "smtp":
         from harvey.integrations.smtp_mail import SmtpImapProvider
         return SmtpImapProvider(config, env)
+    if provider == "microsoft":
+        from harvey.integrations.microsoft import MicrosoftProvider
+        return MicrosoftProvider(config, env)
     return None
