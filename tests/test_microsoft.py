@@ -2,6 +2,7 @@
 reading the inbox without touching it, and failing loudly."""
 
 import json
+import os
 
 import httpx
 import pytest
@@ -118,7 +119,8 @@ async def test_refresh_token_rotates_and_is_saved(graph):
     assert "client_secret" not in form  # public client
     saved = json.loads(microsoft.TOKEN_FILE.read_text())
     assert saved["refresh_token"] == "rt-2"
-    assert microsoft.TOKEN_FILE.stat().st_mode & 0o777 == 0o600
+    if os.name == "posix":  # Windows has no POSIX mode bits; ACLs apply
+        assert microsoft.TOKEN_FILE.stat().st_mode & 0o777 == 0o600
 
 
 @pytest.mark.asyncio

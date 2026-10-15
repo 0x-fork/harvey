@@ -69,7 +69,10 @@ Harvey asks for four **delegated** permissions:
 | `User.Read` | check which mailbox the token belongs to |
 | `offline_access` | keep working without signing in again |
 
-The refresh token is stored in `data/m365_token.json` (mode 600, gitignored).
+The refresh token is stored in `data/m365_token.json` (gitignored). On macOS
+and Linux the file is mode 600 (owner only). Windows has no such mode bits:
+the file is protected only by the access permissions (ACLs) of the folder
+Harvey lives in, so keep Harvey in a folder only you can read.
 Microsoft rotates it on every use, and Harvey saves the new one each time.
 
 ### If you see "Need admin approval"
