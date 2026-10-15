@@ -99,7 +99,7 @@ To make sure nobody else in the tenant can use the app, go to
   prospect's own message, so `In-Reply-To` and `References` are correct. If
   that message was deleted, the reply goes out as a new email.
 - **Your inbox is left alone.** Each cycle, Harvey reads the last 7 days of
-  the inbox, newest first, and skips your own mail. It never marks anything
+  the inbox, newest first, all of it (page by page), and skips your own mail. It never marks anything
   read, moves it or deletes it. It keeps its own record of what it has
   handled.
 - **It only acts as the right mailbox.** If the signed-in mailbox isn't
@@ -109,7 +109,8 @@ To make sure nobody else in the tenant can use the app, go to
 - **Failures hold sending.** If the inbox can't be read (expired login,
   Graph outage, throttling), the cycle sends nothing. A reply nobody read
   can't have stopped its follow-ups. Graph throttling (429/503 with a short
-  `Retry-After`) is retried once.
+  `Retry-After`) is retried once. A read that fails part-way through counts
+  as a failed read: Harvey never acts on part of the inbox.
 - **Unsent drafts are cleaned up.** If a send fails, its draft is deleted
   so it doesn't sit in your Drafts folder.
 - **The sender name is the mailbox's.** Mail goes out under the mailbox's
@@ -149,7 +150,32 @@ delete the app registration. Then delete `data/m365_token.json`.
 
 `get_replies` **raises** `GraphError` when the inbox can't be read, instead
 of returning `[]`. The handler turns that into a failed read, and the
-heartbeat holds sending.
+heartbeat holds sending. It returns the whole 7-day window or nothing:
+
+- **Every page.** `limit` is only the page size (`$top`). Harvey follows
+  `@odata.nextLink` until Graph stops sending one, using the link exactly
+  as given, without re-adding the first request's parameters or touching
+  `$skip`, as Microsoft asks. Messages repeated across pages (new mail
+  shifts `$skip` mid-read) are returned once.
+- **Links are checked before the token is attached.** A `nextLink` must be
+  `https://graph.microsoft.com` (default port), on the path
+  `/v1.0/me/mailFolders/inbox/messages`, with a query, and no credentials,
+  fragment, backslash or control characters. A link that repeats an earlier
+  page is a loop. Either way the read fails without sending the request.
+- **Bounded.** More than `MAX_INBOX_PAGES` (40) pages, i.e. 2,000 messages
+  in a week at the default page size, fails the read rather than truncating.
+- **Malformed data fails.** Any Graph response must be a JSON object; only
+  `202`/`204` (send, delete) may be empty. A page whose `value` is missing
+  or isn't a list, or a message with the wrong shape (no `id`, `from` or
+  `body` not an object, non-string fields, headers not a list) raises. A
+  message with no sender address is skipped, as before.
+
+Limitations: a mailbox with more than 2,000 inbox messages in 7 days holds
+sending every cycle until the volume drops (raise `MAX_INBOX_PAGES` or the
+page size). If Graph ever returns a `nextLink` in another shape (say
+`/users/{id}/...`), reads fail closed until the check is widened. Mail that
+arrives while pages are being read can shift `$skip` so one message is
+missed that cycle; the next cycle reads it, since the window is 7 days.
 
 The loopback callback server listens on both `127.0.0.1` and `::1`, because
 `localhost` resolves to both and browsers differ in which one they try.

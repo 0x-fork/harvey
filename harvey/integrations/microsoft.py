@@ -47,6 +47,12 @@ logger = logging.getLogger("harvey.microsoft")
 
 TOKEN_FILE = PROJECT_ROOT / "data" / "m365_token.json"
 GRAPH = "https://graph.microsoft.com/v1.0"
+GRAPH_HOST = "graph.microsoft.com"
+INBOX_MESSAGES = "/me/mailFolders/inbox/messages"
+INBOX_MESSAGES_PATH = "/v1.0" + INBOX_MESSAGES
+# Inbox pages read per cycle (limit messages each). More than this and the
+# read fails, and sending is held, rather than acting on a partial inbox.
+MAX_INBOX_PAGES = 40
 LOGIN = "https://login.microsoftonline.com"
 SCOPE = (
     "offline_access https://graph.microsoft.com/Mail.ReadWrite "
@@ -143,16 +149,22 @@ class MicrosoftProvider(MailProvider):
             raise GraphError("token refresh returned no access token")
         return self._access_token
 
-    async def _request(self, method: str, path: str, *, headers=None, **kwargs) -> dict:
+    async def _request(self, method: str, path: str, **kwargs) -> dict:
+        return await self._request_url(method, f"{GRAPH}{path}", **kwargs)
+
+    async def _request_url(self, method: str, url: str, *, headers=None, **kwargs) -> dict:
         """One Graph call. Raises GraphError on failure; retries once when
-        Graph asks to slow down (429/503 with a short Retry-After)."""
+        Graph asks to slow down (429/503 with a short Retry-After). The
+        result is always a JSON object; only 202/204 may be empty (send,
+        delete), and come back as {}."""
+        path = url[len(GRAPH):] if url.startswith(GRAPH) else url
         token = await self._token()
         all_headers = {"Authorization": f"Bearer {token}", **(headers or {})}
         for attempt in (1, 2):
             try:
                 async with self._client() as client:
                     resp = await client.request(
-                        method, f"{GRAPH}{path}", headers=all_headers, **kwargs
+                        method, url, headers=all_headers, **kwargs
                     )
             except httpx.HTTPError as e:
                 raise GraphError(f"{method} {path} failed: {e}") from e
@@ -168,11 +180,19 @@ class MicrosoftProvider(MailProvider):
         if resp.status_code >= 400:
             raise GraphError(f"Graph {resp.status_code} on {method} {path}: {resp.text[:200]}")
         if not resp.content:
-            return {}
+            if resp.status_code in (202, 204):
+                return {}
+            raise GraphError(f"Graph {resp.status_code} on {method} {path}: empty response")
         try:
-            return resp.json()
-        except ValueError:
-            return {}
+            data = resp.json()
+        except ValueError as e:
+            raise GraphError(f"Graph {resp.status_code} on {method} {path}: malformed JSON") from e
+        if not isinstance(data, dict):
+            raise GraphError(
+                f"Graph {resp.status_code} on {method} {path}: expected a JSON object, "
+                f"got {type(data).__name__}"
+            )
+        return data
 
     async def _my_address(self) -> str:
         if not self._me:
@@ -246,49 +266,92 @@ class MicrosoftProvider(MailProvider):
 
     async def get_replies(self, limit: int = 50) -> list[InboundMessage]:
         """The last week of the inbox, newest first, minus your own mail.
-        Raises on failure: the heartbeat then holds sends, because an unread
-        reply can't have stopped its follow-ups."""
+        Every page is read (``limit`` is only the page size), following
+        Graph's @odata.nextLink as-is. Raises on any failure, including a
+        later page: the heartbeat then holds sends, because an unread reply
+        can't have stopped its follow-ups. Never returns a partial inbox."""
         me = await self._check_identity()
         since = (datetime.now(timezone.utc) - timedelta(days=REPLY_WINDOW_DAYS))
-        data = await self._request(
-            "GET", "/me/mailFolders/inbox/messages",
-            params={
-                "$filter": f"receivedDateTime ge {since.strftime('%Y-%m-%dT%H:%M:%SZ')}",
-                "$orderby": "receivedDateTime desc",
-                "$top": str(limit),
-                "$select": _SELECT,
-            },
-            headers={"Prefer": 'outlook.body-content-type="text"'},
-        )
+        url = str(httpx.URL(f"{GRAPH}{INBOX_MESSAGES}", params={
+            "$filter": f"receivedDateTime ge {since.strftime('%Y-%m-%dT%H:%M:%SZ')}",
+            "$orderby": "receivedDateTime desc",
+            "$top": str(max(1, int(limit))),
+            "$select": _SELECT,
+        }))
+        seen_urls = {url}
+        seen_ids = set()
         out = []
-        for item in data.get("value", []):
-            msg = self._parse_message(item)
-            if msg and msg.from_email != me:
-                out.append(msg)
-        return out
+        for page in range(1, MAX_INBOX_PAGES + 1):
+            data = await self._request_url(
+                "GET", url, headers={"Prefer": 'outlook.body-content-type="text"'},
+            )
+            items = data.get("value")
+            if not isinstance(items, list):
+                raise GraphError(f"inbox page {page}: 'value' is missing or not a list")
+            for item in items:
+                msg = self._parse_message(item)
+                # A message can repeat across pages if mail arrives mid-read.
+                if msg and msg.from_email != me and msg.provider_id not in seen_ids:
+                    seen_ids.add(msg.provider_id)
+                    out.append(msg)
+            next_link = data.get("@odata.nextLink")
+            if next_link is None:
+                return out
+            url = _checked_next_link(next_link)
+            if url in seen_urls:
+                raise GraphError(f"inbox page {page}: @odata.nextLink repeats an earlier page")
+            seen_urls.add(url)
+        raise GraphError(
+            f"inbox has more than {MAX_INBOX_PAGES} pages; refusing a partial read"
+        )
 
     @staticmethod
-    def _parse_message(item: dict) -> InboundMessage | None:
-        sender = ((item.get("from") or {}).get("emailAddress") or {})
-        from_email = (sender.get("address") or "").strip().lower()
+    def _parse_message(item) -> InboundMessage | None:
+        """One Graph message. A message with no sender address is skipped;
+        one with fields of the wrong shape raises GraphError."""
+        def obj(value, what) -> dict:
+            if value is None:
+                return {}
+            if not isinstance(value, dict):
+                raise GraphError(f"malformed inbox message: {what} is not an object")
+            return value
+
+        def text(value, what) -> str:
+            if value is None:
+                return ""
+            if not isinstance(value, str):
+                raise GraphError(f"malformed inbox message: {what} is not a string")
+            return value
+
+        if not isinstance(item, dict):
+            raise GraphError("malformed inbox message: not an object")
+        msg_id = text(item.get("id"), "id")
+        if not msg_id:
+            raise GraphError("malformed inbox message: no id")
+        sender = obj(obj(item.get("from"), "from").get("emailAddress"), "from.emailAddress")
+        from_email = text(sender.get("address"), "sender address").strip().lower()
         if not from_email:
             return None
-        subject = item.get("subject") or ""
-        headers = {
-            (h.get("name") or "").lower(): h.get("value") or ""
-            for h in item.get("internetMessageHeaders") or []
-        }
-        body = ((item.get("body") or {}).get("content") or "")
+        subject = text(item.get("subject"), "subject")
+        raw_headers = item.get("internetMessageHeaders") or []
+        if not isinstance(raw_headers, list):
+            raise GraphError("malformed inbox message: internetMessageHeaders is not a list")
+        headers = {}
+        for h in raw_headers:
+            h = obj(h, "header")
+            headers[text(h.get("name"), "header name").lower()] = text(
+                h.get("value"), "header value")
+        body = text(obj(item.get("body"), "body").get("content"), "body content")
         return InboundMessage(
-            provider_id=item.get("id", ""),
+            provider_id=msg_id,
             from_email=from_email,
             subject=subject,
             body=body[:5000],
-            message_id=item.get("internetMessageId", ""),
+            message_id=text(item.get("internetMessageId"), "internetMessageId"),
             in_reply_to=headers.get("in-reply-to", ""),
             # The Graph id: what createReply needs to answer this message.
-            thread_ref=item.get("id", ""),
-            date=item.get("receivedDateTime", ""),
+            thread_ref=msg_id,
+            date=text(item.get("receivedDateTime"), "receivedDateTime"),
             is_bounce=looks_like_bounce(from_email, subject),
             headers=headers,
         )
@@ -307,6 +370,33 @@ class MicrosoftProvider(MailProvider):
         except GraphError as e:
             return False, str(e)[:300]
         return True, f"Connected as {me}"
+
+
+def _checked_next_link(link) -> str:
+    """Graph's @odata.nextLink, used whole (Microsoft: don't rebuild or
+    edit $skip). It gets the bearer token, so it must point back at the
+    inbox listing on Graph itself: https, graph.microsoft.com, the same
+    path, no credentials, no fragment. Anything else raises GraphError."""
+    if not isinstance(link, str) or not link:
+        raise GraphError("@odata.nextLink is not a URL")
+    if any(c in link for c in "#\\") or any(c.isspace() or ord(c) < 32 for c in link):
+        raise GraphError("@odata.nextLink rejected: unexpected characters")
+    try:
+        url = httpx.URL(link)
+    except (httpx.InvalidURL, ValueError) as e:
+        raise GraphError(f"@odata.nextLink rejected: {e}") from e
+    path = url.raw_path.split(b"?", 1)[0].decode("ascii", "replace")
+    if (
+        url.scheme != "https"
+        or url.host != GRAPH_HOST
+        or url.port not in (None, 443)
+        or url.userinfo
+        or url.fragment
+        or path.lower() != INBOX_MESSAGES_PATH.lower()
+        or not url.query
+    ):
+        raise GraphError("@odata.nextLink rejected: not the Graph inbox listing")
+    return link
 
 
 def _pkce_pair() -> tuple[str, str]:

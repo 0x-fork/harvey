@@ -23,6 +23,8 @@ class Graph:
         self.inbox = []
         self.fail = {}          # (method, path suffix) -> status
         self.drafts = 0
+        self.pages = {}         # inbox page number -> httpx.Response, or a dict
+                                # merged into that page's normal JSON body
 
     def __call__(self, request: httpx.Request):
         self.requests.append(request)
@@ -56,12 +58,40 @@ class Graph:
         if path.endswith("/send"):
             return httpx.Response(202)
         if path == "/v1.0/me/mailFolders/inbox/messages":
-            return httpx.Response(200, json={"value": self.inbox})
+            return self._inbox_page(request)
         return httpx.Response(404, json={"error": {"code": "notFound"}})
+
+    def _inbox_page(self, request):
+        """Pages like Graph: $top per page, then an opaque nextLink whose
+        query carries only $skip (and a token) — not the first page's params."""
+        params = request.url.params
+        top = int(params.get("$top") or params.get("t") or 50)
+        skip = int(params.get("$skip", 0))
+        page = skip // top + 1
+        body = {"value": self.inbox[skip:skip + top]}
+        if skip + top < len(self.inbox):
+            body["@odata.nextLink"] = (
+                "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages"
+                f"?%24skip={skip + top}&t={top}&%24skiptoken=opaque{page}"
+            )
+        override = self.pages.get(page)
+        if isinstance(override, httpx.Response):
+            return override
+        return httpx.Response(200, json={**body, **(override or {})})
 
     def calls(self):
         return [(r.method, r.url.path) for r in self.requests
                 if r.url.host == "graph.microsoft.com"]
+
+    def inbox_requests(self):
+        return [r for r in self.requests if r.url.path.endswith("/inbox/messages")]
+
+
+def message(i, sender="someone@elsewhere.example", body="hello"):
+    return {"id": f"m{i}", "subject": f"note {i}",
+            "from": {"emailAddress": {"address": sender}},
+            "body": {"content": body}, "internetMessageId": f"<{i}@elsewhere.example>",
+            "receivedDateTime": "2026-10-14T15:00:00Z"}
 
 
 @pytest.fixture
@@ -253,3 +283,260 @@ def test_pkce_challenge_matches_verifier():
     assert 43 <= len(verifier) <= 128
     expected = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
     assert challenge == expected.decode().rstrip("=")
+
+
+# ── Pagination and malformed responses: never a partial inbox ──
+
+
+@pytest.mark.asyncio
+async def test_every_page_of_the_week_is_read(graph):
+    graph.inbox = [message(i) for i in range(120)]
+    replies = await provider(graph).get_replies()
+
+    assert [m.provider_id for m in replies] == [f"m{i}" for i in range(120)]
+    first, *later = graph.inbox_requests()
+    assert len(later) == 2
+    assert first.url.params["$top"] == "50"
+    for request in later:
+        # The nextLink is followed exactly, with no initial params re-added,
+        # and still gets the same Prefer header.
+        assert "$filter" not in request.url.params and "$top" not in request.url.params
+        assert request.headers["Prefer"] == 'outlook.body-content-type="text"'
+    assert str(later[0].url) == (
+        "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages"
+        "?%24skip=50&t=50&%24skiptoken=opaque1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_limit_is_only_the_page_size(graph):
+    graph.inbox = [message(i) for i in range(7)]
+    replies = await provider(graph).get_replies(limit=3)
+
+    assert len(replies) == 7
+    assert len(graph.inbox_requests()) == 3
+
+
+@pytest.mark.asyncio
+async def test_empty_inbox_is_an_empty_list(graph):
+    assert await provider(graph).get_replies() == []
+    assert len(graph.inbox_requests()) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response", [
+    httpx.Response(200, content=b"<html>not json</html>"),
+    httpx.Response(200, content=b'{"value": ['),
+    httpx.Response(200, json=[{"id": "m1"}]),
+    httpx.Response(200, json="value"),
+    httpx.Response(200, json={}),
+    httpx.Response(200, json={"value": None}),
+    httpx.Response(200, json={"value": {"id": "m1"}}),
+    httpx.Response(200),
+], ids=["html", "truncated", "list", "string", "no-value", "null-value",
+        "object-value", "empty-200"])
+async def test_malformed_first_page_raises(graph, response):
+    graph.pages[1] = response
+    with pytest.raises(GraphError):
+        await provider(graph).get_replies()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("override", [
+    httpx.Response(500, json={"error": {"code": "boom"}}),
+    httpx.Response(200, content=b"not json"),
+    httpx.Response(200, json=["m51"]),
+    {"value": None},
+    {"value": [message(50), "not a message"]},
+    {"value": [{**message(50), "id": None}]},
+    {"value": [{**message(50), "from": "jane@acme.com"}]},
+    {"value": [{**message(50), "from": {"emailAddress": {"address": 7}}}]},
+    {"value": [{**message(50), "body": "text"}]},
+    {"value": [{**message(50), "internetMessageHeaders": {"In-Reply-To": "x"}}]},
+    {"value": [{**message(50), "internetMessageHeaders": [{"name": 1}]}]},
+    {"@odata.nextLink": 42},
+    {"@odata.nextLink": ""},
+], ids=["http-500", "not-json", "list", "null-value", "non-object-message",
+        "no-id", "from-string", "address-number", "body-string", "headers-object",
+        "header-name-number", "nextlink-number", "nextlink-empty"])
+async def test_a_bad_later_page_fails_the_whole_read(graph, override):
+    graph.inbox = [message(i) for i in range(120)]
+    graph.pages[2] = override
+    with pytest.raises(GraphError):
+        await provider(graph).get_replies()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("link", [
+    "http://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?%24skip=50",
+    "https://evil.example/v1.0/me/mailFolders/inbox/messages?%24skip=50",
+    "https://graph.microsoft.com.evil.example/v1.0/me/mailFolders/inbox/messages?%24skip=50",
+    "https://graph.microsoft.com@evil.example/v1.0/me/mailFolders/inbox/messages?%24skip=50",
+    "https://user:pass@graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?%24skip=50",
+    "https://graph.microsoft.com:8443/v1.0/me/mailFolders/inbox/messages?%24skip=50",
+    "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?%24skip=50#frag",
+    "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?%24skip=50#",
+    "https://graph.microsoft.com\\@evil.example/v1.0/me/mailFolders/inbox/messages?x=1",
+    "https://graph.microsoft.com/v1.0/me/messages?%24skip=50",
+    "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages/m1/send?x=1",
+    "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages/../../../sendMail?x=1",
+    "https://graph.microsoft.com/v1.0/me/mailFolders/inbox%2Fmessages?x=1",
+    "https://graph.microsoft.com/beta/me/mailFolders/inbox/messages?%24skip=50",
+    "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages",
+    "/v1.0/me/mailFolders/inbox/messages?%24skip=50",
+    "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?a=1\r\nX-Evil: 1",
+], ids=["http", "off-origin", "suffix-host", "userinfo-host", "credentials", "port",
+        "fragment", "empty-fragment", "backslash", "other-path", "send-path",
+        "dot-segments", "encoded-slash", "beta", "no-query", "relative", "crlf"])
+async def test_hostile_next_link_is_refused_before_any_request(graph, link):
+    graph.inbox = [message(i) for i in range(60)]
+    graph.pages[1] = {"@odata.nextLink": link}
+    with pytest.raises(GraphError, match="nextLink"):
+        await provider(graph).get_replies()
+
+    # Only the first page went out; nothing (and no token) followed the link.
+    assert len(graph.inbox_requests()) == 1
+    assert all(r.url.host in ("graph.microsoft.com", "login.microsoftonline.com")
+               for r in graph.requests)
+    graph_requests = [r for r in graph.requests if r.url.host == "graph.microsoft.com"]
+    assert [r.url.path for r in graph_requests] == [
+        "/v1.0/me", "/v1.0/me/mailFolders/inbox/messages"]
+
+
+@pytest.mark.asyncio
+async def test_next_link_loop_is_refused(graph):
+    graph.inbox = [message(i) for i in range(120)]
+    loop = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages?%24skip=50&t=50"
+    graph.pages[1] = {"@odata.nextLink": loop}
+    graph.pages[2] = {"@odata.nextLink": loop}
+    with pytest.raises(GraphError, match="repeats"):
+        await provider(graph).get_replies()
+    assert len(graph.inbox_requests()) == 2
+
+
+@pytest.mark.asyncio
+async def test_next_link_back_to_the_first_page_is_refused(graph):
+    def self_link(request):
+        if request.url.path.endswith("/inbox/messages"):
+            graph.requests.append(request)
+            return httpx.Response(200, json={
+                "value": [message(0)], "@odata.nextLink": str(request.url)})
+        return graph(request)
+
+    p = MicrosoftProvider(config=None, env=Env(), transport=httpx.MockTransport(self_link))
+    with pytest.raises(GraphError, match="repeats"):
+        await p.get_replies()
+    assert len(graph.inbox_requests()) == 1
+
+
+@pytest.mark.asyncio
+async def test_too_many_pages_fails_closed(graph, monkeypatch):
+    monkeypatch.setattr(microsoft, "MAX_INBOX_PAGES", 3)
+    graph.inbox = [message(i) for i in range(10)]
+    with pytest.raises(GraphError, match="more than 3 pages"):
+        await provider(graph).get_replies(limit=3)
+    assert len(graph.inbox_requests()) == 3
+
+    graph.requests.clear()
+    graph.inbox = graph.inbox[:9]  # exactly 3 pages is fine
+    assert len(await provider(graph).get_replies(limit=3)) == 9
+
+
+@pytest.mark.asyncio
+async def test_message_repeated_across_pages_is_returned_once(graph):
+    graph.inbox = [message(i) for i in range(60)]
+    graph.inbox[50] = message(49)  # shifted by new mail arriving mid-read
+    replies = await provider(graph).get_replies()
+    assert [m.provider_id for m in replies].count("m49") == 1
+    assert len(replies) == 59
+
+
+@pytest.mark.asyncio
+async def test_message_without_a_sender_is_skipped(graph):
+    graph.inbox = [{**message(0), "from": None}, message(1)]
+    assert [m.provider_id for m in await provider(graph).get_replies()] == ["m1"]
+
+
+# ── Empty responses: fine for send/delete, not for anything with a body ──
+
+
+@pytest.mark.asyncio
+async def test_empty_202_and_204_are_success(graph):
+    p = provider(graph)
+    assert await p._request("POST", "/me/messages/draft1/send") == {}
+    assert await p._request("DELETE", "/me/messages/draft1") == {}
+
+
+@pytest.mark.asyncio
+async def test_malformed_draft_response_fails_the_send(graph):
+    def bad_draft(request):
+        if request.method == "POST" and request.url.path == "/v1.0/me/messages":
+            graph.requests.append(request)
+            return httpx.Response(201, content=b"<html>oops</html>")
+        return graph(request)
+
+    p = MicrosoftProvider(config=None, env=Env(), transport=httpx.MockTransport(bad_draft))
+    result = await p.send_email("jane@acme.com", "booking", "Hi.")
+    assert not result.ok and "malformed JSON" in result.error
+    assert not any(path.endswith("/send") for _, path in graph.calls())
+
+
+@pytest.mark.asyncio
+async def test_malformed_identity_response_raises(graph):
+    def not_json(request):
+        if request.url.path == "/v1.0/me":
+            return httpx.Response(200, content=b"nope")
+        return graph(request)
+
+    p = MicrosoftProvider(config=None, env=Env(), transport=httpx.MockTransport(not_json))
+    with pytest.raises(GraphError, match="malformed JSON"):
+        await p.get_replies()
+
+
+# ── With the handler: later pages count, and a bad later page holds sends ──
+
+
+async def _handler_with_prospect(tmp_path, graph):
+    import os
+    from harvey.state import StateManager
+    from tests.test_outbox_native import _now_iso, make_handler, seed_prospect
+
+    state = StateManager(os.path.join(tmp_path, "t.db"))
+    await state.init_db()
+    pid = await seed_prospect(state, email="jane@acme.com", status="contacted")
+    await state.add_outbox_item(
+        prospect_id=pid, to_email="jane@acme.com", subject="s2", body="b",
+        send_at=_now_iso(), status="approved", campaign_id="c1", step=2,
+    )
+    return state, pid, make_handler(state, provider(graph))
+
+
+@pytest.mark.asyncio
+async def test_unsubscribe_on_a_later_page_is_honored(graph, tmp_path):
+    graph.inbox = [message(i) for i in range(60)]
+    graph.inbox[55] = message(55, sender="Jane@Acme.com", body="Please unsubscribe me.")
+    state, pid, handler = await _handler_with_prospect(tmp_path, graph)
+
+    assert await handler.run() is True
+    assert len(graph.inbox_requests()) == 2
+    assert (await state.get_prospect(pid)).status == "opted_out"
+    assert len(await state.get_outbox(status="cancelled")) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("override", [
+    httpx.Response(503, headers={"Retry-After": "60"}),
+    httpx.Response(200, content=b"not json"),
+    {"value": "nope"},
+], ids=["outage", "not-json", "bad-value"])
+async def test_bad_later_page_holds_sends_and_handles_nothing(graph, tmp_path, override):
+    graph.inbox = [message(i) for i in range(60)]
+    graph.inbox[3] = message(3, sender="jane@acme.com", body="Please unsubscribe me.")
+    graph.pages[2] = override
+    state, pid, handler = await _handler_with_prospect(tmp_path, graph)
+
+    assert await handler.run() is False
+    # Page 1 was readable, but nothing from a partial inbox is acted on.
+    assert not await state.is_reply_processed("m3")
+    assert (await state.get_prospect(pid)).status == "contacted"
+    assert len(await state.get_outbox(status="approved")) == 1
