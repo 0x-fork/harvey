@@ -125,7 +125,7 @@ async def test_isolated_turn_returns_final_answer_and_usage(fake, native_home):
     result = await _client(native_home).run(PROMPT, timeout=30)
 
     assert result.text == '{"intent": "interested"}'  # final_answer, not commentary
-    assert result.model == "gpt-5.5"  # Harvey's tool-less default, not Codex's
+    assert result.model == "gpt-6.1-sol"  # highest-priority listed model
     assert result.thread_id == "thr-1"
     assert result.duration_ms == 850
     # The turn total (two model responses), not just the last response (5/1).
@@ -331,6 +331,7 @@ def test_cli_version_parsing():
     ("apikey", "setup"),
     ("logged_out", "auth"),
     ("no_toolless_model", "isolation"),
+    ("catalog_override", "isolation"),
 ])
 async def test_unsafe_or_unverifiable_state_never_sends_the_prompt(fake, native_home, scenario, kind):
     fake.use(scenario)
@@ -368,12 +369,19 @@ async def test_rate_limit_reads_attest_the_route_too(fake, native_home):
 
 
 @pytest.mark.asyncio
-async def test_code_mode_model_is_refused_before_the_logged_in_launch(fake, native_home):
-    with pytest.raises(hc.CodexError) as err:
-        await _client(native_home, model="gpt-6.1-sol").run(PROMPT, timeout=30)
-    assert err.value.kind == "isolation"
-    assert "gpt-5.5" in str(err.value)  # names a model that works
-    assert [s["auth"] for s in fake.servers()] == [None]  # only the credential-less check ran
+async def test_code_mode_model_runs_with_a_private_text_catalog(fake, native_home):
+    result = await _client(native_home, model="gpt-6.1-sol").run(PROMPT, timeout=30)
+    assert result.model == "gpt-6.1-sol"
+    first, second = fake.servers()
+    assert first["auth"] is None and second["auth"] is not None
+    config = tomllib.loads(second["config_toml"])
+    assert config["model_catalog_json"].startswith(second["codex_home"] + "/")
+    assert not Path(config["model_catalog_json"]).exists()  # cleaned up after call
+    catalog = next(e["private_catalog"] for e in fake.entries() if "private_catalog" in e)
+    assert all(m["tool_mode"] == "direct" and m["experimental_supported_tools"] == []
+               for m in catalog["models"])
+    params = next(e["params"] for e in fake.entries() if e.get("method") == "thread/start")
+    assert params["config"]["model_catalog_json"] == config["model_catalog_json"]
 
 
 @pytest.mark.asyncio
@@ -861,3 +869,24 @@ def test_parse_rate_limits():
     assert hc.parse_rate_limits({"primary": {"usedPercent": 5, "windowDurationMins": 60}}) == {
         "primary": {"utilization": 5.0, "resets_at": "", "window_minutes": 60}}
     assert hc.parse_rate_limits({}) is None
+
+
+@pytest.mark.parametrize("model", ["gpt-5.6-luna", "gpt-6.1-sol", "gpt-5.6-terra", "gpt-9-future"])
+@pytest.mark.parametrize("mode", [None, "direct", "code_mode", "code_mode_only"])
+def test_text_only_catalog_preserves_model_capabilities(model, mode):
+    entry = {"slug": model, "visibility": "list", "priority": 1, "tool_mode": mode,
+             "experimental_supported_tools": ["clock"], "context_window": 200000,
+             "supported_reasoning_levels": [{"effort": "high"}]}
+    catalog = {model: entry}
+    effective = hc.text_only_catalog(catalog)
+    assert effective[model] == {**entry, "tool_mode": "direct", "experimental_supported_tools": []}
+    assert entry["experimental_supported_tools"] == ["clock"]
+    assert entry["tool_mode"] == mode
+    assert hc.pick_default_model(effective) == model
+    hc.require_toolless_model(effective, model)
+
+
+def test_text_only_catalog_rejects_unknown_tool_mode():
+    catalog = {"future": {"slug": "future", "tool_mode": "future_mode", "visibility": "list"}}
+    with pytest.raises(hc.CodexError):
+        hc.require_toolless_model(hc.text_only_catalog(catalog), "future")
