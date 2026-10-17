@@ -10,6 +10,7 @@ import pytz
 
 from harvey.brain import Brain
 from harvey.config import ConfigError, load_config, load_env, HarveyConfig
+from harvey.pidfile import remove_pid_file, write_pid_file
 from harvey.pipeline import run_profile_stage
 from harvey.state import StateManager
 
@@ -416,10 +417,14 @@ def main():
         asyncio.run(run_setup())
         return
 
+    # Record the loop so the dashboard sees it however it was started.
+    write_pid_file()
     try:
         asyncio.run(_run_with_signals())
     except KeyboardInterrupt:
         logger.info("Goodbye.")
+    finally:
+        remove_pid_file()
 
 
 if __name__ == "__main__":
