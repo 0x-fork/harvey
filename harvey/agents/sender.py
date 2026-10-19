@@ -337,7 +337,8 @@ class Sender:
     def _render(self, text: str, prospect) -> str:
         """Fill merge variables. The pre-send gate rejects any leftovers."""
         replacements = {
-            "first_name": prospect.first_name,
+            # A company inbox has no name; "there" keeps "Hi {{first_name}}," readable.
+            "first_name": prospect.first_name or ("there" if prospect.is_company_inbox else ""),
             "last_name": prospect.last_name,
             "company": prospect.company,
             "title": prospect.title,
