@@ -247,7 +247,7 @@ function showTab(id, btn) {
 
 function loadCurrentTab() {
   switch (currentTab) {
-    case 'today': loadToday(); loadSetupStatus(); loadRuns(); loadTodayActivity(); break;
+    case 'today': loadLiveStatus(); loadToday(); loadSetupStatus(); loadRuns(); loadTodayActivity(); break;
     case 'signals': loadSignals(); break;
     case 'discover': loadDiscoverProviders(); break;
     case 'companies': if (!companyDrill) loadCompanies(); break;
@@ -294,6 +294,66 @@ async function loadToday() {
         escHtml(it.action) + '</button>' +
     '</div>'
   ).join('') + '</div>';
+}
+
+// ── Live status: the "what's happening?" answer, kept on screen ──
+
+async function loadLiveStatus() {
+  const el = document.getElementById('live-status');
+  if (!el) return;
+  const d = await api('/api/live-status');
+  if (!d || !Array.isArray(d.steps)) {
+    // Keep the last good numbers on screen, but never let them pass for live.
+    const flag = el.querySelector('.live-flag');
+    if (flag) flag.textContent = "Can't reach Harvey right now — numbers below may be old.";
+    else el.innerHTML = '<div class="rail-block"><div class="subhead">Status — live</div>' +
+      '<p class="muted live-flag" style="font-size:13px">Can\'t reach Harvey right now. ' +
+      'Is the dashboard window still open?</p></div>';
+    return;
+  }
+  const icon = {done: '&#10003;', running: '&#9203;', partial: '&#9679;', waiting: '&#9675;'};
+  const color = {done: '#2e7d32', running: '#b26a00',
+                 partial: 'var(--text-2, #666)', waiting: 'var(--text-3, #999)'};
+  const rows = d.steps.map(s => {
+    const st = icon[s.state] ? s.state : 'waiting';
+    const pct = s.total ? Math.min(100, Math.round(100 * s.done / s.total)) : 0;
+    const bar = s.total
+      ? '<div style="height:5px;background:var(--border, #e5e5e5);border-radius:3px;margin-top:5px">' +
+        '<div style="height:5px;width:' + pct + '%;background:' + color[st] +
+        ';border-radius:3px;transition:width .4s"></div></div>'
+      : '';
+    return '<div style="display:flex;gap:10px;padding:8px 0;border-bottom:1px solid var(--border, #eee)">' +
+      '<span style="width:20px;text-align:center;color:' + color[st] + '">' + icon[st] + '</span>' +
+      '<div style="flex:1;min-width:0"><div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap">' +
+      '<strong style="font-size:13.5px">' + escHtml(s.label) + '</strong>' +
+      '<span class="muted" style="font-size:12.5px">' + escHtml(s.detail) + '</span></div>' + bar +
+      '</div></div>';
+  }).join('');
+  const jobName = r => r.stage === 'profile' ? 'Reading websites'
+    : r.stage === 'discover' ? 'Searching for businesses (' + (r.provider || '') + ')'
+    : String(r.stage || 'Job');
+  const running = d.running || [];
+  const runningHtml = running.length
+    ? running.map(r => '&#9203; ' + escHtml(jobName(r)) + ' · running ' + r.elapsed_min + ' min' +
+        (r.eta_text ? ' · ' + escHtml(r.eta_text) : '')).join('<br>')
+    : 'Nothing running right now.';
+  const stoppedHtml = (d.stopped || []).length
+    ? '<div style="margin-top:6px;font-size:13px;color:#b3261e">&#9888; ' +
+      (d.stopped || []).map(r => escHtml(jobName(r))).join(', ') +
+      ' stopped before finishing.</div>'
+    : '';
+  const note = d.note && d.note.value
+    ? '<div style="margin-top:8px;font-size:13px">&#128172; ' + escHtml(d.note.value) +
+      ' <span class="muted">(' + formatDate(d.note.updated_at) + ')</span></div>'
+    : '';
+  el.innerHTML = '<div class="rail-block">' +
+    '<div class="subhead">Status — live</div>' +
+    '<div style="font-size:13px;margin:6px 0 4px">' + runningHtml + '</div>' + stoppedHtml + note +
+    '<div style="margin-top:10px">' + rows + '</div>' +
+    '<div style="margin-top:10px;font-size:13px"><strong>Next:</strong> ' + escHtml(d.next || '') + '</div>' +
+    '<div class="muted live-flag" style="margin-top:4px;font-size:12px">Cost so far: $' +
+    Number(d.cost_usd || 0).toFixed(2) + ' · updated ' + new Date().toLocaleTimeString() +
+    ' · refreshes every 10 seconds</div></div>';
 }
 
 function renderFigures(stats) {
@@ -1546,8 +1606,15 @@ loadRuns();
 loadTodayActivity();
 loadHarveyStatus();
 
+loadLiveStatus();
+
 // Agent status: quick poll (not while locked: it would only be refused)
 setInterval(() => { if (!_locked) loadHarveyStatus(); }, 8000);
+
+// Live status panel: the cheapest query on the page, so it refreshes fastest.
+setInterval(() => {
+  if (!document.hidden && !_locked && currentTab === 'today') loadLiveStatus();
+}, 10000);
 
 // Nav counts stay live wherever you are, so "something needs me" is visible
 // from any tab without polling that tab's contents.

@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import aiosqlite
@@ -1110,6 +1110,186 @@ async def stop_discovery():
         return {"success": True}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+
+def _parse_ts(value) -> datetime | None:
+    """SQLite CURRENT_TIMESTAMP / isoformat strings -> naive UTC datetime."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "").split("+")[0])
+    except ValueError:
+        return None
+
+
+async def _scalar(sql: str, params: tuple = ()) -> int:
+    rows = await query_db(sql, params)
+    return int(next(iter(rows[0].values())) or 0) if rows else 0
+
+
+async def _first(sql: str, params: tuple = (), key: str = "t"):
+    """First row's `key`, or None — query_db returns [] on any DB problem."""
+    rows = await query_db(sql, params)
+    return rows[0].get(key) if rows else None
+
+
+# A run row still says 'running' after its process was killed (closed window,
+# reboot). No new facts for this long means it is not coming back.
+STALE_RUN_SECONDS = 900
+# Contact-finding has no run row; a recent prospects_checked_at means it is active.
+CONTACT_ACTIVE_SECONDS = 180
+SENT_STATUSES = ("contacted", "replied", "meeting", "closed", "lost")
+REPLY_STATUSES = ("replied", "meeting", "closed")
+
+
+def _eta_text(minutes) -> str:
+    if minutes is None:
+        return ""
+    return "less than a minute left" if minutes < 1 else f"about {round(minutes)} min left"
+
+
+@app.get("/api/live-status")
+async def get_live_status():
+    """Plain-language progress: each pipeline step, what is running, how long is left.
+
+    Built for someone who would otherwise keep asking "what's the status?".
+    Everything is derived from the database, so it is true whatever started
+    the work — `harvey run`, a CLI command, or a one-off script. Every total
+    counts only what the step can act on (a business with no website is never
+    read), so a finished step always reaches 100% instead of sticking.
+    """
+    now = datetime.now(timezone.utc).replace(tzinfo=None)  # DB stores naive UTC
+    has_site = "COALESCE(domain, '') != ''"
+    companies = await _scalar("SELECT COUNT(*) FROM companies")
+    with_site = await _scalar(f"SELECT COUNT(*) FROM companies WHERE {has_site}")
+    no_site = companies - with_site
+    profiled = await _scalar(
+        f"SELECT COUNT(*) FROM companies WHERE {has_site} AND profile_checked_at IS NOT NULL")
+    checked = await _scalar(
+        f"SELECT COUNT(*) FROM companies WHERE {has_site} "
+        "AND profile_checked_at IS NOT NULL AND prospects_checked_at IS NOT NULL")
+
+    prospects = await query_db("SELECT id, email, email_status, status FROM prospects")
+    with_email = [p for p in prospects if p.get("email")]
+    by_status: dict[str, int] = {}
+    for p in with_email:
+        k = (p.get("email_status") or "guess").lower()
+        by_status[k] = by_status.get(k, 0) + 1
+    deliverable = {p["id"] for p in with_email
+                   if (p.get("email_status") or "") in ("verified", "risky")}
+    unconfirmed = sum(n for k, n in by_status.items()
+                      if k not in ("verified", "risky", "invalid"))
+
+    # Drafts are counted per person, not per campaign: one campaign can cover many.
+    drafted: set[str] = set()
+    for row in await query_db("SELECT prospect_ids_json FROM campaigns"):
+        try:
+            ids = json.loads(row.get("prospect_ids_json") or "[]")
+        except (json.JSONDecodeError, TypeError):
+            ids = []
+        if isinstance(ids, list):
+            drafted.update(i for i in ids if isinstance(i, str))
+    sent = {p["id"] for p in prospects if p.get("status") in SENT_STATUSES}
+    replies = sum(1 for p in prospects if p.get("status") in REPLY_STATUSES)
+    cost = float(await _first(
+        "SELECT COALESCE(SUM(cost_usd), 0) AS c FROM runs", key="c") or 0)
+
+    running, stopped = [], []
+    for run in await query_db(
+            "SELECT * FROM runs WHERE status = 'running' ORDER BY started_at"):
+        started = _parse_ts(run.get("started_at"))
+        elapsed = max(0.0, (now - started).total_seconds()) if started else 0.0
+        last = _parse_ts(await _first(
+            "SELECT MAX(observed_at) AS t FROM observations WHERE run_id = ?",
+            (run["id"],))) or started
+        item = {"stage": run.get("stage"), "provider": run.get("provider"),
+                "elapsed_min": round(elapsed / 60, 1), "eta_min": None}
+        if last and (now - last).total_seconds() > STALE_RUN_SECONDS:
+            stopped.append(item)
+            continue
+        if run.get("stage") == "profile" and started:
+            done_in_run = await _scalar(
+                f"SELECT COUNT(*) FROM companies WHERE {has_site} AND profile_checked_at >= ?",
+                (run["started_at"],))
+            left = max(0, with_site - profiled)
+            if left and done_in_run and elapsed > 0:
+                item["eta_min"] = left / (done_in_run / elapsed) / 60
+        running.append(item)
+
+    last_contact = _parse_ts(await _first(
+        "SELECT MAX(prospects_checked_at) AS t FROM companies"))
+    finding_emails = bool(
+        last_contact and (now - last_contact).total_seconds() < CONTACT_ACTIVE_SECONDS)
+    reading = any(r["stage"] == "profile" for r in running)
+    finding = any(r["stage"] == "discover" for r in running)
+
+    def step(label, done, total, active, detail, info=False):
+        if active:
+            state_ = "running"
+        elif info:
+            state_ = "done" if done else "waiting"
+        elif total and done >= total:
+            state_ = "done"
+        elif done:
+            state_ = "partial"
+        else:
+            state_ = "waiting"
+        return {"label": label, "done": done, "total": total,
+                "state": state_, "detail": detail}
+
+    profile_eta = next((r["eta_min"] for r in running if r["stage"] == "profile"), None)
+    read_detail = f"{profiled} of {with_site} read"
+    if reading and profile_eta is not None:
+        read_detail += " · " + _eta_text(profile_eta)
+    if no_site:
+        read_detail += f" · {no_site} have no website (skipped)"
+
+    steps = [
+        step("Find businesses", companies, 0, finding,
+             f"{companies} businesses found", info=True),
+        step("Read their websites", profiled, with_site, reading, read_detail),
+        step("Find emails", checked, profiled, finding_emails,
+             f"{checked} of {profiled} checked · {len(with_email)} emails found"),
+        step("Check emails are real", len(with_email) - unconfirmed, len(with_email), False,
+             f"{by_status.get('verified', 0)} verified · {by_status.get('risky', 0)} risky · "
+             f"{unconfirmed} not confirmed"
+             + (f" · {by_status['invalid']} bad" if by_status.get("invalid") else "")),
+        step("Write first emails", len(drafted), len(deliverable | drafted), False,
+             f"{len(drafted)} written · see Campaigns"),
+        step("Sent by you", len(sent & drafted), len(drafted), False,
+             f"{len(sent & drafted)} of {len(drafted)} sent"),
+        step("Replies", replies, 0, False,
+             f"{replies} replies" if replies else "No replies yet", info=True),
+    ]
+
+    if reading or finding:
+        next_up = "Wait — Harvey is working. This page updates by itself."
+    elif finding_emails:
+        next_up = "Wait — emails are being found."
+    elif stopped:
+        next_up = "A job stopped before finishing. Run it again."
+    elif drafted - sent:
+        next_up = f"Open Campaigns and send the {len(drafted - sent)} unsent email(s)."
+    elif profiled > checked:
+        next_up = f"Find emails for the {profiled - checked} businesses not checked yet."
+    elif deliverable - drafted:
+        next_up = f"Write first emails for {len(deliverable - drafted)} more contact(s)."
+    elif not companies:
+        next_up = "Search for businesses to get started."
+    else:
+        next_up = "Search more cities or industries to get more leads."
+
+    note_rows = await query_db(
+        "SELECT value, updated_at FROM settings WHERE key = 'status_note'")
+    return {
+        "steps": steps,
+        "running": [dict(r, eta_text=_eta_text(r["eta_min"])) for r in running],
+        "stopped": stopped,
+        "next": next_up,
+        "note": note_rows[0] if note_rows else None,
+        "cost_usd": round(cost, 4),
+        "updated_at": now.isoformat() + "Z",
+    }
 
 
 @app.get("/api/today")
