@@ -101,7 +101,7 @@ def unusable_backlog_notice(summary: dict) -> str:
         return ""
     return (
         f"Harvey found {recent} prospects in the last day, but none has a verified "
-        "or catch-all email, so it paused prospecting until tomorrow to save search "
+        "or catch-all email, so it paused prospecting for about a day to save search "
         "and verifier credits. Add an email verifier key (REOON_API_KEY, "
         "ZEROBOUNCE_API_KEY or HUNTER_API_KEY in .env) or check it still has credits. "
         "`harvey export --all` exports the list as it is."

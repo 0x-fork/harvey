@@ -74,7 +74,7 @@ async def test_a_day_of_unusable_prospects_pauses_spending_and_says_why(state):
     summary = await state.get_state_summary()
     assert await decide_next_action(None, state, CONFIG, summary=summary) == "idle"
     notice = unusable_backlog_notice(summary)
-    assert str(PROSPECT_BACKLOG) in notice and "verifier" in notice and "tomorrow" in notice
+    assert str(PROSPECT_BACKLOG) in notice and "verifier" in notice and "about a day" in notice
 
 
 @pytest.mark.asyncio
