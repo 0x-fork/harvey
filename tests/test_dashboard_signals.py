@@ -438,7 +438,7 @@ vm.runInThisContext("const _cohort = {require: new Set(['A']), exclude: new Set(
 })().catch(e => {console.error(e); process.exit(1);});
 '''
     result = subprocess.run([node, '-e', script, str(web / 'auth.js'), str(web / 'app.js')],
-                            text=True, capture_output=True, check=True)
+                            text=True, encoding="utf-8", capture_output=True, check=True)
     data = json.loads(result.stdout)
     assert all(c['auth'] == 'Bearer ' + 'T' * 43 and c['redirect'] == 'error' for c in data['calls'])
     assert data['calls'][0]['url'] == 'http://127.0.0.1:5555/api/cohort.csv?require=A&exclude=B'
@@ -495,7 +495,7 @@ const page = (name, offset) => ({size: 100, offset, companies: [{name}]});
    offsets: pending.map(x => x.body.offset)}));
 })().catch(e => {console.error(e); process.exit(1);});
 '''
-    response = subprocess.run([node, '-e', script, str(app)], text=True,
+    response = subprocess.run([node, '-e', script, str(app)], text=True, encoding="utf-8",
                               capture_output=True, check=True)
     data = json.loads(response.stdout)
     assert data['offsets'] == [0, 50, 50]
