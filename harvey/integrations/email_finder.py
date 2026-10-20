@@ -557,10 +557,10 @@ async def _verify_candidate(email: str, mx_type: str, env) -> tuple[Optional[str
 async def verify_published_address(email: str, env=None) -> str:
     """Grade an address the company publishes on its own website.
 
-    Unlike a pattern guess, a published address is known to be used, so a
-    catch-all verdict (the domain accepts every address) doesn't make it
-    risky: it counts as verified. A verifier's invalid verdict still wins,
-    and an inconclusive check stays an honest guess that is never sent.
+    Graded like any other address: a catch-all verdict stays "risky", so
+    ``send_to_risky`` still decides whether it is sent (a published address
+    can be stale). A verifier's invalid verdict wins, and an inconclusive
+    check stays an honest guess that is never sent.
     """
     email = (email or "").strip().lower()
     domain = email.partition("@")[2]
@@ -570,8 +570,6 @@ async def verify_published_address(email: str, env=None) -> str:
     if not mx_host:
         return "invalid"
     status, _ = await _verify_candidate(email, classify_mx(mx_host), env)
-    if status == "risky":
-        return "verified"
     return status or "guess"
 
 

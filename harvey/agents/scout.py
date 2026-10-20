@@ -1421,6 +1421,7 @@ Respond ONLY with the JSON array."""
             return []
 
         contacts: list[Prospect] = []
+        named_on_site = False
         for member in team_members:
             title = member.get("title", "")
             if not self._title_matches_icp(title):
@@ -1430,6 +1431,7 @@ Respond ONLY with the JSON array."""
             last_name = member.get("last_name", "")
             if not first_name or not last_name:
                 continue
+            named_on_site = True
 
             email, email_status = await self._resolve_email(
                 first_name, last_name, domain
@@ -1459,13 +1461,27 @@ Respond ONLY with the JSON array."""
             self._remember_prospect(prospect)
             contacts.append(prospect)
 
-        if not contacts:
+        # The inbox is a last resort for a company nobody at Harvey has a
+        # contact for. A named person found here (even one skipped as a
+        # duplicate on a revisit) or already on file from another source
+        # means the company is covered: never email it a second time.
+        if not contacts and not named_on_site and await self._company_uncontacted(company_id):
             inbox = await self._company_inbox_prospect(
                 company_id, domain, company_name, industry, signal_note,
             )
             if inbox:
                 contacts.append(inbox)
         return contacts
+
+    async def _company_uncontacted(self, company_id: str) -> bool:
+        """True only when the company is on file and has no prospects yet."""
+        if not company_id:
+            return False
+        try:
+            return not await self.state.get_contacts_for_company(company_id)
+        except Exception as e:
+            logger.debug(f"Contact lookup failed for company {company_id}: {e}")
+            return False
 
     async def _company_inbox_prospect(
         self, company_id: str, domain: str, company_name: str,

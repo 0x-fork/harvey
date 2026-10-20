@@ -5,8 +5,12 @@ Claude Code skill can't be invoked directly. Instead the skill's
 instructions are read from the operator's skills folder and sent as a
 second, editing-only call over drafts that are already written.
 
+Off unless ``writer.humanizer: true`` is set in harvey.yaml; the skill
+being installed is not enough on its own.
+
 Fails open: no skill file, a failed call, or a rewrite that breaks a rule
-(lost merge variable, new em dash, much longer) keeps the original draft.
+(lost merge variable, new em dash, much longer, meta-text) keeps the
+original draft.
 Every draft still passes the deterministic pre-send gate afterwards.
 """
 
@@ -26,6 +30,13 @@ SKILL_PATH = Path(
 )
 MERGE_VAR = re.compile(r"\{\{\s*\w+\s*\}\}")
 MAX_GROWTH = 1.2  # a rewrite may not be more than 20% longer than the draft
+# A rewrite that talks about itself instead of being the email.
+META_PREFIXES = ("i can't", "i cannot", "as an ai", "sorry,", "here is", "here's")
+
+
+def humanizer_enabled(config) -> bool:
+    """True only when the operator turned the pass on in harvey.yaml."""
+    return bool(getattr(getattr(config, "writer", None), "humanizer", False))
 
 
 def load_skill(path: Path | None = None) -> str:
@@ -48,6 +59,8 @@ def _acceptable(original: dict, rewrite) -> bool:
     subject = str(rewrite.get("subject") or "").strip()
     if not body or (original.get("subject") and not subject):
         return False
+    if body.lower().startswith(META_PREFIXES):
+        return False
     before = original.get("subject", "") + original["body"]
     after = subject + body
     if sorted(MERGE_VAR.findall(before)) != sorted(MERGE_VAR.findall(after)):
@@ -57,14 +70,21 @@ def _acceptable(original: dict, rewrite) -> bool:
     return len(body.split()) <= len(original["body"].split()) * MAX_GROWTH + 2
 
 
-async def humanize(brain, drafts: list[dict], agent: str, path: Path | None = None) -> list[dict]:
+async def humanize(
+    brain, drafts: list[dict], agent: str,
+    path: Path | None = None, enabled: bool = False,
+) -> list[dict]:
     """Return ``drafts`` ({"subject", "body"} dicts) rewritten by the skill.
+
+    A no-op unless ``enabled`` (see ``humanizer_enabled``).
 
     One brain call for the whole list. Any draft whose rewrite fails a check
     comes back unchanged, so the result always has the same length and order.
     """
+    if not enabled or not drafts:
+        return drafts
     skill = load_skill(path)
-    if not drafts or not skill:
+    if not skill:
         return drafts
 
     payload = [{"subject": d.get("subject", ""), "body": d["body"]} for d in drafts]

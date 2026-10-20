@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 
 from harvey.brain import Brain
 from harvey.config import HarveyConfig
-from harvey.humanize import humanize
+from harvey.humanize import humanize, humanizer_enabled
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS
 from harvey.models.campaign import Campaign, EmailStep
 from harvey.state import StateManager
@@ -151,7 +151,10 @@ class Writer:
                 pending.append((prospect, draft))
 
         # One Humanizer pass over the whole batch before anything is staged.
-        polished = await humanize(self.brain, [d for _, d in pending], agent="writer")
+        polished = await humanize(
+            self.brain, [d for _, d in pending], agent="writer",
+            enabled=humanizer_enabled(self.config),
+        )
 
         drafted = 0
         for (prospect, _), draft in zip(pending, polished):
@@ -331,7 +334,7 @@ Return ONLY a JSON array (no markdown fences, no commentary):
         steps = self._parse_sequence(result)
         polished = await humanize(
             self.brain, [{"subject": s.subject, "body": s.body} for s in steps],
-            agent="writer",
+            agent="writer", enabled=humanizer_enabled(self.config),
         )
         for step, draft in zip(steps, polished):
             step.subject, step.body = draft["subject"], draft["body"]

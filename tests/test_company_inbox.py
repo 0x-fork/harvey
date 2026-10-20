@@ -53,7 +53,7 @@ def test_reoon_verdicts(verdict, expected):
 
 @pytest.mark.parametrize("graded, expected", [
     ("verified", "verified"),
-    ("risky", "verified"),     # published on their site, so catch-all is fine
+    ("risky", "risky"),        # catch-all stays risky: send_to_risky decides
     ("invalid", "invalid"),
     (None, "guess"),           # inconclusive stays a guess: never sent
 ])
@@ -129,6 +129,75 @@ async def test_inbox_prospect_carries_its_verification(monkeypatch):
     p = await make_scout(PAGES)._company_inbox_prospect("c1", "acme.com", "Acme Roofing", "Roofing")
     assert p.email == "office@acme.com" and p.email_status == "verified"
     assert p.is_company_inbox and p.company_id == "c1"
+
+
+# ── fallback only when the company has nobody ──
+
+def fallback_scout(team, existing=(), duplicate=False):
+    """A Scout whose team page, email resolution and DB are stand-ins."""
+    scout = Scout.__new__(Scout)
+    scout._seen_prospect_keys = set()
+    scout.inbox_calls = 0
+
+    async def scrape(domain):
+        return team
+
+    async def resolve(first, last, domain):
+        return f"{first.lower()}@acme.com", "verified"
+
+    async def is_dup(prospect):
+        return duplicate
+
+    async def existing_contacts(company_id):
+        return list(existing)
+
+    async def inbox_prospect(*args, **kw):
+        scout.inbox_calls += 1
+        return inbox()
+
+    scout._scrape_team_page = scrape
+    scout._title_matches_icp = lambda title: True
+    scout._resolve_email = resolve
+    scout._infer_seniority = lambda title: ""
+    scout._is_duplicate_prospect = is_dup
+    scout._company_inbox_prospect = inbox_prospect
+    scout.state = SimpleNamespace(get_contacts_for_company=existing_contacts)
+    return scout
+
+
+OWNER = [{"first_name": "Jo", "last_name": "Li", "title": "Owner"}]
+
+
+@pytest.mark.asyncio
+async def test_inbox_used_when_the_site_names_nobody():
+    scout = fallback_scout(team=[])
+    contacts = await scout._contacts_from_company("c1", "acme.com", "Acme", "Roofing")
+    assert [p.is_company_inbox for p in contacts] == [True]
+
+
+@pytest.mark.asyncio
+async def test_no_inbox_when_the_named_owner_is_already_a_prospect():
+    # A revisit: the owner is skipped as a duplicate, but the company must
+    # not be emailed a second time through info@.
+    scout = fallback_scout(team=OWNER, duplicate=True)
+    assert await scout._contacts_from_company("c1", "acme.com", "Acme", "Roofing") == []
+    assert scout.inbox_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_no_inbox_when_the_company_already_has_a_contact():
+    # Someone at the company came from another source (LinkedIn, a job board).
+    known = Prospect(first_name="Jo", last_name="Li", title="Owner", email="jo@acme.com")
+    scout = fallback_scout(team=[], existing=[known])
+    assert await scout._contacts_from_company("c1", "acme.com", "Acme", "Roofing") == []
+    assert scout.inbox_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_no_inbox_without_a_company_record():
+    scout = fallback_scout(team=[])
+    assert await scout._contacts_from_company("", "acme.com", "Acme", "Roofing") == []
+    assert scout.inbox_calls == 0
 
 
 # ── writer ──
