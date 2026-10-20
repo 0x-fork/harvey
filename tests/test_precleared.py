@@ -175,6 +175,41 @@ async def test_prospect_country_is_sent_as_a_fallback_only_when_set(state):
     assert calls[1]["json"]["default_recipient_country"] == "US"
 
 
+@pytest.mark.asyncio
+async def test_setting_prospect_country_forces_a_fresh_check_then_caches(state):
+    # A verdict cached before the setting existed was decided without the
+    # fallback country, so it must not be reused once the setting is on.
+    calls = []
+    await PreclearedClient("US", transport=mock_precleared(calls, OK_BODY)).clear("jane@acme.com", state)
+    with_country = PreclearedClient(
+        "US", prospect_country="US", transport=mock_precleared(calls, OK_BODY),
+    )
+    await with_country.clear("jane@acme.com", state)
+    await with_country.clear("jane@acme.com", state)
+    assert len(calls) == 2
+    assert calls[1]["json"]["default_recipient_country"] == "US"
+
+
+def test_prospect_country_loads_from_harvey_yaml(tmp_path):
+    import yaml
+
+    from harvey.config import load_config
+
+    path = tmp_path / "harvey.yaml"
+    path.write_text(yaml.safe_dump({
+        "persona": {"name": "H", "company": "A", "role": "B",
+                    "email": "h@a.com", "linkedin": "", "tone": "casual"},
+        "product": {"name": "P", "description": "D", "pricing": "$1",
+                    "key_benefits": ["x"], "objection_responses": {}},
+        "icp": {"industries": ["SaaS"], "company_size": "10-50",
+                "titles": ["CEO"], "geography": ["US"]},
+        "compliance": {"precleared": {
+            "enabled": True, "sender_country": "US", "prospect_country": "usa",
+        }},
+    }))
+    assert load_config(str(path)).compliance.precleared.prospect_country == "US"
+
+
 def test_prospect_country_changes_the_cache_fingerprint_only_when_set():
     base = PreclearedClient("US")._fingerprint()
     assert PreclearedClient("US", prospect_country="")._fingerprint() == base
