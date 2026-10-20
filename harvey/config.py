@@ -257,6 +257,14 @@ class BrainConfig(BaseModel):
         return v
 
 
+class WriterConfig(BaseModel):
+    # Run every draft through one extra editing-only brain call using the
+    # Humanizer skill's instructions (~/.claude/skills/humanizer/SKILL.md,
+    # or HARVEY_HUMANIZER_SKILL). Off by default: installing the skill for
+    # your own Claude Code use never changes what Harvey sends on its own.
+    humanizer: bool = False
+
+
 class HarveyConfig(BaseModel):
     persona: PersonaConfig
     product: ProductConfig
@@ -265,6 +273,7 @@ class HarveyConfig(BaseModel):
     usage: UsageConfig = UsageConfig()
     brain: BrainConfig = BrainConfig()
     compliance: ComplianceConfig = ComplianceConfig()
+    writer: WriterConfig = WriterConfig()
 
 
 class EnvConfig(BaseModel):

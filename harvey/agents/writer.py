@@ -11,15 +11,20 @@ design). Every draft still passes the deterministic pre-send gate.
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
 
 from harvey.brain import Brain
 from harvey.config import HarveyConfig
+from harvey.humanize import humanize, humanizer_enabled
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS
 from harvey.models.campaign import Campaign, EmailStep
 from harvey.state import StateManager
 
 logger = logging.getLogger("harvey.writer")
+
+# Merge variables that name a person; a company inbox has none of them.
+PERSON_VAR = re.compile(r"\{\{\s*(first_?name|last_?name|title)\s*\}\}", re.IGNORECASE)
 
 # Native mode: one Claude call per prospect for email 1, so batches stay
 # small — the rest of the 'new' pool is picked up on later cycles.
@@ -139,15 +144,24 @@ class Writer:
         now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         provider = self.config.channels.email.provider
 
-        drafted = 0
+        pending = []
         for prospect in prospects:
             try:
                 draft = await self._write_personal_email(prospect)
             except Exception as e:
                 logger.warning(f"Writer: personal draft failed for {prospect.email}: {e}")
                 continue
-            if not draft:
-                continue
+            if draft:
+                pending.append((prospect, draft))
+
+        # One Humanizer pass over the whole batch before anything is staged.
+        polished = await humanize(
+            self.brain, [d for _, d in pending], agent="writer",
+            enabled=humanizer_enabled(self.config),
+        )
+
+        drafted = 0
+        for (prospect, _), draft in zip(pending, polished):
             item_id = await self.state.add_outbox_item(
                 prospect_id=prospect.id,
                 campaign_id=campaign_id,
@@ -170,11 +184,19 @@ class Writer:
 
     async def _write_personal_email(self, prospect) -> dict | None:
         """One grounded draft for one person. Facts in, one email out."""
-        facts = [
-            f"- Name: {prospect.full_name()}",
-            f"- Title: {prospect.title}",
-            f"- Company: {prospect.company}",
-        ]
+        if prospect.is_company_inbox:
+            facts = [
+                f"- Name: unknown. This goes to the company's general inbox ({prospect.email}),"
+                " most likely read by the owner or the office manager. Use no first name;"
+                " open with 'Hi there' or address the company's team.",
+                f"- Company: {prospect.company}",
+            ]
+        else:
+            facts = [
+                f"- Name: {prospect.full_name()}",
+                f"- Title: {prospect.title}",
+                f"- Company: {prospect.company}",
+            ]
         if prospect.industry:
             facts.append(f"- Industry: {prospect.industry}")
 
@@ -249,6 +271,19 @@ Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
             + (f" | Notes: {p.personalization_notes}" if p.personalization_notes else "")
             for p in prospects[:5]  # Show sample for context
         )
+        inbox_batch = all(p.is_company_inbox for p in prospects)
+        if inbox_batch:
+            merge_rule = (
+                "- These go to each company's general inbox, so no names are known.\n"
+                "  Use {{company}} as the merge variable in every email and NEVER\n"
+                "  {{first_name}} or {{title}}. Greet with 'Hi there' or the company's team."
+            )
+        else:
+            merge_rule = (
+                "- Use {{first_name}}, {{company}}, {{title}} as merge variables — every email\n"
+                "  must use at least one, and email 1 must reference something specific to\n"
+                "  these prospects' industry or role (use the notes above)."
+            )
 
         prompt = self.brain.load_prompt(
             "writer",
@@ -284,9 +319,7 @@ Requirements:
 - Email 1: Personalized cold observation + one question. Under 75 words. No pitch.
 - Email 2: Follow-up 3 days later. Different angle, one concrete proof point. Under 75 words.
 - Email 3: Break-up email 4 days after that. Under 40 words. Gracious, not guilt-tripping.
-- Use {{{{first_name}}}}, {{{{company}}}}, {{{{title}}}} as merge variables — every email
-  must use at least one, and email 1 must reference something specific to
-  these prospects' industry or role (use the notes above).
+{merge_rule}
 - Never be pushy or salesy. Be consultative and value-driven.
 - Subject lines: lowercase, 2-5 words.
 - Follow every rule in the STRICT EMAIL RULES above. No exceptions.
@@ -302,7 +335,21 @@ Return ONLY a JSON array (no markdown fences, no commentary):
             prompt, session_id="harvey-writer",
             agent="writer", task="write_sequence",
         )
-        return self._parse_sequence(result)
+        steps = self._parse_sequence(result)
+        if inbox_batch and any(
+            PERSON_VAR.search(s.subject + s.body) for s in steps
+        ):
+            # Nobody's name is known: "Hi {{first_name}}" or "as {{title}}"
+            # would render as "Hi there" at best and "as General inbox" at worst.
+            logger.warning("Writer: inbox sequence used a person merge variable; discarding it.")
+            return []
+        polished = await humanize(
+            self.brain, [{"subject": s.subject, "body": s.body} for s in steps],
+            agent="writer", enabled=humanizer_enabled(self.config),
+        )
+        for step, draft in zip(steps, polished):
+            step.subject, step.body = draft["subject"], draft["body"]
+        return steps
 
     def _parse_sequence(self, result) -> list[EmailStep]:
         """Robustly coerce LLM output into a validated EmailStep list.
@@ -361,7 +408,10 @@ Return ONLY a JSON array (no markdown fences, no commentary):
         for prospect in prospects:
             # Group by industry + rough title category
             industry = prospect.industry or "general"
-            key = f"{industry}-outreach"
+            # Inbox prospects get their own campaign: their templates can't
+            # greet anyone by name.
+            kind = "inbox-outreach" if prospect.is_company_inbox else "outreach"
+            key = f"{industry}-{kind}"
 
             if key not in batches:
                 batches[key] = []

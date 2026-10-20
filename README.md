@@ -226,6 +226,8 @@ Agency detection is the compounding one. Almost every agency credits itself in t
 
 Free public registries first. Name plus title from the team page, confirmed against an authoritative registry where one exists — which also filters out your own parsing artifacts, because a "person" who matches nothing usually wasn't one.
 
+When a company's site names nobody and Harvey has no contact there yet — common for small trades — it falls back to a general address the company prints on its own homepage or contact page (only general mailboxes such as `owner@`, `office@`, `info@` or `hello@`, never a person's own address). It is never guessed, it is verified like any other address, and those emails greet the company's team instead of a first name.
+
 ### 4. VERIFY — can you reach them
 
 Harvey learns each company's **address pattern** and verifies one candidate, rather than brute-forcing name variations. Raw SMTP probing is not viable from a laptop — outbound port 25 is usually blocked, and Google Workspace and Microsoft 365 accept everything from an unknown IP.
@@ -404,6 +406,7 @@ channels:
                 send_to_risky, max_bounce_rate }
 usage:        { max_daily_claude_percent, heartbeat_interval_minutes, quiet_hours }
 brain:        { provider: claude | codex, model, reasoning_effort }   # optional; claude by default
+writer:       { humanizer }   # optional; true adds one editing pass per batch using ~/.claude/skills/humanizer/SKILL.md
 ```
 
 `max_daily_claude_percent` caps whichever subscription `brain.provider` uses (the name predates Codex support).

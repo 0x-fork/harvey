@@ -355,7 +355,10 @@ async def verify_reoon(email: str, api_key: str) -> Optional[dict]:
     """Reoon email-verifier — generous free tier, good catch-all flagging.
 
     Returns {'status': ..., 'catch_all': bool} or None if unavailable.
-    Reoon 'status' values: valid / invalid / disabled / catch_all / unknown.
+    Reoon power-mode 'status' values: safe / invalid / disabled / disposable /
+    inbox_full / catch_all / role_account / spamtrap / unknown. 'safe' is its
+    deliverable verdict; a 'role_account' (info@, office@) counts as valid
+    only when Reoon also reports it deliverable.
     """
     try:
         async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
@@ -375,6 +378,8 @@ async def verify_reoon(email: str, api_key: str) -> Optional[dict]:
     if not isinstance(data, dict):
         return None
     status = str(data.get("status") or "").lower()
+    if status == "role_account":
+        status = "valid" if data.get("is_deliverable") is True else "unknown"
     is_catch_all = bool(data.get("is_catch_all") or status == "catch_all")
     return {"status": status, "catch_all": is_catch_all}
 
@@ -476,9 +481,9 @@ def _status_from_verdict(verdict: dict) -> Optional[str]:
     if verdict.get("catch_all"):
         return "risky"
     status = verdict.get("status", "")
-    if status in ("valid", "deliverable"):
+    if status in ("valid", "deliverable", "safe"):
         return "verified"
-    if status in ("invalid", "undeliverable", "disabled"):
+    if status in ("invalid", "undeliverable", "disabled", "disposable", "spamtrap"):
         return "invalid"
     if status in ("catch_all", "catch-all", "accept_all"):
         return "risky"
@@ -547,6 +552,25 @@ async def _verify_candidate(email: str, mx_type: str, env) -> tuple[Optional[str
                 return status, catch_all_seen
 
     return None, catch_all_seen
+
+
+async def verify_published_address(email: str, env=None) -> str:
+    """Grade an address the company publishes on its own website.
+
+    Graded like any other address: a catch-all verdict stays "risky", so
+    ``send_to_risky`` still decides whether it is sent (a published address
+    can be stale). A verifier's invalid verdict wins, and an inconclusive
+    check stays an honest guess that is never sent.
+    """
+    email = (email or "").strip().lower()
+    domain = email.partition("@")[2]
+    if not domain:
+        return "invalid"
+    mx_host = await get_mx_host(domain)
+    if not mx_host:
+        return "invalid"
+    status, _ = await _verify_candidate(email, classify_mx(mx_host), env)
+    return status or "guess"
 
 
 # ── Top-level entry point ──

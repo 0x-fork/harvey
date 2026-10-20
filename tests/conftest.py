@@ -41,3 +41,12 @@ def _stand_in_claude_cli(request, monkeypatch):
     monkeypatch.setattr(claude_runtime, "_probe_help", lambda exe: FAKE_HELP)
     yield
     claude_runtime.clear_cache()
+
+
+import harvey.humanize  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _no_installed_humanizer(monkeypatch, tmp_path):
+    """Tests never pick up the operator's real ~/.claude Humanizer skill."""
+    monkeypatch.setattr(harvey.humanize, "SKILL_PATH", tmp_path / "no-humanizer.md")

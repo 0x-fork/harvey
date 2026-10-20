@@ -30,17 +30,17 @@ import logging
 import random
 import re
 from datetime import datetime, timezone
-from urllib.parse import parse_qs, quote_plus, urlparse
+from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
 
 from harvey.brain import Brain
 from harvey.config import HarveyConfig, EnvConfig
-from harvey.integrations.email_finder import find_email
+from harvey.integrations.email_finder import find_email, verify_published_address
 from harvey.integrations.linkedin import LinkedInAutomation
 from harvey.models.company import Company
-from harvey.models.prospect import Prospect
+from harvey.models.prospect import COMPANY_INBOX_SOURCE, Prospect
 from harvey.state import StateManager
 
 logger = logging.getLogger("harvey.scout")
@@ -57,6 +57,16 @@ MAX_RETRIES = 3
 BACKOFF_BASE = 1.5  # seconds; grows exponentially per attempt
 MAX_RESULTS_PER_QUERY = 20
 MAX_COMPANIES_PER_CYCLE = 10
+
+# Company-inbox fallback: pages that publish a general address, and the
+# only mailboxes it will use, most likely read by the owner first. An
+# allowlist, not a blocklist: a personal address (jane.doe@) on a contact
+# page is a person Harvey chose not to target, never "the team".
+INBOX_PAGES = ("/contact", "/contact-us")
+INBOX_PREFERRED = ("owner", "office", "info", "contact", "contactus", "hello",
+                   "team", "service", "sales", "estimates", "quotes",
+                   "inquiries", "enquiries", "admin", "support")
+INBOX_ADDRESS = re.compile(r"[a-z0-9._+\-]+@[a-z0-9.\-]+\.[a-z]{2,}")
 MAX_PROSPECTS_PER_CYCLE = 25
 
 # Hunter domain-searches per heartbeat. The monthly budget itself is shared
@@ -1409,6 +1419,7 @@ Respond ONLY with the JSON array."""
             return []
 
         contacts: list[Prospect] = []
+        named_on_site = False
         for member in team_members:
             title = member.get("title", "")
             if not self._title_matches_icp(title):
@@ -1418,6 +1429,7 @@ Respond ONLY with the JSON array."""
             last_name = member.get("last_name", "")
             if not first_name or not last_name:
                 continue
+            named_on_site = True
 
             email, email_status = await self._resolve_email(
                 first_name, last_name, domain
@@ -1446,7 +1458,103 @@ Respond ONLY with the JSON array."""
 
             self._remember_prospect(prospect)
             contacts.append(prospect)
+
+        # The inbox is a last resort for a company Harvey has no contact at.
+        # A named person found here (even one skipped as a duplicate on a
+        # revisit) or already on file from another source means the
+        # company is covered, so its inbox isn't added on top.
+        if not contacts and not named_on_site and await self._company_uncontacted(company_id):
+            inbox = await self._company_inbox_prospect(
+                company_id, domain, company_name, industry, signal_note,
+            )
+            if inbox:
+                contacts.append(inbox)
         return contacts
+
+    async def _company_uncontacted(self, company_id: str) -> bool:
+        """True only when the company is on file and has no prospects yet."""
+        if not company_id:
+            return False
+        try:
+            return not await self.state.get_contacts_for_company(company_id)
+        except Exception as e:
+            logger.debug(f"Contact lookup failed for company {company_id}: {e}")
+            return False
+
+    async def _company_inbox_prospect(
+        self, company_id: str, domain: str, company_name: str,
+        industry: str, signal_note: str = "",
+    ) -> Prospect | None:
+        """The company's own published inbox, when its site names nobody.
+
+        Small trade businesses rarely list a team, but most publish an
+        info@ or office@ address that the owner or office manager reads.
+        Only an address printed on the company's own site is used, never a
+        guessed one, and it is verified like any other before sending.
+        """
+        email = await self._find_inbox_address(domain)
+        if not email:
+            return None
+        try:
+            status = await verify_published_address(email, env=self.env)
+        except Exception as e:
+            logger.debug(f"Inbox verification failed for {email}: {e}")
+            status = "guess"
+        prospect = Prospect(
+            email=email,
+            email_status=status,
+            email_verified=(status == "verified"),
+            company=company_name,
+            company_id=company_id,
+            title="General inbox",
+            industry=industry,
+            source=COMPANY_INBOX_SOURCE,
+            source_url=f"https://{domain}",
+            personalization_notes=signal_note,
+        )
+        if not prospect.is_valid() or await self._is_duplicate_prospect(prospect):
+            return None
+        self._remember_prospect(prospect)
+        logger.info(f"Scout: No named owner at {domain}; using its published inbox {email} [{status}]")
+        return prospect
+
+    async def _find_inbox_address(self, domain: str) -> str:
+        """Best general address published on the company's homepage or contact page."""
+        base, home = await self._resolve_base_url(domain)
+        if not base:
+            return ""
+        domain = domain.lower().removeprefix("www.")
+        pages = [home] if home is not None else []
+        for path in INBOX_PAGES:
+            resp = await self._fetch(f"{base}{path}", timeout=SCRAPE_TIMEOUT, retries=1)
+            if resp is not None:
+                pages.append(resp)
+
+        found: list[str] = []
+        for resp in pages:
+            text = getattr(resp, "text", "") or ""
+            soup = self._safe_soup(text)
+            if soup is not None:
+                for a in soup.find_all("a", href=True):
+                    href = self._attr_str(a.get("href"))
+                    if href.lower().startswith("mailto:"):
+                        found.append(unquote(href[7:].split("?")[0]))
+            found.append(unquote(text[:50000]))
+
+        # Pull clean addresses out of everything found ("%20info@x.com",
+        # a trailing full stop), then keep only general on-domain inboxes.
+        candidates = []
+        for chunk in found:
+            for addr in INBOX_ADDRESS.findall(chunk.lower()):
+                addr = addr.rstrip(".")
+                local, _, adomain = addr.partition("@")
+                if adomain.removeprefix("www.") != domain or local not in INBOX_PREFERRED:
+                    continue
+                if addr not in candidates:
+                    candidates.append(addr)
+        if not candidates:
+            return ""
+        return min(candidates, key=lambda a: INBOX_PREFERRED.index(a.partition("@")[0]))
 
     # ── Strategy 4: Job boards — companies hiring for signal roles ──
 
