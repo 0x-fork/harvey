@@ -8,6 +8,7 @@ import asyncio
 import copy
 import logging
 import os
+import shutil
 import time
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -406,9 +407,14 @@ def write_trained_config(learned: dict, path: Path) -> dict:
         print("      compliance, sender identity); updated the product, targeting and company.")
 
     tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        yaml.safe_dump(config, f, default_flow_style=False, sort_keys=False)
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            yaml.safe_dump(config, f, default_flow_style=False, sort_keys=False)
+        if path.exists():
+            shutil.copymode(path, tmp)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
     return config
 
 

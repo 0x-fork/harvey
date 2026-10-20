@@ -184,3 +184,18 @@ def test_a_real_sender_with_a_blank_company_is_kept(tmp_path):
     out = write_trained_config(LEARNED, path)
     assert out["persona"]["email"] == "ethan@oldco.com"
     assert out["persona"]["company"] == "Acme Roofing"
+
+
+def test_a_failed_write_leaves_the_config_and_no_temp_file(tmp_path):
+    path = tmp_path / "harvey.local.yaml"
+    write(path, TUNED)
+    before = path.read_text()
+    bad = {**LEARNED, "product": {**LEARNED["product"], "name": object()}}
+    try:
+        write_trained_config(bad, path)
+    except yaml.YAMLError:
+        pass
+    else:
+        raise AssertionError("an unrepresentable value should fail the write")
+    assert path.read_text() == before
+    assert list(tmp_path.glob("*.tmp")) == []
