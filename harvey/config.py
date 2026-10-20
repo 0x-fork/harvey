@@ -109,6 +109,27 @@ class ChannelsConfig(BaseModel):
 PRECLEARED_ADDRESS_SOURCES = ("published", "bought", "scraped", "given", "unknown")
 
 
+def normalize_prospect_country(v) -> str:
+    """A two-letter country code ("us" -> "US", "UK" -> "GB"), or "" for none.
+
+    Raises ValueError on anything else, including the booleans YAML makes of
+    an unquoted NO (Norway) or ON, so a typo is never silently ignored.
+    """
+    if isinstance(v, bool):
+        raise ValueError(
+            f"prospect_country was read as {v}. YAML turns an unquoted NO or "
+            'ON into true/false, so quote the code, e.g. prospect_country: "NO".'
+        )
+    v = str(v or "").strip().upper()
+    v = {"UK": "GB", "USA": "US"}.get(v, v)
+    if v and not (len(v) == 2 and v.isascii() and v.isalpha()):
+        raise ValueError(
+            f"'{v}' is not a valid prospect_country. Use a two-letter "
+            "country code such as US or GB, or leave it empty."
+        )
+    return v
+
+
 class PreclearedConfig(BaseModel):
     """Optional per-recipient cold-email check through Precleared.
 
@@ -126,6 +147,11 @@ class PreclearedConfig(BaseModel):
     # is "unknown"; use "published" only if yours are copied from the
     # businesses' own websites.
     address_source: str = "unknown"
+    # Optional: the country your prospects are in (two letters, e.g. "US"),
+    # if they are all in one. Precleared uses it only when it can't work out
+    # the recipient's country from the address, company records or the
+    # company's website. Leave empty if your prospects are spread out.
+    prospect_country: str = ""
 
     @field_validator("sender_country", mode="before")
     @classmethod
@@ -142,6 +168,11 @@ class PreclearedConfig(BaseModel):
                 f"Use one of: {', '.join(PRECLEARED_ADDRESS_SOURCES)}."
             )
         return v
+
+    @field_validator("prospect_country", mode="before")
+    @classmethod
+    def _valid_prospect_country(cls, v) -> str:
+        return normalize_prospect_country(v)
 
     @model_validator(mode="after")
     def _country_when_enabled(self):
