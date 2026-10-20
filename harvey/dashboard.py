@@ -759,6 +759,73 @@ def _state():
     return StateManager(db_path=str(DB_PATH))
 
 
+# What a reviewer needs next to a draft to check its claims against the facts.
+OUTBOX_CONTEXT_SIGNALS = (
+    "TECH_STACK", "INCUMBENT_AGENCY", "HIRING_ROLE", "RUNNING_GOOGLE_ADS", "NO_ONLINE_BOOKING",
+)
+
+
+def _in(ids) -> str:
+    return ",".join("?" for _ in ids)
+
+
+async def _with_context(items: list[dict]) -> list[dict]:
+    """Attach the campaign, company, contact and signals behind each draft."""
+    if not items:
+        return items
+    pids = sorted({i["prospect_id"] for i in items if i.get("prospect_id")})
+    cids = sorted({i["campaign_id"] for i in items if i.get("campaign_id")})
+
+    people = {r["id"]: r for r in (await query_db(
+        "SELECT p.id, p.first_name, p.last_name, p.title, p.source, p.email_status, "
+        "p.score, p.personalization_notes, p.company_id, c.name AS company_name, "
+        "c.domain, c.website, c.description, c.industry AS found_by "
+        "FROM prospects p LEFT JOIN companies c ON c.id = p.company_id "
+        f"WHERE p.id IN ({_in(pids)})", tuple(pids)) if pids else [])}
+    campaigns = {r["id"]: r["name"] for r in (await query_db(
+        f"SELECT id, name FROM campaigns WHERE id IN ({_in(cids)})",
+        tuple(cids)) if cids else [])}
+
+    company_ids = sorted({p["company_id"] for p in people.values() if p.get("company_id")})
+    signals: dict[str, dict[str, str]] = {}
+    if company_ids:
+        rows = await query_db(
+            "SELECT o.company_id, o.signal_code, o.value_num, o.value_text, "
+            "COALESCE(sc.label, o.signal_code) AS label FROM observations o "
+            "LEFT JOIN signal_codes sc ON sc.code = o.signal_code "
+            f"WHERE o.company_id IN ({_in(company_ids)}) "
+            f"AND o.signal_code IN ({_in(OUTBOX_CONTEXT_SIGNALS)}) "
+            "ORDER BY o.observed_at",
+            (*company_ids, *OUTBOX_CONTEXT_SIGNALS),
+        )
+        for r in rows:  # oldest first, so the latest observation wins
+            if r["value_text"]:
+                value = r["value_text"]
+            elif r["value_num"] is None:
+                value = ""
+            else:
+                value = "yes" if r["value_num"] else "no"
+            signals.setdefault(r["company_id"], {})[r["label"]] = value
+
+    for item in items:
+        p = people.get(item.get("prospect_id")) or {}
+        item["context"] = {
+            "campaign": campaigns.get(item.get("campaign_id"), ""),
+            "company": p.get("company_name", ""),
+            "website": p.get("website") or (f"https://{p['domain']}" if p.get("domain") else ""),
+            "description": p.get("description", ""),
+            "found_by": p.get("found_by", ""),
+            "contact": " ".join(x for x in (p.get("first_name"), p.get("last_name")) if x),
+            "contact_title": p.get("title", ""),
+            "contact_source": p.get("source", ""),
+            "email_status": p.get("email_status", ""),
+            "score": p.get("score"),
+            "notes": p.get("personalization_notes", ""),
+            "signals": signals.get(p.get("company_id"), {}),
+        }
+    return items
+
+
 @app.get("/api/outbox")
 async def get_outbox_api():
     """Outbox queue + kill-switch state for the Outbox tab."""
@@ -767,7 +834,8 @@ async def get_outbox_api():
         await state.init_db()
         return {
             "paused": await state.get_setting("sending_paused"),
-            "pending": await state.get_outbox(status="pending_review", limit=100),
+            "pending": await _with_context(
+                await state.get_outbox(status="pending_review", limit=100)),
             "approved": await state.get_outbox(status="approved", limit=50),
             "sent": (await query_db(
                 "SELECT * FROM outbox WHERE status = 'sent' "
@@ -798,6 +866,30 @@ async def outbox_approve(item_id: str):
         await state.init_db()
         n = await state.approve_outbox(item_id)
         return {"success": bool(n)}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+
+@app.post("/api/outbox/{item_id}/edit")
+async def outbox_edit(item_id: str, request: Request):
+    """Rewrite a draft awaiting review. Never approves it."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    subject = str((body or {}).get("subject") or "").strip()
+    text = str((body or {}).get("body") or "").strip()
+    if not subject or not text:
+        return JSONResponse({"success": False, "message": "Subject and body are both required."},
+                            status_code=400)
+    try:
+        state = _state()
+        await state.init_db()
+        if not await state.edit_outbox_draft(item_id, subject, text):
+            return JSONResponse({"success": False,
+                                 "message": "Only drafts awaiting review can be edited."},
+                                status_code=409)
+        return {"success": True}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 
