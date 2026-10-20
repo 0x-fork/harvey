@@ -1315,36 +1315,107 @@ async def set_signals_status(request: Request):
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 
 
+COHORT_PAGE_SIZE = 50
+COHORT_MAX_PAGE_SIZE = 200
+
+
+async def _cohort_companies(require: list[str], exclude: list[str],
+                            offset: int = 0, limit: int | None = None):
+    state = _state()
+    await state.init_db()
+    return await state.cohort_companies(require, exclude, offset, limit)
+
+
+def _codes(raw) -> list[str]:
+    """Accept lists or CSV strings, with bounded SQL parameter counts."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    if not isinstance(raw, list) or any(not isinstance(c, str) for c in raw):
+        raise ValueError("signals must be a list of strings or comma-separated string")
+    codes = list(dict.fromkeys(c.strip() for c in raw if c.strip()))
+    if len(codes) > 200 or any(len(c) > 128 for c in codes):
+        raise ValueError("too many or oversized signal codes")
+    return codes
+
+
+def _cohort_integer(raw, default):
+    if raw is None:
+        return default
+    if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+        raise ValueError("offset and limit must be integers")
+    value = int(raw)
+    if abs(value) > 9223372036854775807:
+        raise ValueError("offset or limit is too large")
+    return value
+
+
 @app.post("/api/cohort")
 async def preview_cohort(request: Request):
     """How many companies carry ALL these signals and none of those.
 
     The payoff for confirming signals: a cohort is a query, not a list. Set
     intersection happens in SQL — intersecting in JS over a capped fetch
-    silently returns the wrong answer.
+    silently returns the wrong answer. ``offset``/``limit`` page through the
+    matches; ``size`` is always the whole cohort.
     """
     try:
         body = await request.json()
-        require = [c for c in (body.get("require") or []) if c]
-        exclude = [c for c in (body.get("exclude") or []) if c]
+        if not isinstance(body, dict):
+            raise ValueError("request body must be an object")
+        require = _codes(body.get("require"))
+        exclude = _codes(body.get("exclude"))
+        offset = max(0, _cohort_integer(body.get("offset"), 0))
+        limit = min(max(1, _cohort_integer(body.get("limit"), COHORT_PAGE_SIZE)),
+                    COHORT_MAX_PAGE_SIZE)
         if not require:
-            return {"size": 0, "companies": []}
+            return {"size": 0, "offset": 0, "limit": limit, "companies": []}
 
-        state = _state()
-        await state.init_db()
-        ids = await state.cohort(require, exclude, limit=1000)
-        if not ids:
-            return {"size": 0, "companies": []}
-
-        placeholders = ",".join("?" for _ in ids[:200])
-        rows = await query_db(
-            f"SELECT id, name, domain, industry, location FROM companies "
-            f"WHERE id IN ({placeholders})",
-            tuple(ids[:200]),
-        )
-        return {"size": len(ids), "companies": rows}
+        size, rows = await _cohort_companies(require, exclude, offset, limit)
+        return {"size": size, "offset": offset, "limit": limit,
+                "companies": rows}
+    except (ValueError, TypeError) as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
     except Exception as e:
         return JSONResponse({"size": 0, "companies": [], "error": str(e)}, status_code=500)
+
+
+def _csv_cell(value):
+    text = str(value or "")
+    # Spreadsheet software may ignore leading whitespace before formulas.
+    if text.lstrip().startswith(("=", "+", "-", "@")) or text.startswith(("\t", "\r", "\n")):
+        return "'" + text
+    return text
+
+
+@app.get("/api/cohort.csv")
+async def export_cohort(require: str = "", exclude: str = ""):
+    """The whole cohort as a CSV download — every match, not just one page."""
+    import csv
+    import io
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["name", "domain", "website", "industry", "location"])
+    try:
+        codes = _codes(require)
+        excluded = _codes(exclude)
+        if codes:
+            _, rows = await _cohort_companies(codes, excluded)
+            for r in rows:
+                writer.writerow([_csv_cell(r.get(k)) for k in
+                                 ("name", "domain", "website", "industry", "location")])
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        logger.warning("Cohort export failed: %s", e)
+        return JSONResponse({"error": "Cohort export failed"}, status_code=500)
+    return PlainTextResponse(
+        buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="cohort.csv"'},
+    )
 
 
 @app.get("/api/runs")

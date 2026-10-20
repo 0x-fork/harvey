@@ -36,6 +36,14 @@ minor versions can still change behaviour.
   go out. One check per address, cached for 30 days; changing the sender
   country, address source or product description triggers a fresh check. The
   receipt id is logged with each send. Native providers only. Off by default.
+- **Cohort builder pagination and CSV export.** The cohort table on the
+  Signals tab used to stop at the first 50 matches with no way to see the
+  rest. It now pages with Prev / Next ("Showing 51–100 of 147"), and an
+  Export CSV button downloads the whole cohort. `POST /api/cohort` accepts
+  `offset` and `limit` (default 50, max 200) and orders by name so pages never
+  overlap; `GET /api/cohort.csv?require=...&exclude=...` returns every match.
+  Counts and exports include every match; pages use a stable name/id SQL order.
+  CSV downloads carry dashboard authorization and escape spreadsheet formulas.
 
 ## [0.3.0] — 2026-10-13
 

@@ -82,6 +82,10 @@ class _ExtraLinkError(TokenError):
     dashboard publishes it: see _publish_token)."""
 
 
+class _WindowsReadBusyError(TokenError):
+    """Windows refused an open that may overlap token publication."""
+
+
 # ── Token file ──
 
 
@@ -117,7 +121,14 @@ def _read_token(path: Path) -> str | None:
         if e.errno in (errno.ELOOP, errno.EMLINK):
             raise TokenError(f"{path} is a symbolic link. Remove it and restart "
                              "the dashboard.") from e
-        raise TokenError(f"Can't read {path}: {e.strerror}.") from e
+        error_type = TokenError
+        # The CRT can reduce sharing violations to EACCES without winerror.
+        # Real ACL denials use the same code; they still fail closed after
+        # the bounded settling window, without replacing the token.
+        if _IS_WINDOWS and (e.errno == errno.EACCES
+                            or getattr(e, "winerror", None) in (5, 32, 33)):
+            error_type = _WindowsReadBusyError
+        raise error_type(f"Can't read {path}: {e.strerror}.") from e
     try:
         _check_open_file(fd, path)
         data = os.read(fd, 4097)
@@ -174,12 +185,15 @@ def _publish_token(path: Path, token: str):
 
 
 def _read_token_settled(path: Path) -> str | None:
-    """_read_token, waiting briefly (about 0.5s) for a concurrent publisher
-    to drop its temporary link. A link that stays is still refused."""
+    """Wait at most 50 short intervals for publication-related read failures.
+
+    Persistent access errors or extra links are still refused. Token contents
+    and all other file-security checks are never retried or relaxed.
+    """
     for _ in range(50):
         try:
             return _read_token(path)
-        except _ExtraLinkError:
+        except (_ExtraLinkError, _WindowsReadBusyError):
             time.sleep(0.01)
     return _read_token(path)
 
