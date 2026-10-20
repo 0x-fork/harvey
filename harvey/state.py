@@ -1410,6 +1410,11 @@ class StateManager:
                 row = await cursor.fetchone()
                 return row[0] if row else default
 
+    async def delete_setting(self, key: str):
+        async with self._connect() as db:
+            await db.execute("DELETE FROM settings WHERE key = ?", (key,))
+            await db.commit()
+
     async def set_setting(self, key: str, value: str):
         async with self._connect() as db:
             await db.execute(
