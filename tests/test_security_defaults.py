@@ -165,3 +165,26 @@ async def test_training_on_a_local_url_says_why_it_was_refused():
     crawler = FallbackCrawler()
     assert await crawler.crawl("http://localhost:3000", max_pages=3) == {}
     assert crawler.blocked is True
+
+
+def test_status_still_works_when_the_config_is_invalid(tmp_path, monkeypatch, capsys):
+    # `harvey status` is what people run when something's wrong, so an
+    # invalid harvey.yaml must not crash the sending-hold check.
+    import harvey.config
+    import harvey.state
+    from harvey.cli import cmd_status
+    from harvey.config import HarveyConfig
+    from pydantic import ValidationError
+
+    def invalid():
+        HarveyConfig(channels={"email": {"max_daily_sends": "lots"}})
+
+    try:
+        invalid()
+    except ValidationError:
+        pass
+    real_state = harvey.state.StateManager
+    monkeypatch.setattr(harvey.state, "StateManager", lambda: real_state(str(tmp_path / "s.db")))
+    monkeypatch.setattr(harvey.config, "load_config", invalid)
+    cmd_status(SimpleNamespace(check=False))
+    assert "Prospects:" in capsys.readouterr().out
