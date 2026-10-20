@@ -100,3 +100,22 @@ def test_edit_needs_both_subject_and_body(client):
                        json={"subject": "  ", "body": "text"}).status_code == 400
     assert client.post(f"/api/outbox/{item_id}/edit",
                        json={"subject": "s"}).status_code == 400
+
+
+@pytest.mark.parametrize("body", [
+    "Hi {{first_name}},\n\nQuick one.\n\nHaris",   # merge tag a person typed
+    "Hi there,\n\n<a href='x'>click</a>\n\nHaris",   # HTML
+])
+def test_an_edit_the_sender_would_block_is_refused_with_the_reason(client, body):
+    state, item_id = asyncio.run(_seed(client.db_path))
+    r = client.post(f"/api/outbox/{item_id}/edit", json={"subject": "your portal", "body": body})
+    assert r.status_code == 400
+    assert "blocked" in r.json()["message"]
+    assert asyncio.run(state.get_outbox_item(item_id))["subject"] == "your client portal"
+
+
+def test_editing_needs_the_dashboard_token(client):
+    _, item_id = asyncio.run(_seed(client.db_path))
+    r = client.post(f"/api/outbox/{item_id}/edit", headers={"Authorization": ""},
+                    json={"subject": "s", "body": "b"})
+    assert r.status_code in (401, 403)

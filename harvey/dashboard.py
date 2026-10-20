@@ -882,6 +882,17 @@ async def outbox_edit(item_id: str, request: Request):
     if not subject or not text:
         return JSONResponse({"success": False, "message": "Subject and body are both required."},
                             status_code=400)
+    # The sender re-checks every email before it goes out; an edit it would
+    # block is refused now, while the reviewer can still fix it, instead of
+    # failing quietly at send time. Content rules only: the recipient isn't
+    # something an edit can change.
+    from harvey.gate import pre_send_check
+    gate = pre_send_check("reviewer@example.com", subject, text)
+    if not gate:
+        return JSONResponse({"success": False,
+                             "message": "The sender would have blocked this: "
+                                        + "; ".join(gate.reasons)},
+                            status_code=400)
     try:
         state = _state()
         await state.init_db()
