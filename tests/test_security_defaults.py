@@ -109,3 +109,59 @@ def test_setup_saves_explicit_linkedin_choice_for_existing_config(tmp_path, monk
     wizard.config = {"channels": {"linkedin": {"enabled": enabled}}}
     wizard._write_config()
     assert yaml.safe_load(path.read_text())["channels"]["linkedin"]["enabled"] is enabled
+
+
+# ── a held Instantly setup stays visible and never stalls the pipeline ──
+
+@pytest.mark.asyncio
+async def test_held_instantly_reply_spends_no_model_call(state):
+    await state.add_prospect(Prospect(first_name="Jane", last_name="Doe", company="Acme",
+                                      title="Owner", email="jane@acme.test"))
+    handler = Handler(None, state, legacy_config(), EnvConfig())
+    handler.instantly = AsyncMock()
+    handler._classify_intent = AsyncMock(return_value="interested")
+    handler._generate_response = AsyncMock(return_value="Happy to help.")
+    await handler._process_reply("jane@acme.test", "Sounds good, tell me more", "reply-id")
+    handler._generate_response.assert_not_awaited()
+    handler.instantly.send_reply.assert_not_awaited()
+    assert len(await state.get_conversations_by_status("needs_human")) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("new, expected", [(30, "write_campaign"), (0, "prospect")])
+async def test_held_drafts_do_not_block_writing_or_prospecting(new, expected):
+    # A held Instantly draft must not win "send_campaign" every cycle and
+    # starve the writer and scout forever.
+    from harvey.main import decide_next_action
+    summary = {"prospects": {"new": new}, "draft_campaigns": 1, "open_conversations": 0}
+    assert await decide_next_action(None, None, legacy_config(), summary=summary) == expected
+
+
+@pytest.mark.asyncio
+async def test_drafts_still_deploy_on_instantly_autopilot_and_native_providers():
+    from harvey.main import decide_next_action
+    summary = {"prospects": {"new": 30}, "draft_campaigns": 1, "open_conversations": 0}
+    assert await decide_next_action(None, None, legacy_config(False), summary=summary) == "send_campaign"
+    native = legacy_config()
+    native.channels.email.provider = "gmail"
+    assert await decide_next_action(None, None, native, summary=summary) == "send_campaign"
+
+
+def test_held_instantly_is_announced_plainly():
+    from harvey.config import legacy_sending_held, sending_notice
+    assert legacy_sending_held(legacy_config()) is True
+    assert legacy_sending_held(legacy_config(False)) is False
+    notice = sending_notice(legacy_config())
+    assert "Instantly" in notice and "require_approval: false" in notice
+    assert sending_notice(legacy_config(False)) == ""
+    native = legacy_config()
+    native.channels.email.provider = "gmail"
+    assert sending_notice(native) == ""
+
+
+@pytest.mark.asyncio
+async def test_training_on_a_local_url_says_why_it_was_refused():
+    from harvey.trainer import FallbackCrawler
+    crawler = FallbackCrawler()
+    assert await crawler.crawl("http://localhost:3000", max_pages=3) == {}
+    assert crawler.blocked is True

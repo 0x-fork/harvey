@@ -95,6 +95,29 @@ class EmailChannelConfig(BaseModel):
         return v
 
 
+def legacy_sending_held(config) -> bool:
+    """True when Instantly is the provider and approval is required.
+
+    Instantly has no per-email approval queue, so with require_approval on
+    Harvey holds campaign deployment and hands replies to a human.
+    """
+    email = getattr(getattr(config, "channels", None), "email", None)
+    return (getattr(email, "provider", "") == "instantly"
+            and bool(getattr(email, "require_approval", True)))
+
+
+def sending_notice(config) -> str:
+    """A plain-language warning when outbound sending is held by config, or ""."""
+    if not legacy_sending_held(config):
+        return ""
+    return (
+        "Instantly sending is held: channels.email.require_approval is true, and "
+        "Instantly has no approval queue. Campaigns stay as drafts and replies go to "
+        "a human (dashboard Activity tab). Set require_approval: false to let Instantly "
+        "send automatically, or switch to gmail, microsoft or smtp to approve each email."
+    )
+
+
 class LinkedInChannelConfig(BaseModel):
     enabled: bool = False
     max_daily_connections: int = 20

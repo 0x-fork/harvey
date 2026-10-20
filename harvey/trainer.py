@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 
 from harvey.brain import Brain
 from harvey.config import BrainConfig, load_brain_config
-from harvey.public_http import public_http_client
+from harvey.public_http import UnsafeURLError, public_http_client
 from harvey.state import StateManager
 
 logger = logging.getLogger("harvey.trainer")
@@ -204,8 +204,12 @@ class FallbackCrawler:
     on each crawled page until it hits the max_pages limit.
     """
 
+    # Set when a page was refused for pointing at a local or private address.
+    blocked = False
+
     async def crawl(self, base_url: str, max_pages: int = 100) -> dict[str, str]:
         """Recursively crawl a website by following internal links."""
+        self.blocked = False
         pages: dict[str, str] = {}
         visited: set[str] = set()
         domain = urlparse(base_url).netloc
@@ -275,6 +279,9 @@ class FallbackCrawler:
             lines = [line.strip() for line in text.splitlines() if line.strip()]
             return raw_html, "\n".join(lines)
 
+        except UnsafeURLError:
+            self.blocked = True
+            return "", ""
         except Exception as e:
             logger.debug(f"Failed to fetch {url}: {e}")
             return "", ""
@@ -475,7 +482,12 @@ class Trainer:
             self.scraped_pages = await crawler.crawl(base_url, max_pages=max_pages)
 
         if not self.scraped_pages:
-            print("\nERROR: Could not scrape any pages. Check the URL.")
+            if getattr(crawler, "blocked", False):
+                print(f"\nERROR: {base_url} points to a local or private address. Harvey only")
+                print("learns from public websites, so it never reaches into your own network.")
+                print("Train on the live public site instead.")
+            else:
+                print("\nERROR: Could not scrape any pages. Check the URL.")
             return None
 
         print(f"      Done! Crawled {len(self.scraped_pages)} pages.\n")
