@@ -24,7 +24,7 @@ from harvey.state import StateManager
 logger = logging.getLogger("harvey.writer")
 
 # Merge variables that name a person; a company inbox has none of them.
-PERSON_VAR = re.compile(r"\{\{\s*(first_name|last_name|title)\s*\}\}")
+PERSON_VAR = re.compile(r"\{\{\s*(first_?name|last_?name|title)\s*\}\}", re.IGNORECASE)
 
 # Native mode: one Claude call per prospect for email 1, so batches stay
 # small — the rest of the 'new' pool is picked up on later cycles.

@@ -279,7 +279,10 @@ def sequence_writer(steps):
     return writer
 
 
-@pytest.mark.parametrize("var", ["{{first_name}}", "{{last_name}}", "{{title}}"])
+@pytest.mark.parametrize("var", [
+    "{{first_name}}", "{{last_name}}", "{{title}}",
+    "{{ first_name }}", "{{First_Name}}", "{{firstName}}", "{{Title}}",
+])
 @pytest.mark.asyncio
 async def test_inbox_sequence_using_a_person_variable_is_rejected(var):
     # "as General inbox at Acme" must never be rendered and sent.
