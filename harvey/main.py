@@ -93,6 +93,9 @@ async def decide_next_action(
 
     prospects = summary.get("prospects") or {}
     new_prospects = prospects.get("new", 0) if isinstance(prospects, dict) else 0
+    # Only prospects the Writer can draft for count: one with a guessed email
+    # stays 'new' for good, and counting it starved Scout forever.
+    new_prospects = summary.get("writable_prospects", new_prospects) or 0
     draft_campaigns = summary.get("draft_campaigns", 0) or 0
     open_conversations = summary.get("open_conversations", 0) or 0
 

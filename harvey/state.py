@@ -29,6 +29,10 @@ DB_PATH = PROJECT_ROOT / "data" / "harvey.db"
 # How long (seconds) a connection waits on a locked database before failing.
 BUSY_TIMEOUT_SECONDS = 30.0
 
+# Email statuses the Writer drafts for. Shared with the heartbeat so it only
+# chooses write_campaign when there is something the Writer will act on.
+WRITABLE_EMAIL_STATUSES = ("verified", "risky")
+
 
 def _new_id() -> str:
     return uuid.uuid4().hex[:12]
@@ -1456,6 +1460,18 @@ class StateManager:
                         return True
         return False
 
+    async def count_writable_prospects(self) -> int:
+        """New prospects the Writer can draft for (a deliverable email)."""
+        marks = ",".join("?" for _ in WRITABLE_EMAIL_STATUSES)
+        async with self._connect() as db:
+            async with db.execute(
+                f"""SELECT COUNT(*) FROM prospects
+                    WHERE status = 'new' AND email != ''
+                      AND email_status IN ({marks})""",
+                WRITABLE_EMAIL_STATUSES,
+            ) as cursor:
+                return (await cursor.fetchone())[0]
+
     async def count_prospects_by_status(self) -> dict[str, int]:
         async with self._connect() as db:
             async with db.execute(
@@ -1880,6 +1896,10 @@ class StateManager:
 
         return {
             "prospects": prospect_counts,
+            # The 'new' prospects the Writer can act on. A guessed or invalid
+            # address stays 'new' forever, so deciding from the raw count
+            # would keep choosing write_campaign with nothing to write.
+            "writable_prospects": await self.count_writable_prospects(),
             "draft_campaigns": draft_campaigns,
             "active_campaigns": active_campaigns,
             "open_conversations": open_conversations,

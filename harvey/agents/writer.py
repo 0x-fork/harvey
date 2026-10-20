@@ -19,7 +19,7 @@ from harvey.config import HarveyConfig
 from harvey.humanize import humanize, humanizer_enabled
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS
 from harvey.models.campaign import Campaign, EmailStep
-from harvey.state import StateManager
+from harvey.state import WRITABLE_EMAIL_STATUSES, StateManager
 
 logger = logging.getLogger("harvey.writer")
 
@@ -65,10 +65,9 @@ class Writer:
         # Only write for prospects we can actually deliver to. Guessed and
         # invalid addresses are skipped so we don't spend Claude calls (or
         # sending reputation) on mail that will bounce.
-        deliverable = {"verified", "risky"}
         prospects_with_email = [
             p for p in new_prospects
-            if p.email and (p.email_status or "guess") in deliverable
+            if p.email and (p.email_status or "guess") in WRITABLE_EMAIL_STATUSES
         ]
         if not prospects_with_email:
             logger.info(
