@@ -1199,6 +1199,39 @@ class StateManager:
             async with db.execute(sql, params) as cursor:
                 return [row[0] for row in await cursor.fetchall()]
 
+    async def cohort_companies(self, require: list[str], exclude: list[str],
+                               offset: int = 0, limit: int | None = None) -> tuple[int, list[dict]]:
+        """Count all matches and page company details in one read snapshot."""
+        if not require:
+            return 0, []
+        require = list(dict.fromkeys(require))
+        exclude = list(dict.fromkeys(exclude))
+        matches = (
+            "SELECT company_id FROM positive WHERE company_id != '' AND "
+            f"signal_code IN ({','.join('?' for _ in require)}) "
+            "AND confidence >= 0 GROUP BY company_id "
+            "HAVING COUNT(DISTINCT signal_code) = ?"
+        )
+        params = [*require, len(require)]
+        if exclude:
+            matches += (" AND company_id NOT IN (SELECT company_id FROM positive "
+                        f"WHERE signal_code IN ({','.join('?' for _ in exclude)}))")
+            params.extend(exclude)
+        base = self._CURRENT_CTE + " SELECT {columns} FROM companies WHERE id IN (" + matches + ")"
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            await db.execute("BEGIN")
+            async with db.execute(base.format(columns="COUNT(*)"), params) as cursor:
+                size = (await cursor.fetchone())[0]
+            sql = base.format(columns="id, name, domain, website, industry, location")
+            sql += " ORDER BY LOWER(COALESCE(name, '')), id"
+            page_params = list(params)
+            if limit is not None:
+                sql += " LIMIT ? OFFSET ?"
+                page_params.extend([limit, offset])
+            async with db.execute(sql, page_params) as cursor:
+                return size, [dict(row) for row in await cursor.fetchall()]
+
     async def companies_needing_profile(
         self, limit: int = 100, stale_days: int = 90
     ) -> list[dict]:
@@ -1251,6 +1284,20 @@ class StateManager:
                 """UPDATE companies SET profile_checked_at = CURRENT_TIMESTAMP,
                        updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
                 (company_id,),
+            )
+            await db.commit()
+
+    async def rename_company(self, company_id: str, name: str):
+        """Set a company's name, and the copy each of its prospects carries."""
+        async with self._connect() as db:
+            await db.execute(
+                "UPDATE companies SET name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (name, company_id),
+            )
+            await db.execute(
+                "UPDATE prospects SET company = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE company_id = ?",
+                (name, company_id),
             )
             await db.commit()
 
@@ -1843,3 +1890,4 @@ class StateManager:
             # Claude budget the rest of the loop is rationing.
             "unprofiled": await self.count_companies_needing_profile(),
         }
+

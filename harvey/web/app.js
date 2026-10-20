@@ -42,6 +42,13 @@ function escHtml(s) {
   ));
 }
 
+// Links built from collected data (websites, profiles) open only as http(s):
+// a javascript: URL from a scraped page must never run in the dashboard.
+function safeHref(u) {
+  const s = String(u || '').trim();
+  return /^https?:\/\//i.test(s) ? escHtml(s) : '';
+}
+
 // ── One status vocabulary ──
 //
 // Harvey's tables each carry their own words for state: a prospect is `new`,
@@ -127,11 +134,89 @@ function offlineState() {
 
 async function api(path, opts) {
   try {
-    const r = await fetch(path, opts);
+    const r = await authFetch(path, opts);
+    if (await lockIfRefused(r)) return null;
     if (!r.ok) return null;
     return await r.json();
   } catch {
     return null;
+  }
+}
+
+// ── Locked: no token, a wrong one, or the server can't load its own ──
+
+let _locked = false;
+
+async function lockIfRefused(r) {
+  if (r.status !== 401 && r.status !== 503) {
+    if (r.ok && _locked) hideLock();
+    return false;
+  }
+  let why = '';
+  if (r.status === 503) {
+    try { why = ((await r.json()) || {}).message || ''; } catch { /* ignore */ }
+  }
+  showLock(r.status === 503
+    ? 'The dashboard server can\'t use its token file, so it is refusing every request. ' + why
+    : authToken()
+      ? 'The saved token was not accepted (the dashboard may have a new one).'
+      : 'This tab doesn\'t have the dashboard token yet.');
+  return true;
+}
+
+function showLock(reason) {
+  _locked = true;
+  const el = document.getElementById('lock-screen');
+  if (!el) return;
+  document.getElementById('lock-reason').textContent = reason;
+  el.style.display = 'flex';
+  const dot = document.getElementById('header-dot');
+  const text = document.getElementById('header-status-text');
+  if (dot) dot.className = 'status-dot offline';
+  if (text) text.textContent = 'Locked';
+}
+
+function hideLock() {
+  _locked = false;
+  const el = document.getElementById('lock-screen');
+  if (el) el.style.display = 'none';
+}
+
+function unlockWithToken(event) {
+  event.preventDefault();
+  const input = document.getElementById('lock-token');
+  const value = (input.value || '').trim();
+  input.value = '';
+  if (!setAuthToken(value)) {
+    document.getElementById('lock-reason').textContent =
+      'That doesn\'t look like a dashboard token. Copy it again from the link or data/dashboard-token.';
+    return;
+  }
+  hideLock();
+  loadCurrentTab();
+  loadHarveyStatus();
+}
+
+// Downloads go through the same authorised fetch and are handed to the
+// browser as a local blob, so no download URL ever carries the token.
+async function downloadCsv(path, filename, btn) {
+  if (btn) btn.disabled = true;
+  try {
+    const r = await authFetch(path);
+    if (await lockIfRefused(r)) return;
+    if (!r.ok) { showToast('Export failed.', 'error'); return; }
+    const href = URL.createObjectURL(await r.blob());
+    const a = document.createElement('a');
+    a.href = href;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(href), 10000);
+  } catch {
+    showToast('Export failed — is the dashboard still running?', 'error');
+  } finally {
+    if (btn) btn.disabled = false;
   }
 }
 
@@ -446,7 +531,7 @@ async function loadDiscoverProviders() {
       (p.needs_key
         ? '<div class="row"><span class="k">Setup</span><span class="v">' +
           escHtml(p.env_keys.join(', ')) + ' in .env &middot; ' +
-          '<a href="' + escHtml(p.signup_url) + '" target="_blank" rel="noopener">get a key</a>' +
+          '<a href="' + safeHref(p.signup_url) + '" target="_blank" rel="noopener noreferrer">get a key</a>' +
           '</span></div>'
         : '') +
       (p.caveat ? '<div class="caveat">' + escHtml(p.caveat) + '</div>' : '') +
@@ -582,6 +667,9 @@ function renderDiscoverResult(report, running) {
 // ── Cohort builder: a prospect list is a query ──
 
 let _cohort = { require: new Set(), exclude: new Set() };
+let _cohortOffset = 0;
+let _cohortGeneration = 0;
+const COHORT_PAGE = 50;
 
 function renderCohortBuilder() {
   const el = document.getElementById('cohort-builder');
@@ -620,21 +708,28 @@ function toggleCohort(key, code, on) {
   // A company can't be both required and excluded on the same signal.
   const other = key === 'require' ? 'exclude' : 'require';
   if (on) _cohort[other].delete(code);
+  _cohortOffset = 0;  // a new cohort starts on its first page
   runCohort();
   renderCohortBuilder();
 }
 
 async function runCohort() {
+  const generation = ++_cohortGeneration;
+  const offset = _cohortOffset;
   const el = document.getElementById('cohort-result');
   if (!el) return;
   const require = [..._cohort.require], exclude = [..._cohort.exclude];
   if (!require.length) { el.innerHTML = ''; return; }
+  // Remove the prior export button as soon as its criteria become stale.
+  el.innerHTML = '<p class="muted">Loading cohort…</p>';
 
   const data = await api('/api/cohort', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({require: require, exclude: exclude}),
+    body: JSON.stringify({require: require, exclude: exclude,
+                          offset: offset, limit: COHORT_PAGE}),
   });
+  if (generation !== _cohortGeneration) return;
   if (!data) { el.innerHTML = ''; return; }
 
   let html = '<div style="border-top:1px solid var(--border);margin-top:20px;padding-top:20px">' +
@@ -646,20 +741,67 @@ async function runCohort() {
     html += '<div class="table-card" style="margin-top:16px"><table><thead><tr>' +
       '<th>Company</th><th>Domain</th><th>Industry</th><th>Location</th>' +
       '</tr></thead><tbody>' +
-      data.companies.slice(0, 50).map(c =>
+      data.companies.map(c =>
         '<tr><td>' + escHtml(c.name) + '</td><td class="muted">' + escHtml(c.domain) + '</td>' +
         '<td class="muted">' + escHtml(c.industry) + '</td>' +
         '<td class="muted">' + escHtml(c.location) + '</td></tr>'
       ).join('') + '</tbody></table></div>';
-    if (data.size > 50) {
-      html += '<p class="muted" style="font-size:12px;margin-top:10px">Showing the first 50.</p>';
-    }
+
+    const first = data.offset + 1, last = data.offset + data.companies.length;
+    const hasPrev = data.offset > 0, hasNext = last < data.size;
+    html += '<div style="display:flex;align-items:center;gap:8px;margin-top:10px">' +
+      '<span class="muted" style="font-size:12px">Showing ' + first + '&ndash;' + last +
+        ' of ' + data.size + '</span>' +
+      '<span style="flex:1"></span>' +
+      '<button class="btn btn-secondary btn-sm" onclick="pageCohort(-1)"' +
+        (hasPrev ? '' : ' disabled') + '>Prev</button>' +
+      '<button class="btn btn-secondary btn-sm" onclick="pageCohort(1)"' +
+        (hasNext ? '' : ' disabled') + '>Next</button>' +
+      '<button class="btn btn-secondary btn-sm" onclick="exportCohort(this)">Export CSV</button>' +
+      '</div>';
   } else if (data.size === 0) {
     html += '<p class="muted" style="font-size:13px;margin-top:12px">' +
       'No company carries all of those yet. Either loosen the cohort, or run ' +
       'prospecting to collect more.</p>';
+  } else if (_cohortOffset > 0) {
+    // The cohort shrank under us (a re-profile, a delete): back to page one.
+    _cohortOffset = 0;
+    return runCohort();
   }
   el.innerHTML = html + '</div>';
+}
+
+async function exportCohort(button) {
+  const qs = new URLSearchParams({require: [..._cohort.require].join(','),
+                                  exclude: [..._cohort.exclude].join(',')});
+  button.disabled = true;
+  button.textContent = 'Exporting…';
+  let url;
+  let link;
+  try {
+    const response = await authFetch('/api/cohort.csv?' + qs);
+    if (await lockIfRefused(response)) throw new Error('Dashboard authorization required');
+    if (!response.ok) throw new Error('Export failed (HTTP ' + response.status + ')');
+    url = URL.createObjectURL(await response.blob());
+    link = document.createElement('a');
+    link.href = url;
+    link.download = 'cohort.csv';
+    document.body.appendChild(link);
+    link.click();
+    button.textContent = 'Export CSV';
+  } catch (error) {
+    button.textContent = 'Export failed — retry';
+  } finally {
+    if (link) link.remove();
+    // Give the browser time to start consuming the download before revoking.
+    if (url) setTimeout(() => URL.revokeObjectURL(url), 1000);
+    button.disabled = false;
+  }
+}
+
+function pageCohort(dir) {
+  _cohortOffset = Math.max(0, _cohortOffset + dir * COHORT_PAGE);
+  runCohort();
 }
 
 // ── Settings ──
@@ -795,6 +937,7 @@ async function loadHarveyStatus() {
   const headerDot = document.getElementById('header-dot');
   const headerText = document.getElementById('header-status-text');
 
+  if (_locked) return;  // the header already says "Locked"
   if (!data) {
     headerDot.className = 'status-dot offline';
     headerText.textContent = 'Offline';
@@ -1183,8 +1326,8 @@ async function loadCompanies() {
   let html = '<div class="table-card"><table><thead><tr><th>Company</th><th>Domain</th><th>Industry</th><th>Size</th><th>Location</th><th>Contacts</th><th>Source</th><th>Added</th></tr></thead><tbody>';
   data.forEach((c, i) => {
     const website = c.website || (c.domain ? 'https://' + c.domain : '');
-    const nameLink = website
-      ? '<a href="' + escHtml(website) + '" target="_blank" rel="noopener" onclick="event.stopPropagation()">' + escHtml(c.name) + '</a>'
+    const nameLink = safeHref(website)
+      ? '<a href="' + safeHref(website) + '" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">' + escHtml(c.name) + '</a>'
       : escHtml(c.name);
     html += '<tr style="cursor:pointer" onclick="showCompanyContacts(' + i + ')">' +
       '<td>' + nameLink + '</td><td class="muted">' + escHtml(c.domain) + '</td><td>' + escHtml(c.industry) + '</td>' +
@@ -1213,7 +1356,7 @@ async function showCompanyContacts(index) {
       html += '<tr><td>' + escHtml(p.first_name) + ' ' + escHtml(p.last_name) + '</td>' +
         '<td>' + escHtml(p.title) + '</td><td>' + escHtml(p.email) + emailIcon + '</td>' +
         '<td>' + escHtml(p.phone) + phoneIcon + '</td>' +
-        '<td>' + (p.linkedin_url ? '<a href="' + escHtml(p.linkedin_url) + '" target="_blank" rel="noopener">Profile</a>' : '') + '</td>' +
+        '<td>' + (safeHref(p.linkedin_url) ? '<a href="' + safeHref(p.linkedin_url) + '" target="_blank" rel="noopener noreferrer">Profile</a>' : '') + '</td>' +
         '<td>' + badge(p.status) + '</td><td class="muted">' + escHtml(p.source) + '</td></tr>';
     }
     html += '</tbody></table></div></div>';
@@ -1347,13 +1490,13 @@ loadRuns();
 loadTodayActivity();
 loadHarveyStatus();
 
-// Agent status: quick poll
-setInterval(loadHarveyStatus, 8000);
+// Agent status: quick poll (not while locked: it would only be refused)
+setInterval(() => { if (!_locked) loadHarveyStatus(); }, 8000);
 
 // Nav counts stay live wherever you are, so "something needs me" is visible
 // from any tab without polling that tab's contents.
 setInterval(async () => {
-  if (document.hidden || currentTab === 'today') return;
+  if (document.hidden || _locked || currentTab === 'today') return;
   const data = await api('/api/today');
   if (!data) return;
   navCount('nav-today', (data.items || []).filter(i => i.tone !== 'good').length);
@@ -1364,7 +1507,7 @@ setInterval(async () => {
 // Outbox, settings and help are deliberately excluded — re-rendering the desk
 // under someone mid-decision loses their place, and settings may be mid-edit.
 setInterval(() => {
-  if (document.hidden) return;
+  if (document.hidden || _locked) return;
   switch (currentTab) {
     case 'today': loadToday(); loadRuns(); loadTodayActivity(); break;
     case 'companies': if (!companyDrill) loadCompanies(); break;

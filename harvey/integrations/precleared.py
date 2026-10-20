@@ -27,10 +27,13 @@ reason gives the checkout link from Precleared's answer.
 """
 
 import hashlib
+import ipaddress
 import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from urllib.parse import unquote, urlsplit
 
 import httpx
 
@@ -181,7 +184,7 @@ class PreclearedClient:
                 allowed=False, held=True,
                 reason=self._redact(
                     "Precleared: today's free checks on your key are used and it has "
-                    f"no credits left; add a pack ({_buy_url(resp)}) "
+                    f"no credits left; add a pack ({_buy_url(resp, self.api_key)}) "
                     "or wait until tomorrow"
                 ),
             )
@@ -225,7 +228,7 @@ def _text(value) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
-def _buy_url(resp: httpx.Response) -> str:
+def _buy_url(resp: httpx.Response, api_key: str = "") -> str:
     """The checkout link from a 402 answer's ``buy_url``, or BUY_URL.
 
     Only a plain https link of sane length is used; a missing, malformed or
@@ -236,15 +239,52 @@ def _buy_url(resp: httpx.Response) -> str:
     except ValueError:
         return BUY_URL
     url = data.get("buy_url") if isinstance(data, dict) else None
-    if (
+    if not (
         isinstance(url, str)
-        and url.startswith("https://")
         and len(url) <= MAX_BUY_URL
         and url.isprintable()
         and not any(ch.isspace() for ch in url)
+        and "\\" not in url
     ):
-        return url
-    return BUY_URL
+        return BUY_URL
+    try:
+        parsed = urlsplit(url)
+        host = parsed.hostname
+        port = parsed.port  # Access validates numeric syntax and range.
+        if (parsed.scheme != "https" or not host or parsed.username is not None
+                or parsed.password is not None or "%" in parsed.netloc
+                or parsed.netloc.endswith(":") or port == 0):
+            return BUY_URL
+        if ":" in host:
+            ipaddress.IPv6Address(host)
+            # urlsplit accepts suffixes after the closing bracket; a browser
+            # need not interpret that malformed authority the same way.
+            if not re.fullmatch(r"\[[0-9a-fA-F:.]+\](?::[0-9]+)?", parsed.netloc):
+                return BUY_URL
+        else:
+            ascii_host = host.encode("idna").decode("ascii").rstrip(".")
+            if len(ascii_host) > 253 or not all(
+                re.fullmatch(r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?", label)
+                for label in ascii_host.split(".")
+            ):
+                return BUY_URL
+    except (ValueError, UnicodeError):
+        return BUY_URL
+
+    if api_key:
+        # Inspect decoded copies, but keep a usable checkout/session URL intact.
+        # Reject excessive nesting instead of logging a credential we could not
+        # finish checking. unquote handles upper/lower-case percent escapes.
+        decoded = url
+        for _ in range(8):
+            if api_key in decoded:
+                return BUY_URL
+            next_decoded = unquote(decoded)
+            if next_decoded == decoded:
+                return url
+            decoded = next_decoded
+        return BUY_URL
+    return url
 
 
 def _reason(data: dict) -> str:

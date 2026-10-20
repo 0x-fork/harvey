@@ -24,6 +24,7 @@ import asyncio
 import base64
 import logging
 import re
+from html import unescape
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
@@ -69,6 +70,9 @@ JUNK_DOMAIN_PATTERNS = tuple(re.compile(p, re.I) for p in (
 JUNK_NAME_PATTERNS = tuple(re.compile(p, re.I) for p in (
     r"^\s*(top|best|\d+)\s+\d*\s*(best\s+)?\w+.*\b(in|near|of)\b",
     r"\b(directory|listings?|reviews? of|compare|find a)\b",
+    # "Ohio HOA Management Company List", "List of Plumbers in Austin"
+    r"\b(compan(y|ies)|firms?|contractors?|businesses|providers?)\s+list\b",
+    r"\blist of\b",
 ))
 
 
@@ -85,6 +89,130 @@ def normalize_domain(url_or_domain: str) -> str:
         raw = "http://" + raw
     host = (urlparse(raw).hostname or "").strip(".")
     return host[4:] if host.startswith("www.") else host
+
+
+# ── Business names ────────────────────────────────────────────────────
+# SERP providers return a page TITLE, not a business name: "Denver, CO | HOA
+# Management Firm", "Home Page - NVCM | Community Association Management".
+# Stored as-is it lands in an email as "...at Denver, CO | HOA Management
+# Firm". The business is the title segment that shares a DISTINCTIVE word with
+# the domain — "management" matches managementharbor.com but says nothing.
+
+_TITLE_SEPARATORS = re.compile(r"\s+[|\-–—·•]\s+|\s*[|•·]\s*|:\s+")
+_GENERIC_NAME_WORDS = frozenset("""
+home page welcome official site website hoa hoas management manager managers
+mgmt mgt company companies co inc llc ltd corp firm group services service
+property properties community communities association associations condo
+condominium residential homeowners owners real estate the and of in for best
+top leading trusted local full arizona phoenix az texas tx florida fl
+california ca nevada nv colorado co georgia ga carolina nc usa us america
+roofing roof roofers roofer plumbing plumber plumbers contact about
+""".split())
+
+
+def _words(text: str) -> list[str]:
+    return [w for w in re.findall(r"[a-z0-9]+", text.lower()) if w]
+
+
+def _domain_stem(domain: str) -> str:
+    host = normalize_domain(domain)
+    return re.sub(r"[^a-z0-9]", "", host.rsplit(".", 1)[0]) if host else ""
+
+
+def _segment_matches_domain(segment: str, stem: str) -> bool:
+    # Navigation and service/location labels can share an incidental word
+    # with a domain without identifying the business.
+    if re.fullmatch(r"(?i)(contact(?: us)?|about(?: us)?|home(?: page)?)", segment.strip()):
+        return False
+    if re.search(r"(?i)\bservices?\s+(?:in|near)\s+\S", segment):
+        return False
+    words = _words(segment)
+    distinctive = [w for w in words if w not in _GENERIC_NAME_WORDS]
+    if any(len(w) >= 3 and w in stem for w in distinctive):
+        return True
+    # "Northvale Association of Community Managers" ↔ nacm.org
+    initials = "".join(w[0] for w in words if w not in ("of", "the", "and", "&"))
+    return len(initials) >= 3 and stem.startswith(initials)
+
+
+def _segment_domain_evidence(segment: str, stem: str) -> int:
+    """Amount of distinctive domain evidence, shared by SERP and homepage names."""
+    if not _segment_matches_domain(segment, stem):
+        return 0
+    return sum(len(w) for w in set(_words(segment))
+               if w not in _GENERIC_NAME_WORDS and len(w) >= 3 and w in stem)
+
+
+_SPLIT_WORDS = sorted((w for w in _GENERIC_NAME_WORDS | {"with", "your"}
+                       if len(w) >= 4), key=len, reverse=True)
+
+
+def _split_stem(stem: str) -> list[str]:
+    """managementharbor → [management, harbor]; kqresidential → [kq, residential]."""
+    parts, buf, i = [], "", 0
+    while i < len(stem):
+        word = next((w for w in _SPLIT_WORDS if stem.startswith(w, i)), "")
+        if word:
+            if buf:
+                parts.append(buf)
+                buf = ""
+            parts.append(word)
+            i += len(word)
+        else:
+            buf += stem[i]
+            i += 1
+    if buf:
+        parts.append(buf)
+    return parts
+
+
+def name_from_domain(domain: str) -> str:
+    stem = normalize_domain(domain).rsplit(".", 1)[0]
+    words = [w for chunk in re.split(r"[-_.]+", stem) if chunk for w in _split_stem(chunk)]
+    # Short vowel-less leftovers are initials: "kq" → "KQ".
+    return " ".join(w.upper() if len(w) <= 3 and not re.search(r"[aeiouy]", w)
+                    else w.capitalize() for w in words)
+
+
+def name_matches_domain(name: str, domain: str) -> bool:
+    """True when the stored name demonstrably belongs to this domain."""
+    stem = _domain_stem(domain)
+    return bool(stem and name and _segment_matches_domain(name, stem))
+
+
+def site_name_from_html(html: str, domain: str) -> str:
+    """The business name a homepage gives itself (og:site_name, then <title>),
+    or "" when neither names it in a way the domain backs up."""
+    stem = _domain_stem(domain)
+    candidates = []
+    for pat in (r'<meta[^>]+property=["\']og:site_name["\'][^>]*content=["\']([^"\']+)',
+                r'<meta[^>]+content=["\']([^"\']+)["\'][^>]*property=["\']og:site_name',
+                r"(?is)<title[^>]*>(.*?)</title>"):
+        m = re.search(pat, html or "", re.I)
+        if m:
+            candidates.append(unescape(re.sub(r"\s+", " ", m.group(1))).strip())
+    # Distinctive brand evidence wins; equally backed names prefer the fullest
+    # form: "The Management Harbor" over og's "Management Harbor".
+    matches = [seg for text in candidates
+               for seg in (x.strip(" ,.-") for x in _TITLE_SEPARATORS.split(text))
+               if seg and len(seg) <= 60 and _segment_matches_domain(seg, stem)]
+    return max(matches, key=lambda seg: (_segment_domain_evidence(seg, stem), len(seg)),
+               default="")
+
+
+def business_name(title: str, domain: str) -> str:
+    """The business's name from a SERP title, or one derived from its domain."""
+    stem = _domain_stem(domain)
+    title = re.sub(r"\s*(\.\.\.|…)\s*$", "", (title or "").strip())
+    if stem and title:
+        segments = [segment.strip(" ,.-") for segment in _TITLE_SEPARATORS.split(title)]
+        matches = [seg for seg in segments
+                   if seg and len(seg) <= 60 and _segment_matches_domain(seg, stem)]
+        # Prefer the segment with the most distinctive domain evidence rather
+        # than the first incidental substring. Stable ties preserve title order.
+        if matches:
+            return max(matches, key=lambda seg: _segment_domain_evidence(seg, stem))
+    return name_from_domain(domain) if stem else title
 
 
 def is_junk(domain: str, name: str = "") -> bool:
@@ -193,6 +321,7 @@ class Business:
     external_id: str = ""            # "<provider>:<stable id>"
     source_url: str = ""
     provider: str = ""
+    raw_title: str = ""             # SERP evidence for junk filtering before normalization
 
     def identity(self) -> str:
         return self.domain or self.external_id
@@ -387,7 +516,8 @@ class DataForSEOSerp(DiscoveryProvider):
             if not domain:
                 continue
             out.append(Business(
-                name=item.get("title") or domain,
+                name=business_name(item.get("title") or "", domain),
+                raw_title=item.get("title") or "",
                 domain=domain,
                 website=item.get("url") or "",
                 location=query.location,
@@ -438,7 +568,8 @@ class Serper(DiscoveryProvider):
             if not domain:
                 continue
             out.append(Business(
-                name=item.get("title") or domain,
+                name=business_name(item.get("title") or "", domain),
+                raw_title=item.get("title") or "",
                 domain=domain,
                 website=item.get("link") or "",
                 location=query.location,
@@ -774,7 +905,7 @@ async def run_discovery(
                 report.found += len(found)
                 batch = []
                 for biz in found:
-                    if is_junk(biz.domain, biz.name):
+                    if is_junk(biz.domain, biz.raw_title or biz.name):
                         report.junk += 1
                         continue
                     ident = biz.identity()
@@ -876,3 +1007,4 @@ def provider_menu(env: dict | None = None) -> list[dict]:
         }
         for p in PROVIDERS.values()
     ]
+
