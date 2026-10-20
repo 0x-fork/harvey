@@ -1193,6 +1193,10 @@ async function loadOutbox() {
 
   const pending = data.pending || [];
   _desk.items = pending;
+  if (_desk.editing && !pending.some(p => p.id === _desk.editing)) {
+    _desk.editing = null;
+    _desk.unsaved = null;
+  }
   if (_desk.i >= pending.length) _desk.i = Math.max(0, pending.length - 1);
   navCount('nav-outbox', pending.length);
 
@@ -1275,11 +1279,12 @@ function renderDeskContext(ctx) {
     row('Website', site) +
     row('About', escHtml(ctx.description)) +
     row('Contact', who) +
-    row('Found via', escHtml(CONTACT_SOURCES[ctx.contact_source] || ctx.contact_source)) +
+    row('Found via', escHtml(Object.prototype.hasOwnProperty.call(CONTACT_SOURCES, ctx.contact_source)
+      ? CONTACT_SOURCES[ctx.contact_source] : ctx.contact_source)) +
     row('Email', email) +
     row('Signals', signals) +
-    row('Campaign', escHtml(ctx.campaign) +
-      (ctx.found_by ? ' <span class="muted">(how they were found, not a fact about them)</span>' : '')) +
+    row('Campaign', ctx.campaign ? escHtml(ctx.campaign) +
+      ' <span class="muted">(how they were found, not a fact about them)</span>' : '') +
     row('Writer notes', escHtml(ctx.notes)) +
   '</div>';
 }
@@ -1293,9 +1298,15 @@ function renderDesk(items, i) {
     '</div>').join('');
 
   const editing = _desk.editing === cur.id;
+  const unsaved = (editing && _desk.unsaved) || {subject: cur.subject || '', body: cur.body || ''};
+  // A reply keeps its subject: Gmail threads by it.
+  const fixedSubject = cur.kind === 'reply'
+    ? ' readonly title="A reply keeps its subject so it stays in the thread"' : '';
   const draft = editing
-    ? '<input id="desk-subject" class="desk-edit-subject" value="' + escHtml(cur.subject || '') + '">' +
-      '<textarea id="desk-body" class="desk-edit-body" rows="14">' + escHtml(cur.body) + '</textarea>'
+    ? '<input id="desk-subject" class="desk-edit-subject" value="' + escHtml(unsaved.subject) + '"' +
+        fixedSubject + ' oninput="deskKeep()">' +
+      '<textarea id="desk-body" class="desk-edit-body" rows="14" oninput="deskKeep()">' +
+        escHtml(unsaved.body) + '</textarea>'
     : '<div class="subject">' + escHtml(cur.subject || '(no subject)') + '</div>' +
       '<div class="body">' + escHtml(cur.body) + '</div>';
   const actions = editing
@@ -1325,8 +1336,25 @@ function renderDesk(items, i) {
 
 function deskEdit(id) {
   _desk.editing = id;
+  _desk.unsaved = null;
   document.getElementById('outbox-desk').innerHTML = renderDesk(_desk.items, _desk.i);
   if (id) document.getElementById('desk-body').focus();
+}
+
+// What's typed survives a re-render (switching tabs and back reloads the desk).
+function deskKeep() {
+  _desk.unsaved = {
+    subject: document.getElementById('desk-subject').value,
+    body: document.getElementById('desk-body').value,
+  };
+}
+
+// While a draft is being edited, nothing else on the desk may act on the
+// stored version of it: Save or Cancel first.
+function deskBusy() {
+  if (!_desk.editing) return false;
+  showToast('Save or cancel your edit first.', 'error');
+  return true;
 }
 
 async function deskSave(id) {
@@ -1344,6 +1372,7 @@ async function deskSave(id) {
   } catch {}
   if (data && data.success) {
     _desk.editing = null;
+    _desk.unsaved = null;
     showToast('Saved. Still waiting for your approval.', 'success');
     loadOutbox();
   } else {
@@ -1352,15 +1381,22 @@ async function deskSave(id) {
 }
 
 function deskGo(n) {
-  if (n < 0 || n >= _desk.items.length) return;
+  if (n < 0 || n >= _desk.items.length || deskBusy()) return;
   _desk.i = n;
-  _desk.editing = null;  // moving to another draft drops unsaved edits
   document.getElementById('outbox-desk').innerHTML = renderDesk(_desk.items, n);
 }
 
 // Keyboard review. Ignored while typing into a field, so Settings still works.
 document.addEventListener('keydown', e => {
   if (currentTab !== 'outbox' || e.metaKey || e.ctrlKey || e.altKey) return;
+  // Mid-edit, A would approve the stored draft, not what's typed. Only
+  // Escape (cancel) works until the edit is saved or cancelled.
+  if (_desk.editing) {
+    const typing = /^(input|textarea)$/i.test(e.target.tagName || '');
+    if (e.key === 'Escape') { e.preventDefault(); deskEdit(null); }
+    else if (!typing && 'jkare'.includes(e.key.toLowerCase())) { e.preventDefault(); deskBusy(); }
+    return;
+  }
   const tag = (e.target.tagName || '').toLowerCase();
   if (tag === 'input' || tag === 'textarea' || e.target.isContentEditable) return;
   const cur = _desk.items[_desk.i];
@@ -1373,6 +1409,7 @@ document.addEventListener('keydown', e => {
 });
 
 async function outboxAct(id, action) {
+  if (deskBusy()) return;
   const data = await api('/api/outbox/' + encodeURIComponent(id) + '/' + action, {method: 'POST'});
   if (data && data.success) showToast(action === 'approve' ? 'Approved — will send on schedule.' : 'Rejected.', 'success');
   else showToast('Action failed.', 'error');
@@ -1380,6 +1417,7 @@ async function outboxAct(id, action) {
 }
 
 async function outboxApproveAll() {
+  if (deskBusy()) return;
   const data = await api('/api/outbox/approve-all', {method: 'POST'});
   if (data && data.success) showToast('Approved ' + data.approved + ' email(s).', 'success');
   else showToast('Approve-all failed.', 'error');
