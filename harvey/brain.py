@@ -87,6 +87,10 @@ class Brain:
         self.provider = self.config.provider
         self.model = self.config.model
         self.codex = None
+        # Whether the last think_json got no reply at all (an outage, logout,
+        # rate limit or timeout), as opposed to a reply that wasn't valid
+        # JSON. Callers that count model failures must not count outages.
+        self.last_reply_empty = False
         # Codex health (unused for Claude, whose behaviour is unchanged).
         self.unavailable = ""
         self._unavailable_at = 0.0
@@ -369,6 +373,15 @@ class Brain:
                 except Exception as e:
                     logger.warning(f"Failed to record usage event: {e}")
 
+                if payload and payload.get("is_error"):
+                    # The CLI reported an API error (overloaded, rate limited)
+                    # inside a successful exit. That text is not the model's
+                    # answer, so no caller may use it as one: retry like any
+                    # other transient failure.
+                    logger.error(f"Claude reported an error: {response[:300]}")
+                    last_error = response
+                    continue
+
                 logger.debug(f"Brain response: {response[:200]}...")
                 return response
 
@@ -573,6 +586,7 @@ class Brain:
         response = await self.think(
             full_prompt, session_id=session_id, agent=agent, task=task
         )
+        self.last_reply_empty = not response
         if not response:
             return None
         parsed = self._extract_json(response)

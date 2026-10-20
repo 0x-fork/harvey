@@ -1410,6 +1410,22 @@ class StateManager:
                 row = await cursor.fetchone()
                 return row[0] if row else default
 
+    async def retry_write_failed(self) -> int:
+        """Give every 'write_failed' prospect another try. Returns how many."""
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE prospects SET status = 'new', updated_at = ? "
+                "WHERE status = 'write_failed'",
+                (_utcnow().isoformat(),),
+            )
+            await db.commit()
+            return cursor.rowcount
+
+    async def delete_setting(self, key: str):
+        async with self._connect() as db:
+            await db.execute("DELETE FROM settings WHERE key = ?", (key,))
+            await db.commit()
+
     async def set_setting(self, key: str, value: str):
         async with self._connect() as db:
             await db.execute(

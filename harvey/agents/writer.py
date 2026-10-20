@@ -23,6 +23,12 @@ from harvey.state import WRITABLE_EMAIL_STATUSES, StateManager
 
 logger = logging.getLogger("harvey.writer")
 
+# How many times the model may fail to write a usable sequence for a
+# prospect before Harvey stops trying (status 'write_failed'). A provider
+# outage never counts; only a reply that came back unusable does.
+MAX_WRITE_ATTEMPTS = 3
+WRITE_ATTEMPTS_KEY = "write_attempts:"
+
 # Merge variables that name a person; a company inbox has none of them.
 PERSON_VAR = re.compile(r"\{\{\s*(first_?name|last_?name|title)\s*\}\}", re.IGNORECASE)
 
@@ -88,9 +94,19 @@ class Writer:
             )
 
             # Generate the email sequence
+            self._no_reply = False
             sequence = await self._write_sequence(prospects)
             if not sequence:
+                paused = getattr(self.brain, "paused_reason", "") or (
+                    "no reply from the model" if self._no_reply else "")
+                if paused:
+                    # The provider failed (outage, logout, rate limit,
+                    # timeout), not the draft: no attempt is counted, and the
+                    # other batches would fail the same way.
+                    logger.warning(f"Writer: {paused}; leaving '{batch_name}' for later.")
+                    return
                 logger.warning(f"Writer: Failed to generate sequence for {batch_name}")
+                await self._count_failed_attempt(batch_name, prospects)
                 continue
 
             # Create the campaign
@@ -107,6 +123,7 @@ class Writer:
             # Mark prospects so they aren't picked up again
             for p in prospects:
                 await self.state.update_prospect_status(p.id, "queued")
+                await self.state.delete_setting(WRITE_ATTEMPTS_KEY + p.id)
 
             # Native providers: replace the shared template for email 1 with
             # a per-prospect draft grounded in that company's actual facts.
@@ -126,6 +143,38 @@ class Writer:
             logger.info(
                 f"Writer: Campaign '{batch_name}' created with "
                 f"{len(sequence)} emails for {len(prospects)} prospects."
+            )
+
+    async def _count_failed_attempt(self, batch_name: str, prospects: list):
+        """Count one unusable sequence against each prospect in the batch.
+
+        A prospect left 'new' makes the heartbeat choose write_campaign every
+        cycle, so after MAX_WRITE_ATTEMPTS it moves to 'write_failed': visible
+        in status and the dashboard, and out of the way of prospecting.
+        """
+        given_up = []
+        for p in prospects:
+            key = WRITE_ATTEMPTS_KEY + p.id
+            try:
+                attempts = int(await self.state.get_setting(key) or 0) + 1
+            except ValueError:
+                attempts = 1
+            if attempts >= MAX_WRITE_ATTEMPTS:
+                await self.state.update_prospect_status(p.id, "write_failed")
+                await self.state.delete_setting(key)
+                given_up.append(p.email)
+            else:
+                await self.state.set_setting(key, str(attempts))
+        if given_up:
+            await self.state.log_action(
+                action_type="write_failed",
+                agent="writer",
+                details={"campaign_name": batch_name, "prospects": given_up,
+                         "attempts": MAX_WRITE_ATTEMPTS},
+            )
+            logger.warning(
+                f"Writer: Gave up on {len(given_up)} prospect(s) in '{batch_name}' after "
+                f"{MAX_WRITE_ATTEMPTS} unusable drafts; marked write_failed."
             )
 
     async def _personalize_first_emails(self, campaign_id: str, prospects: list):
@@ -334,6 +383,8 @@ Return ONLY a JSON array (no markdown fences, no commentary):
             prompt, session_id="harvey-writer",
             agent="writer", task="write_sequence",
         )
+        # Read right after the call, before anything else can use the brain.
+        self._no_reply = result is None and bool(getattr(self.brain, "last_reply_empty", False))
         steps = self._parse_sequence(result)
         if inbox_batch and any(
             PERSON_VAR.search(s.subject + s.body) for s in steps

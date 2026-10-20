@@ -67,6 +67,7 @@ const STATUS = {
   meeting:        ['Meeting booked', 'note'],
   not_interested: ['Not interested', 'bad'],
   bounced:        ['Bounced', 'bad'],
+  write_failed:   ["Couldn't write", 'bad'],
   // campaigns
   draft:          ['Draft', 'waiting'],
   active:         ['Active', 'good'],
