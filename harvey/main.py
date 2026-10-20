@@ -75,10 +75,12 @@ def seconds_until_quiet_hours_end(config: HarveyConfig) -> int:
     return max(int(delta.total_seconds()), 60)
 
 
-# Stop prospecting once this many 'new' prospects are waiting. Past it, more
-# leads only add to a backlog the Writer can't work through, or (when none
-# has a usable email) spend search and verifier credits on people Harvey
-# can never email.
+# When nothing is writable, prospecting pauses for the rest of the day once
+# this many unusable prospects (a guessed, invalid or missing email) were
+# found in the last 24 hours. Without a working verifier every address is a
+# guess, and prospecting every cycle would spend search and verifier credits
+# on people Harvey can never email. Nothing re-checks a guess, so the window
+# is a day, never all time: an all-time count would stop Scout for good.
 PROSPECT_BACKLOG = 20
 
 
@@ -92,16 +94,17 @@ def _new_counts(summary: dict) -> tuple[int, int]:
 
 
 def unusable_backlog_notice(summary: dict) -> str:
-    """Why Harvey is idling on a full backlog of unusable prospects, or ""."""
-    new, writable = _new_counts(summary)
-    if writable or new < PROSPECT_BACKLOG:
+    """Why Harvey paused prospecting for the day, or ""."""
+    _, writable = _new_counts(summary)
+    recent = summary.get("recent_unusable_prospects", 0) or 0
+    if writable or recent < PROSPECT_BACKLOG:
         return ""
     return (
-        f"{new} new prospects are waiting, but none has a verified or catch-all "
-        "email, so Harvey has stopped prospecting to save search and verifier "
-        "credits. Add an email verifier key (REOON_API_KEY, ZEROBOUNCE_API_KEY or "
-        "HUNTER_API_KEY in .env) or check it still has credits, or export the list "
-        "with `harvey export --all`."
+        f"Harvey found {recent} prospects in the last day, but none has a verified "
+        "or catch-all email, so it paused prospecting until tomorrow to save search "
+        "and verifier credits. Add an email verifier key (REOON_API_KEY, "
+        "ZEROBOUNCE_API_KEY or HUNTER_API_KEY in .env) or check it still has credits. "
+        "`harvey export --all` exports the list as it is."
     )
 
 
@@ -137,13 +140,11 @@ async def decide_next_action(
         action, reason = "send_campaign", f"{draft_campaigns} draft campaign(s) ready to deploy"
     elif writable > 0:
         action, reason = "write_campaign", f"{writable} new prospect(s) with no drafts ready"
-    elif new_prospects < PROSPECT_BACKLOG:
-        action, reason = "prospect", f"only {new_prospects} new prospect(s); pipeline needs leads"
+    elif unusable_backlog_notice(summary):
+        action, reason = "idle", "a day's worth of prospects with no usable email"
+        logger.warning(unusable_backlog_notice(summary))
     else:
-        action, reason = "idle", "backlog full; running analysis"
-        notice = unusable_backlog_notice(summary)
-        if notice:
-            logger.warning(notice)
+        action, reason = "prospect", f"{new_prospects} new prospect(s), none ready to write for"
 
     logger.info(f"Decision: {action} ({reason})")
     return action

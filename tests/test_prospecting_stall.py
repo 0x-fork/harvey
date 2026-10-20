@@ -53,18 +53,55 @@ async def test_guessed_emails_alone_lead_back_to_prospecting(state):
     assert await decide_next_action(None, state, CONFIG, summary=summary) == "prospect"
 
 
+async def age_all(state, days):
+    """Pretend every prospect was found ``days`` ago."""
+    import aiosqlite
+    from datetime import datetime, timedelta, timezone
+    then = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)).isoformat()
+    async with aiosqlite.connect(state.db_path) as db:
+        await db.execute("UPDATE prospects SET created_at = ?", (then,))
+        await db.commit()
+
+
 @pytest.mark.asyncio
-async def test_a_backlog_of_unusable_prospects_stops_spending_and_says_why(state):
+async def test_a_day_of_unusable_prospects_pauses_spending_and_says_why(state):
     # With no usable email at all (say, no verifier key), prospecting every
     # cycle would burn search and verifier credits on people Harvey can
-    # never email. At the backlog cap it idles, and status explains why.
+    # never email. A day's worth pauses it, and status explains why.
     from harvey.main import PROSPECT_BACKLOG, unusable_backlog_notice
     for n in range(PROSPECT_BACKLOG):
         await add(state, n, f"p{n}@co{n}.test", "guess")
     summary = await state.get_state_summary()
     assert await decide_next_action(None, state, CONFIG, summary=summary) == "idle"
     notice = unusable_backlog_notice(summary)
-    assert str(PROSPECT_BACKLOG) in notice and "verifier" in notice
+    assert str(PROSPECT_BACKLOG) in notice and "verifier" in notice and "tomorrow" in notice
+
+
+@pytest.mark.asyncio
+async def test_the_pause_never_becomes_permanent(state):
+    # Nothing re-checks a guessed address, so an all-time count would stop
+    # Scout for good. Once the guesses are a day old, prospecting resumes.
+    from harvey.main import PROSPECT_BACKLOG, unusable_backlog_notice
+    for n in range(PROSPECT_BACKLOG + 10):
+        await add(state, n, f"p{n}@co{n}.test", "guess")
+    await age_all(state, days=2)
+    summary = await state.get_state_summary()
+    assert await decide_next_action(None, state, CONFIG, summary=summary) == "prospect"
+    assert unusable_backlog_notice(summary) == ""
+
+
+@pytest.mark.asyncio
+async def test_old_guesses_do_not_stop_a_mixed_setup_returning_to_prospecting(state):
+    for n in range(25):
+        await add(state, n, f"p{n}@co{n}.test", "guess")
+    await age_all(state, days=3)
+    await add(state, 100, "v@verified.test", "verified")
+    summary = await state.get_state_summary()
+    assert await decide_next_action(None, state, CONFIG, summary=summary) == "write_campaign"
+    [verified] = [p for p in await state.get_prospects_by_status("new") if p.email_status == "verified"]
+    await state.update_prospect_status(verified.id, "queued")  # what the Writer does
+    summary = await state.get_state_summary()
+    assert await decide_next_action(None, state, CONFIG, summary=summary) == "prospect"
 
 
 @pytest.mark.asyncio

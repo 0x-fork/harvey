@@ -12,7 +12,7 @@ upgrade cleanly in place.
 import json
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 
 import aiosqlite
@@ -1472,6 +1472,21 @@ class StateManager:
             ) as cursor:
                 return (await cursor.fetchone())[0]
 
+    async def count_recent_unusable_prospects(self, hours: int = 24) -> int:
+        """New prospects found in the last ``hours`` that the Writer can't use."""
+        since = (_utcnow() - timedelta(hours=hours)).isoformat()
+        marks = ",".join("?" for _ in WRITABLE_EMAIL_STATUSES)
+        async with self._connect() as db:
+            async with db.execute(
+                f"""SELECT COUNT(*) FROM prospects
+                    WHERE status = 'new'
+                      AND NOT (COALESCE(email, '') != ''
+                               AND COALESCE(email_status, '') IN ({marks}))
+                      AND datetime(created_at) >= datetime(?)""",
+                (*WRITABLE_EMAIL_STATUSES, since),
+            ) as cursor:
+                return (await cursor.fetchone())[0]
+
     async def count_prospects_by_status(self) -> dict[str, int]:
         async with self._connect() as db:
             async with db.execute(
@@ -1900,6 +1915,9 @@ class StateManager:
             # address stays 'new' forever, so deciding from the raw count
             # would keep choosing write_campaign with nothing to write.
             "writable_prospects": await self.count_writable_prospects(),
+            # Unusable ones found in the last day: the heartbeat pauses
+            # prospecting for the day when these alone fill the backlog.
+            "recent_unusable_prospects": await self.count_recent_unusable_prospects(),
             "draft_campaigns": draft_campaigns,
             "active_campaigns": active_campaigns,
             "open_conversations": open_conversations,
