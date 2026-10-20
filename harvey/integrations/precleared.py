@@ -39,6 +39,8 @@ from urllib.parse import unquote, urlsplit
 
 import httpx
 
+from harvey.config import normalize_prospect_country
+
 logger = logging.getLogger("harvey.precleared")
 
 API_URL = "https://precleared.dev/api/v1/check"
@@ -90,7 +92,7 @@ class PreclearedClient:
         self.api_key = api_key or ""
         self.address_source = address_source
         self.pitch = (pitch or "").strip()[:200]
-        self.prospect_country = (prospect_country or "").strip().upper()
+        self.prospect_country = normalize_prospect_country(prospect_country)
         self._transport = transport  # tests inject httpx.MockTransport
 
     @classmethod

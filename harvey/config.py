@@ -109,6 +109,27 @@ class ChannelsConfig(BaseModel):
 PRECLEARED_ADDRESS_SOURCES = ("published", "bought", "scraped", "given", "unknown")
 
 
+def normalize_prospect_country(v) -> str:
+    """A two-letter country code ("us" -> "US", "UK" -> "GB"), or "" for none.
+
+    Raises ValueError on anything else, including the booleans YAML makes of
+    an unquoted NO (Norway) or ON, so a typo is never silently ignored.
+    """
+    if isinstance(v, bool):
+        raise ValueError(
+            f"prospect_country was read as {v}. YAML turns an unquoted NO or "
+            'ON into true/false, so quote the code, e.g. prospect_country: "NO".'
+        )
+    v = str(v or "").strip().upper()
+    v = {"UK": "GB", "USA": "US"}.get(v, v)
+    if v and not (len(v) == 2 and v.isascii() and v.isalpha()):
+        raise ValueError(
+            f"'{v}' is not a valid prospect_country. Use a two-letter "
+            "country code such as US or GB, or leave it empty."
+        )
+    return v
+
+
 class PreclearedConfig(BaseModel):
     """Optional per-recipient cold-email check through Precleared.
 
@@ -151,14 +172,7 @@ class PreclearedConfig(BaseModel):
     @field_validator("prospect_country", mode="before")
     @classmethod
     def _valid_prospect_country(cls, v) -> str:
-        v = str(v or "").strip().upper()
-        v = {"UK": "GB", "USA": "US"}.get(v, v)
-        if v and not (len(v) == 2 and v.isascii() and v.isalpha()):
-            raise ValueError(
-                f"'{v}' is not a valid prospect_country. Use a two-letter "
-                "country code such as US or GB, or leave it empty."
-            )
-        return v
+        return normalize_prospect_country(v)
 
     @model_validator(mode="after")
     def _country_when_enabled(self):

@@ -150,6 +150,20 @@ def test_prospect_country_is_optional_and_normalised():
         PreclearedConfig(enabled=True, sender_country="US", prospect_country="United States")
 
 
+@pytest.mark.parametrize("yaml_value", [False, True])
+def test_unquoted_yaml_country_is_an_error_not_ignored(yaml_value):
+    # YAML reads an unquoted NO (Norway) as False and ON as True.
+    with pytest.raises(ValidationError, match="quote"):
+        PreclearedConfig(enabled=True, sender_country="US", prospect_country=yaml_value)
+
+
+def test_client_normalises_prospect_country_like_the_config():
+    assert PreclearedClient("US", prospect_country="uk").prospect_country == "GB"
+    assert PreclearedClient("US", prospect_country="usa").prospect_country == "US"
+    with pytest.raises(ValueError):
+        PreclearedClient("US", prospect_country="garbage!!")
+
+
 def test_from_config_reads_prospect_country():
     config = SimpleNamespace(
         compliance=SimpleNamespace(precleared=PreclearedConfig(
