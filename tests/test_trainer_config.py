@@ -95,12 +95,11 @@ def test_retraining_keeps_every_setting_training_does_not_learn(tmp_path):
     assert out["product"]["offer"] == TUNED["product"]["offer"]
     assert out["icp"]["hiring_signals"] == ["SDR"]
     assert out["icp"]["geo_coordinates"] == {"London": "51.5,-0.12,50"}
-    # The sender identity is the user's, not a training placeholder.
-    for key in ("name", "role", "email", "linkedin"):
+    # The sender identity and voice are the user's, not training guesses.
+    for key in ("name", "role", "email", "linkedin", "tone"):
         assert out["persona"][key] == TUNED["persona"][key]
     # What training learns is replaced.
     assert out["persona"]["company"] == "Acme Roofing"
-    assert out["persona"]["tone"] == "warm, direct"
     for key in ("name", "description", "pricing", "key_benefits", "objection_responses"):
         assert out["product"][key] == LEARNED["product"][key]
     for key in ("industries", "company_size", "titles", "geography"):
@@ -124,7 +123,7 @@ def test_first_training_keeps_the_template_settings(tmp_path):
     shipped = (PROJECT_ROOT / "harvey.yaml").read_text()
     template.write_text(shipped)
     path = tmp_path / "harvey.local.yaml"
-    out = write_trained_config(LEARNED, path, base_path=template)
+    out = write_trained_config(LEARNED, path)
 
     assert out["channels"]["email"]["provider"] == "gmail"
     assert out["compliance"]["precleared"]["enabled"] is False
@@ -145,4 +144,43 @@ def test_unreadable_config_is_backed_up_not_lost(tmp_path):
     path.write_text("channels: [unclosed\n")
     out = write_trained_config(LEARNED, path)
     assert out == LEARNED
-    assert (tmp_path / "harvey.local.yaml.bak").read_text() == "channels: [unclosed\n"
+    backups = list(tmp_path.glob("harvey.local.yaml*.bak"))
+    assert [b.read_text() for b in backups] == ["channels: [unclosed\n"]
+
+
+def test_an_earlier_backup_is_never_overwritten(tmp_path):
+    path = tmp_path / "harvey.local.yaml"
+    (tmp_path / "harvey.local.yaml.bak").write_text("precious")
+    path.write_text("channels: [unclosed\n")
+    write_trained_config(LEARNED, path)
+    assert (tmp_path / "harvey.local.yaml.bak").read_text() == "precious"
+    assert sorted(b.read_text() for b in tmp_path.glob("harvey.local.yaml*.bak")) == [
+        "channels: [unclosed\n", "precious",
+    ]
+
+
+def test_an_empty_config_needs_no_backup(tmp_path):
+    path = tmp_path / "harvey.local.yaml"
+    path.write_text("\n")
+    assert write_trained_config(LEARNED, path) == LEARNED
+    assert list(tmp_path.glob("*.bak")) == []
+
+
+def test_first_training_ignores_configs_outside_harveys_folder(tmp_path, monkeypatch):
+    # Running `harvey train` from another project's folder must not copy that
+    # project's provider or sender identity into Harvey.
+    elsewhere = tmp_path / "other-project"
+    elsewhere.mkdir()
+    write(elsewhere / "harvey.local.yaml", TUNED)
+    monkeypatch.chdir(elsewhere)
+    home = tmp_path / "harvey"
+    home.mkdir()
+    assert write_trained_config(LEARNED, home / "harvey.local.yaml") == LEARNED
+
+
+def test_a_real_sender_with_a_blank_company_is_kept(tmp_path):
+    path = tmp_path / "harvey.local.yaml"
+    write(path, {**TUNED, "persona": {**TUNED["persona"], "company": ""}})
+    out = write_trained_config(LEARNED, path)
+    assert out["persona"]["email"] == "ethan@oldco.com"
+    assert out["persona"]["company"] == "Acme Roofing"

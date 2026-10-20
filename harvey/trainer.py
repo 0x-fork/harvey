@@ -18,7 +18,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 from harvey.brain import Brain
-from harvey.config import BrainConfig, ConfigError, _find_config_file, load_brain_config
+from harvey.config import BrainConfig, load_brain_config
 from harvey.state import StateManager
 
 logger = logging.getLogger("harvey.trainer")
@@ -323,15 +323,24 @@ def brain_section(brain_config: BrainConfig) -> dict:
 
 # What training learns from a website. Retraining replaces exactly these and
 # keeps everything else in the existing config (email provider, quiet hours,
-# send limits, compliance, offer, ...), which are the operator's choices.
+# send limits, compliance, offer, the sender's name, email and tone, ...),
+# which are the operator's choices.
 LEARNED_FIELDS = {
-    "persona": ("company", "tone"),
+    "persona": ("company",),
     "product": ("name", "description", "pricing", "key_benefits", "objection_responses"),
     "icp": ("industries", "company_size", "titles", "geography"),
 }
 # The shipped template's placeholder company: a persona still carrying it
 # was never set up, so training fills in the whole persona.
 UNTRAINED_COMPANY = "Your Company"
+
+
+def _persona_untrained(persona) -> bool:
+    return (
+        not isinstance(persona, dict)
+        or persona.get("company") == UNTRAINED_COMPANY
+        or not persona.get("email")
+    )
 
 
 def merge_trained_config(learned: dict, existing: dict | None) -> dict:
@@ -341,11 +350,10 @@ def merge_trained_config(learned: dict, existing: dict | None) -> dict:
     The brain selection always comes from the trainer, which already starts
     from the existing choice unless ``--provider`` overrode it.
     """
-    if not isinstance(existing, dict):
+    if not isinstance(existing, dict) or not existing:
         return learned
     merged = copy.deepcopy(existing)
-    persona = existing.get("persona")
-    untrained = not isinstance(persona, dict) or persona.get("company") in ("", None, UNTRAINED_COMPANY)
+    untrained = _persona_untrained(existing.get("persona"))
     for section, value in learned.items():
         if not isinstance(merged.get(section), dict):
             merged[section] = copy.deepcopy(value)
@@ -360,42 +368,48 @@ def merge_trained_config(learned: dict, existing: dict | None) -> dict:
     return merged
 
 
-def write_trained_config(learned: dict, path: Path, base_path: Path | None = None) -> dict:
+def _backup(path: Path, raw: str) -> Path:
+    """Save ``raw`` next to ``path`` without overwriting an earlier backup."""
+    backup = path.with_name(path.name + ".bak")
+    if backup.exists():
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        backup = path.with_name(f"{path.name}.{stamp}.bak")
+    backup.write_text(raw, encoding="utf-8")
+    return backup
+
+
+def write_trained_config(learned: dict, path: Path) -> dict:
     """Write a trained config to ``path`` without losing the operator's settings.
 
-    The base is ``path`` itself when it exists, else ``base_path`` (the
-    config Harvey runs on today, usually the harvey.yaml template). A base
-    that can't be read as YAML is copied to ``<path>.bak`` before it is
-    replaced, so nothing is lost. Returns what was written.
+    The base is ``path`` itself when it exists. On a first training it is the
+    harvey.yaml next to it (the template Harvey ships, with the provider and
+    compliance blocks), never a config found elsewhere on disk. A base that
+    has content but can't be read as YAML is backed up before it is
+    replaced. The new file is swapped in whole, so a failed write never
+    leaves a half-written config. Returns what was written.
     """
     path = Path(path)
-    source = path if path.exists() else base_path
+    source = path if path.exists() else path.with_name("harvey.yaml")
     existing = None
-    if source is not None and Path(source).exists():
-        raw = Path(source).read_text(encoding="utf-8")
+    if source.exists():
+        raw = source.read_text(encoding="utf-8")
         try:
             existing = yaml.safe_load(raw)
         except yaml.YAMLError:
             existing = None
-        if not isinstance(existing, dict) and source == path:
-            backup = path.with_name(path.name + ".bak")
-            backup.write_text(raw, encoding="utf-8")
+        if not isinstance(existing, dict) and source == path and raw.strip():
+            backup = _backup(path, raw)
             print(f"      Couldn't read the existing {path.name}; saved it as {backup.name}.")
     config = merge_trained_config(learned, existing)
-    if isinstance(existing, dict):
-        print(f"      Kept your settings from {Path(source).name} (email provider, schedule,")
-        print("      limits, compliance); updated the product, targeting and company.")
-    with open(path, "w", encoding="utf-8") as f:
-        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+    if config is not learned and source == path:
+        print(f"      Kept your settings from {path.name} (email provider, schedule, limits,")
+        print("      compliance, sender identity); updated the product, targeting and company.")
+
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        yaml.safe_dump(config, f, default_flow_style=False, sort_keys=False)
+    os.replace(tmp, path)
     return config
-
-
-def _current_config_path() -> Path | None:
-    """The config Harvey loads today, or None if there isn't one."""
-    try:
-        return Path(_find_config_file())
-    except ConfigError:
-        return None
 
 
 class Trainer:
@@ -492,7 +506,8 @@ class Trainer:
         config_path = Path(output_path)
         if not config_path.is_absolute():
             config_path = PROJECT_ROOT / config_path
-        config = write_trained_config(config, config_path, base_path=_current_config_path())
+        guessed_email = config["persona"]["email"]
+        config = write_trained_config(config, config_path)
 
         # Generate product knowledge skill
         await self._generate_product_knowledge(product_info, icp_info, competitive_intel)
@@ -514,8 +529,12 @@ class Trainer:
         print(f"    - skills/product_knowledge.md")
         if competitive_intel.get("competitors"):
             print(f"    - skills/competitive_intel.md")
-        print(f"\n  Review {config_path} and adjust as needed — especially the")
-        print(f"  persona name/email, which I guessed from your domain.")
+        if config["persona"].get("email") == guessed_email:
+            print(f"\n  Review {config_path} and adjust as needed — especially the")
+            print(f"  persona name/email, which I guessed from your domain.")
+        else:
+            print(f"\n  Review {config_path} and adjust as needed. Emails still go out as")
+            print(f"  {config['persona'].get('name', '')} <{config['persona']['email']}>.")
         print(f"  Then run: harvey run\n")
 
         return config
