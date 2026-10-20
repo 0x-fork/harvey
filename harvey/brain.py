@@ -373,6 +373,15 @@ class Brain:
                 except Exception as e:
                     logger.warning(f"Failed to record usage event: {e}")
 
+                if payload and payload.get("is_error"):
+                    # The CLI reported an API error (overloaded, rate limited)
+                    # inside a successful exit. That text is not the model's
+                    # answer, so no caller may use it as one: retry like any
+                    # other transient failure.
+                    logger.error(f"Claude reported an error: {response[:300]}")
+                    last_error = response
+                    continue
+
                 logger.debug(f"Brain response: {response[:200]}...")
                 return response
 

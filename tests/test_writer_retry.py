@@ -156,3 +156,44 @@ async def test_given_up_prospects_can_be_retried(state, capsys):
     assert await state.retry_write_failed() == 1
     assert await status(state, pid) == "new"
     assert await state.retry_write_failed() == 0
+
+
+class _ClaudeProcess:
+    """A Claude CLI that exits 0 with the given JSON result payload."""
+
+    returncode = 0
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    async def communicate(self, data=None):
+        import json
+        return json.dumps(self.payload).encode(), b""
+
+
+@pytest.mark.asyncio
+async def test_a_cli_reported_api_error_is_no_reply_not_model_text(state, monkeypatch):
+    # The CLI can report an API error (overloaded, rate limited) inside a
+    # successful exit. That text is not the model's answer: no caller should
+    # treat it as a draft, and the Writer must not count it as a bad one.
+    import harvey.brain as brain_mod
+    from harvey.brain import Brain
+
+    payloads = []
+
+    async def fake_exec(*cmd, **kwargs):
+        return _ClaudeProcess(payloads.pop(0))
+
+    async def no_sleep(*a, **kw):
+        return None
+
+    monkeypatch.setattr(brain_mod.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(brain_mod.asyncio, "sleep", no_sleep)
+    brain = Brain(state)
+
+    payloads[:] = [{"type": "result", "is_error": True, "result": "API Error: 529 Overloaded"}] * 5
+    assert await brain.think("hi", max_retries=1) == ""
+    assert await brain.think_json("hi") is None and brain.last_reply_empty is True
+
+    payloads[:] = [{"type": "result", "is_error": False, "result": '{"ok": true}'}]
+    assert await brain.think_json("hi") == {"ok": True} and brain.last_reply_empty is False
