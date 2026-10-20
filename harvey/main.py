@@ -75,6 +75,39 @@ def seconds_until_quiet_hours_end(config: HarveyConfig) -> int:
     return max(int(delta.total_seconds()), 60)
 
 
+# When nothing is writable, prospecting pauses for the rest of the day once
+# this many unusable prospects (a guessed, invalid or missing email) were
+# found in the last 24 hours. Without a working verifier every address is a
+# guess, and prospecting every cycle would spend search and verifier credits
+# on people Harvey can never email. Nothing re-checks a guess, so the window
+# is a day, never all time: an all-time count would stop Scout for good.
+PROSPECT_BACKLOG = 20
+
+
+def _new_counts(summary: dict) -> tuple[int, int]:
+    """(all 'new' prospects, the ones the Writer can draft for)."""
+    prospects = summary.get("prospects") or {}
+    new = (prospects.get("new", 0) if isinstance(prospects, dict) else 0) or 0
+    # A summary built without the writable count keeps the old rule.
+    writable = summary.get("writable_prospects", new) or 0
+    return new, writable
+
+
+def unusable_backlog_notice(summary: dict) -> str:
+    """Why Harvey paused prospecting for the day, or ""."""
+    _, writable = _new_counts(summary)
+    recent = summary.get("recent_unusable_prospects", 0) or 0
+    if writable or recent < PROSPECT_BACKLOG:
+        return ""
+    return (
+        f"Harvey found {recent} prospects in the last day, but none has a verified "
+        "or catch-all email, so it paused prospecting for about a day to save search "
+        "and verifier credits. Add an email verifier key (REOON_API_KEY, "
+        "ZEROBOUNCE_API_KEY or HUNTER_API_KEY in .env) or check it still has credits. "
+        "`harvey export --all` exports the list as it is."
+    )
+
+
 async def decide_next_action(
     brain: Brain,
     state: StateManager,
@@ -91,8 +124,9 @@ async def decide_next_action(
     if summary is None:
         summary = await state.get_state_summary()
 
-    prospects = summary.get("prospects") or {}
-    new_prospects = prospects.get("new", 0) if isinstance(prospects, dict) else 0
+    # Only prospects the Writer can draft for trigger writing: one with a
+    # guessed email stays 'new' for good, and counting it starved Scout.
+    new_prospects, writable = _new_counts(summary)
     draft_campaigns = summary.get("draft_campaigns", 0) or 0
     open_conversations = summary.get("open_conversations", 0) or 0
 
@@ -104,12 +138,13 @@ async def decide_next_action(
         action, reason = "handle_replies", f"{open_conversations} open conversation(s) waiting"
     elif deployable > 0:
         action, reason = "send_campaign", f"{draft_campaigns} draft campaign(s) ready to deploy"
-    elif new_prospects > 0:
-        action, reason = "write_campaign", f"{new_prospects} new prospect(s) with no drafts ready"
-    elif new_prospects < 20:
-        action, reason = "prospect", f"only {new_prospects} new prospect(s); pipeline needs leads"
+    elif writable > 0:
+        action, reason = "write_campaign", f"{writable} new prospect(s) with no drafts ready"
+    elif unusable_backlog_notice(summary):
+        action, reason = "idle", "a day's worth of prospects with no usable email"
+        logger.warning(unusable_backlog_notice(summary))
     else:
-        action, reason = "idle", "pipeline is healthy; running analysis"
+        action, reason = "prospect", f"{new_prospects} new prospect(s), none ready to write for"
 
     logger.info(f"Decision: {action} ({reason})")
     return action
