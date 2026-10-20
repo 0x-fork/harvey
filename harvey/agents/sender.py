@@ -126,6 +126,16 @@ class Sender:
 
     async def _deploy_campaign(self, campaign):
         """Deploy a single campaign to Instantly. Idempotent: safe to retry."""
+        # Instantly owns campaign scheduling and has no per-message outbox
+        # approval here. Fail closed rather than silently bypass the setting,
+        # including retries of an already-created remote campaign.
+        if getattr(self.config.channels.email, "require_approval", True):
+            logger.warning(
+                "Sender: Instantly campaign held because require_approval is true. "
+                "Use a native mail provider for outbox review, or explicitly set "
+                "channels.email.require_approval: false for Instantly autopilot."
+            )
+            return
         logger.info(f"Sender: Deploying campaign '{campaign.name}'...")
 
         # 0. Validate before touching the network

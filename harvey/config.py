@@ -79,9 +79,9 @@ class EmailChannelConfig(BaseModel):
     # mailboxes. Off by default — catch-alls accept everything, so a bad
     # guess still bounces.
     send_to_risky: bool = False
-    # Copilot mode (native providers): every outgoing email waits in the
-    # outbox for your approval (dashboard → Outbox, or `harvey outbox`).
-    # Set false for full autopilot once you trust the output.
+    # Native providers queue mail for approval. Instantly cannot use that
+    # outbox, so it holds campaigns and escalates replies while this is true.
+    # Set false explicitly for full autopilot once you trust the output.
     require_approval: bool = True
     # Kill switch: pause all sending when bounces exceed this fraction of
     # sent mail (measured over the trailing sends). 0 disables the switch.
@@ -96,7 +96,7 @@ class EmailChannelConfig(BaseModel):
 
 
 class LinkedInChannelConfig(BaseModel):
-    enabled: bool = True
+    enabled: bool = False
     max_daily_connections: int = 20
     max_daily_messages: int = 10
 
