@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 from harvey.brain import Brain, BrainUnavailable
 from harvey.config import HarveyConfig, EnvConfig
+from harvey.humanize import humanize
 from harvey.integrations.instantly import InstantlyClient
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
 from harvey.models.conversation import Conversation, Message
@@ -669,4 +670,5 @@ Write a reply that:"""
         if response.lower().startswith(("i can't", "i cannot", "as an ai", "sorry,")):
             logger.warning("Handler: Model returned meta-text instead of an email. Discarding.")
             return ""
-        return response
+        polished = await humanize(self.brain, [{"subject": "", "body": response}], agent="handler")
+        return polished[0]["body"]

@@ -37,10 +37,10 @@ from bs4 import BeautifulSoup
 
 from harvey.brain import Brain
 from harvey.config import HarveyConfig, EnvConfig
-from harvey.integrations.email_finder import find_email
+from harvey.integrations.email_finder import find_email, verify_published_address
 from harvey.integrations.linkedin import LinkedInAutomation
 from harvey.models.company import Company
-from harvey.models.prospect import Prospect
+from harvey.models.prospect import COMPANY_INBOX_SOURCE, Prospect
 from harvey.state import StateManager
 
 logger = logging.getLogger("harvey.scout")
@@ -57,6 +57,18 @@ MAX_RETRIES = 3
 BACKOFF_BASE = 1.5  # seconds; grows exponentially per attempt
 MAX_RESULTS_PER_QUERY = 20
 MAX_COMPANIES_PER_CYCLE = 10
+
+# Company-inbox fallback: pages that publish a general address, the
+# mailboxes most likely read by the owner (best first), and addresses that
+# never reach a decision-maker.
+INBOX_PAGES = ("/contact", "/contact-us")
+INBOX_PREFERRED = ("owner", "office", "info", "contact", "service", "hello",
+                   "sales", "admin", "support")
+INBOX_SKIP_LOCALS = {
+    "noreply", "no-reply", "donotreply", "careers", "jobs", "hr", "billing",
+    "accounting", "invoices", "ap", "press", "media", "marketing", "privacy",
+    "webmaster", "abuse", "postmaster", "example", "email", "name", "your",
+}
 MAX_PROSPECTS_PER_CYCLE = 25
 
 # Hunter domain-searches per heartbeat. The monthly budget itself is shared
@@ -1446,7 +1458,91 @@ Respond ONLY with the JSON array."""
 
             self._remember_prospect(prospect)
             contacts.append(prospect)
+
+        if not contacts:
+            inbox = await self._company_inbox_prospect(
+                company_id, domain, company_name, industry, signal_note,
+            )
+            if inbox:
+                contacts.append(inbox)
         return contacts
+
+    async def _company_inbox_prospect(
+        self, company_id: str, domain: str, company_name: str,
+        industry: str, signal_note: str = "",
+    ) -> Prospect | None:
+        """The company's own published inbox, when its site names nobody.
+
+        Small trade businesses rarely list a team, but most publish an
+        info@ or office@ address that the owner or office manager reads.
+        Only an address printed on the company's own site is used, never a
+        guessed one, and it is verified like any other before sending.
+        """
+        email = await self._find_inbox_address(domain)
+        if not email:
+            return None
+        try:
+            status = await verify_published_address(email, env=self.env)
+        except Exception as e:
+            logger.debug(f"Inbox verification failed for {email}: {e}")
+            status = "guess"
+        prospect = Prospect(
+            email=email,
+            email_status=status,
+            email_verified=(status == "verified"),
+            company=company_name,
+            company_id=company_id,
+            title="General inbox",
+            industry=industry,
+            source=COMPANY_INBOX_SOURCE,
+            source_url=f"https://{domain}",
+            personalization_notes=signal_note,
+        )
+        if not prospect.is_valid() or await self._is_duplicate_prospect(prospect):
+            return None
+        self._remember_prospect(prospect)
+        logger.info(f"Scout: No named owner at {domain}; using its published inbox {email} [{status}]")
+        return prospect
+
+    async def _find_inbox_address(self, domain: str) -> str:
+        """Best general address published on the company's homepage or contact page."""
+        base, home = await self._resolve_base_url(domain)
+        if not base:
+            return ""
+        domain = domain.lower().removeprefix("www.")
+        pages = [home] if home is not None else []
+        for path in INBOX_PAGES:
+            resp = await self._fetch(f"{base}{path}", timeout=SCRAPE_TIMEOUT, retries=1)
+            if resp is not None:
+                pages.append(resp)
+
+        found: list[str] = []
+        for resp in pages:
+            text = getattr(resp, "text", "") or ""
+            soup = self._safe_soup(text)
+            if soup is not None:
+                for a in soup.find_all("a", href=True):
+                    href = self._attr_str(a.get("href"))
+                    if href.lower().startswith("mailto:"):
+                        found.append(href[7:].split("?")[0])
+            found += re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", text[:50000])
+
+        candidates = []
+        for addr in found:
+            addr = addr.strip().lower()
+            local, _, adomain = addr.partition("@")
+            if adomain.removeprefix("www.") != domain or local in INBOX_SKIP_LOCALS:
+                continue
+            if addr not in candidates:
+                candidates.append(addr)
+        if not candidates:
+            return ""
+
+        def rank(addr: str) -> int:
+            local = addr.partition("@")[0]
+            return INBOX_PREFERRED.index(local) if local in INBOX_PREFERRED else len(INBOX_PREFERRED)
+
+        return min(candidates, key=rank)
 
     # ── Strategy 4: Job boards — companies hiring for signal roles ──
 
