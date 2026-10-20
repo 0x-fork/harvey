@@ -5,6 +5,7 @@ Falls back to manual scraping if no Cloudflare credentials are configured.
 """
 
 import asyncio
+import copy
 import logging
 import os
 import time
@@ -17,7 +18,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
 from harvey.brain import Brain
-from harvey.config import BrainConfig, load_brain_config
+from harvey.config import BrainConfig, ConfigError, _find_config_file, load_brain_config
 from harvey.state import StateManager
 
 logger = logging.getLogger("harvey.trainer")
@@ -320,6 +321,83 @@ def brain_section(brain_config: BrainConfig) -> dict:
     return section
 
 
+# What training learns from a website. Retraining replaces exactly these and
+# keeps everything else in the existing config (email provider, quiet hours,
+# send limits, compliance, offer, ...), which are the operator's choices.
+LEARNED_FIELDS = {
+    "persona": ("company", "tone"),
+    "product": ("name", "description", "pricing", "key_benefits", "objection_responses"),
+    "icp": ("industries", "company_size", "titles", "geography"),
+}
+# The shipped template's placeholder company: a persona still carrying it
+# was never set up, so training fills in the whole persona.
+UNTRAINED_COMPANY = "Your Company"
+
+
+def merge_trained_config(learned: dict, existing: dict | None) -> dict:
+    """``existing`` with what training learned laid over it.
+
+    Sections the existing config lacks come from ``learned`` (its defaults).
+    The brain selection always comes from the trainer, which already starts
+    from the existing choice unless ``--provider`` overrode it.
+    """
+    if not isinstance(existing, dict):
+        return learned
+    merged = copy.deepcopy(existing)
+    persona = existing.get("persona")
+    untrained = not isinstance(persona, dict) or persona.get("company") in ("", None, UNTRAINED_COMPANY)
+    for section, value in learned.items():
+        if not isinstance(merged.get(section), dict):
+            merged[section] = copy.deepcopy(value)
+    for section, keys in LEARNED_FIELDS.items():
+        for key in keys:
+            if key in learned.get(section, {}):
+                merged[section][key] = copy.deepcopy(learned[section][key])
+    if untrained:
+        merged["persona"].update(copy.deepcopy(learned.get("persona", {})))
+    if "brain" in learned:
+        merged["brain"] = copy.deepcopy(learned["brain"])
+    return merged
+
+
+def write_trained_config(learned: dict, path: Path, base_path: Path | None = None) -> dict:
+    """Write a trained config to ``path`` without losing the operator's settings.
+
+    The base is ``path`` itself when it exists, else ``base_path`` (the
+    config Harvey runs on today, usually the harvey.yaml template). A base
+    that can't be read as YAML is copied to ``<path>.bak`` before it is
+    replaced, so nothing is lost. Returns what was written.
+    """
+    path = Path(path)
+    source = path if path.exists() else base_path
+    existing = None
+    if source is not None and Path(source).exists():
+        raw = Path(source).read_text(encoding="utf-8")
+        try:
+            existing = yaml.safe_load(raw)
+        except yaml.YAMLError:
+            existing = None
+        if not isinstance(existing, dict) and source == path:
+            backup = path.with_name(path.name + ".bak")
+            backup.write_text(raw, encoding="utf-8")
+            print(f"      Couldn't read the existing {path.name}; saved it as {backup.name}.")
+    config = merge_trained_config(learned, existing)
+    if isinstance(existing, dict):
+        print(f"      Kept your settings from {Path(source).name} (email provider, schedule,")
+        print("      limits, compliance); updated the product, targeting and company.")
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+    return config
+
+
+def _current_config_path() -> Path | None:
+    """The config Harvey loads today, or None if there isn't one."""
+    try:
+        return Path(_find_config_file())
+    except ConfigError:
+        return None
+
+
 class Trainer:
     def __init__(self, brain_config: BrainConfig | None = None):
         # Without an explicit choice, train with whatever provider the
@@ -414,8 +492,7 @@ class Trainer:
         config_path = Path(output_path)
         if not config_path.is_absolute():
             config_path = PROJECT_ROOT / config_path
-        with open(config_path, "w") as f:
-            yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+        config = write_trained_config(config, config_path, base_path=_current_config_path())
 
         # Generate product knowledge skill
         await self._generate_product_knowledge(product_info, icp_info, competitive_intel)
