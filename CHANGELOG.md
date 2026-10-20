@@ -17,6 +17,15 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Outbox review: see what a draft is based on, and edit it.** Each pending
+  draft now shows its campaign, the company (name, clickable website,
+  description), the contact and how they were found, email status and score,
+  tech / agency / hiring / ads / booking signals, and the Writer's notes, so
+  every claim can be checked against what Harvey actually found. **Edit** (or
+  `E`) turns subject and body into fields; Save rewrites the draft only while
+  it is still `pending_review` and never approves it.
+  `POST /api/outbox/{id}/edit` backs it.
+
 - **Microsoft 365 mail provider.** Set `channels.email.provider: microsoft` to
   send and read through a Microsoft 365 / Outlook mailbox via Microsoft Graph,
   for domains whose mail lives in Exchange Online (which no longer accepts

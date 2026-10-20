@@ -901,6 +901,22 @@ class StateManager:
             )
             await db.commit()
 
+    async def edit_outbox_draft(self, item_id: str, subject: str, body: str) -> int:
+        """Rewrite a draft's subject and body — only while it awaits review.
+
+        Atomic on status, like approve: an item already approved, sent or
+        rejected is never changed. Editing never approves; that stays a
+        separate, explicit step. Returns the number of rows changed (0/1).
+        """
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE outbox SET subject = ?, body = ?, updated_at = ? "
+                "WHERE id = ? AND status = 'pending_review'",
+                (subject, body, _utcnow().isoformat(), item_id),
+            )
+            await db.commit()
+            return cursor.rowcount
+
     async def approve_outbox(self, item_id: str | None = None) -> int:
         """Approve one pending item, or ALL pending when item_id is None."""
         async with self._connect() as db:
