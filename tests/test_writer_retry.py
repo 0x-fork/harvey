@@ -113,3 +113,46 @@ async def test_attempts_are_counted_per_prospect(state):
     await writer.run()
     assert await status(state, early) == "write_failed"
     assert await status(state, late) == "new"
+
+
+@pytest.mark.asyncio
+async def test_an_empty_reply_is_an_outage_not_a_bad_draft(state):
+    # On Claude a logout, rate limit, timeout or missing CLI returns "" without
+    # pausing the brain. Only a reply that came back unusable may count.
+    pid = await add(state, 1)
+    brain = FakeBrain(reply=None)
+    brain.last_reply_empty = True
+    writer = Writer(brain, state, CONFIG, None)
+    for _ in range(MAX_WRITE_ATTEMPTS + 2):
+        await writer.run()
+    assert await status(state, pid) == "new"
+
+
+@pytest.mark.asyncio
+async def test_the_real_brain_reports_whether_the_model_replied(state, monkeypatch):
+    from harvey.brain import Brain
+    from harvey.config import BrainConfig
+    brain = Brain(state, BrainConfig())
+
+    async def silent(*a, **kw):
+        return ""
+
+    async def chatty(*a, **kw):
+        return "Sorry, here are some thoughts instead of JSON."
+
+    monkeypatch.setattr(brain, "think", silent)
+    assert await brain.think_json("x") is None and brain.last_reply_empty is True
+    monkeypatch.setattr(brain, "think", chatty)
+    assert await brain.think_json("x") is None and brain.last_reply_empty is False
+
+
+@pytest.mark.asyncio
+async def test_given_up_prospects_can_be_retried(state, capsys):
+    pid = await add(state, 1)
+    writer = Writer(FakeBrain(reply="not a sequence"), state, CONFIG, None)
+    for _ in range(MAX_WRITE_ATTEMPTS):
+        await writer.run()
+    assert await status(state, pid) == "write_failed"
+    assert await state.retry_write_failed() == 1
+    assert await status(state, pid) == "new"
+    assert await state.retry_write_failed() == 0

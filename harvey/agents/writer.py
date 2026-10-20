@@ -94,12 +94,15 @@ class Writer:
             )
 
             # Generate the email sequence
+            self._no_reply = False
             sequence = await self._write_sequence(prospects)
             if not sequence:
-                paused = getattr(self.brain, "paused_reason", "")
+                paused = getattr(self.brain, "paused_reason", "") or (
+                    "no reply from the model" if self._no_reply else "")
                 if paused:
-                    # The provider is down, not the draft bad: no attempt is
-                    # counted, and the other batches would fail the same way.
+                    # The provider failed (outage, logout, rate limit,
+                    # timeout), not the draft: no attempt is counted, and the
+                    # other batches would fail the same way.
                     logger.warning(f"Writer: {paused}; leaving '{batch_name}' for later.")
                     return
                 logger.warning(f"Writer: Failed to generate sequence for {batch_name}")
@@ -380,6 +383,8 @@ Return ONLY a JSON array (no markdown fences, no commentary):
             prompt, session_id="harvey-writer",
             agent="writer", task="write_sequence",
         )
+        # Read right after the call, before anything else can use the brain.
+        self._no_reply = result is None and bool(getattr(self.brain, "last_reply_empty", False))
         steps = self._parse_sequence(result)
         if inbox_batch and any(
             PERSON_VAR.search(s.subject + s.body) for s in steps

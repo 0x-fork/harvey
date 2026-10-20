@@ -205,6 +205,10 @@ def cmd_status(args):
         print(f"  Prospects:            {summary['prospects']}")
         print(f"  Ready to write for:   {summary.get('writable_prospects', 0)} "
               "(new, with a verified or catch-all email)")
+        write_failed = (summary.get("prospects") or {}).get("write_failed", 0)
+        if write_failed:
+            print(f"  Couldn't write for:   {write_failed} (the model's drafts kept coming back "
+                  "unusable; `harvey retry-writes` tries again)")
         print(f"  Draft campaigns:      {summary['draft_campaigns']}")
         print(f"  Active campaigns:     {summary['active_campaigns']}")
         print(f"  Open conversations:   {summary['open_conversations']}")
@@ -663,6 +667,24 @@ def cmd_signals(args):
     asyncio.run(_signals())
 
 
+def cmd_retry_writes(args):
+    """Put prospects the Writer gave up on back in line for another try."""
+    from harvey.agents.writer import MAX_WRITE_ATTEMPTS
+    from harvey.state import StateManager
+
+    async def _run():
+        state = StateManager()
+        await state.init_db()
+        count = await state.retry_write_failed()
+        if count:
+            print(f"\n  {count} prospect(s) are back in line. The Writer will try each "
+                  f"up to {MAX_WRITE_ATTEMPTS} more times.\n")
+        else:
+            print("\n  No prospects are waiting on a retry.\n")
+
+    asyncio.run(_run())
+
+
 def cmd_sending(args):
     """Pause/resume the sending kill switch."""
     from harvey.state import StateManager
@@ -815,6 +837,10 @@ def main():
     sub.add_argument("--reject", metavar="CODES", default="",
                      help="Comma-separated codes to turn off")
     sub.set_defaults(func=cmd_signals)
+
+    sub = subparsers.add_parser(
+        "retry-writes", help="Retry prospects the Writer couldn't write an email for")
+    sub.set_defaults(func=cmd_retry_writes)
 
     sub = subparsers.add_parser("sending", help="Kill switch: pause/resume sending")
     sub.add_argument("sending_action", nargs="?", default="status",

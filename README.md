@@ -326,6 +326,7 @@ The dashboard's Outbox is a decisions desk: one email fills the pane, the rest w
 harvey outbox                 # review from the terminal
 harvey outbox --approve-all
 harvey sending pause          # kill switch, stops everything mid-flight
+harvey retry-writes           # retry prospects the Writer gave up on after 3 unusable drafts
 ```
 
 Before anything leaves, a **deterministic pre-send gate** — no model involved — rejects: unrendered merge tags, banned phrases, emails over the length cap, too many links, HTML bodies, non-deliverable addresses, and any mismatch between the recipient and the database record.
@@ -441,6 +442,7 @@ harvey usage                 # active provider's quota + per-agent tokens
 harvey outbox                # review queued email
 harvey export                # deliverable prospects → CSV
 harvey sending pause|resume  # kill switch
+harvey retry-writes          # retry prospects the Writer gave up on
 harvey gmail auth            # one-time Gmail OAuth
 harvey microsoft auth|test  # one-time Microsoft 365 sign-in (docs/microsoft365.md)
 ```
