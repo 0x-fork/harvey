@@ -18,6 +18,8 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
+from harvey.public_http import public_http_client
+
 from harvey.collectors.discover import (
     name_from_domain, name_matches_domain, site_name_from_html,
 )
@@ -237,8 +239,8 @@ class ProfileCollector:
         return code in self.confirmed
 
     async def __aenter__(self):
-        self._client = httpx.AsyncClient(
-            timeout=TIMEOUT, follow_redirects=True,
+        self._client = public_http_client(
+            timeout=TIMEOUT,
             headers={"User-Agent": random.choice(USER_AGENTS),
                      "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"},
         )

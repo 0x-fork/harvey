@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 
@@ -208,6 +209,17 @@ def cmd_status(args):
         by_provider = summary.get("usage_today_by_provider", {})
         print(f"  Claude calls today:   {by_provider.get('claude', summary['usage_today'])}")
         print(f"  Codex calls today:    {by_provider.get('codex', 0)}")
+        from harvey.config import load_config, sending_notice
+        try:
+            notice = sending_notice(load_config())
+        except Exception:
+            # Status must still print when harvey.yaml is broken; that's
+            # when people run it. The --check path reports config errors.
+            notice = ""
+        if notice:
+            print("  Sending:              HELD")
+            print(textwrap.fill(notice, width=72, initial_indent="                        ",
+                                subsequent_indent="                        "))
         from harvey.brain import BRAIN_STATUS_KEY, Brain, active_brain_status
         from harvey.config import ConfigError, load_brain_config
         try:

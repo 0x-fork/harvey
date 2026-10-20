@@ -9,6 +9,23 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- Keep local website requests out of private networks, including redirects and
+  DNS rebinding. Preserve the original hostname for TLS verification. Website
+  fetching (search, company sites, profiling, the training crawler) now ignores
+  `HTTP_PROXY`/`HTTPS_PROXY`, so it can't be routed around that boundary; mail
+  and API integrations are unchanged. `harvey train` refuses local or intranet
+  URLs and says so.
+- **Instantly users: check `require_approval`.** Instantly has no per-email
+  approval queue, so with `channels.email.require_approval: true` (the default)
+  Harvey now holds campaign deployment and hands replies to a human instead of
+  silently bypassing the setting. `harvey run` and `harvey status` say when this
+  is happening; prospecting and drafting carry on (drafts wait, using model
+  quota, until sending is allowed). Set `require_approval: false` for
+  Instantly autopilot.
+- Disable LinkedIn by default in the model, sample config, and product trainer;
+  save the setup wizard's explicit LinkedIn choice when updating a config.
+  Answering "no" to LinkedIn when re-running `harvey setup` now turns it off
+  (saved credentials stay in `.env`).
 - Protect the local dashboard with an access token, restrict requests to trusted
   local origins, and save settings with owner-only permissions. Update and restart
   Harvey, then open the dashboard link printed in your terminal.

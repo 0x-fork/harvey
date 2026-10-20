@@ -9,7 +9,9 @@ from datetime import datetime, time, timedelta
 import pytz
 
 from harvey.brain import Brain
-from harvey.config import ConfigError, load_config, load_env, HarveyConfig
+from harvey.config import (
+    ConfigError, load_config, load_env, HarveyConfig, legacy_sending_held, sending_notice,
+)
 from harvey.pipeline import run_profile_stage
 from harvey.state import StateManager
 
@@ -94,9 +96,13 @@ async def decide_next_action(
     draft_campaigns = summary.get("draft_campaigns", 0) or 0
     open_conversations = summary.get("open_conversations", 0) or 0
 
+    # Held Instantly drafts can't deploy; choosing send_campaign for them
+    # every cycle would starve the writer and scout forever.
+    deployable = 0 if legacy_sending_held(config) else draft_campaigns
+
     if open_conversations > 0:
         action, reason = "handle_replies", f"{open_conversations} open conversation(s) waiting"
-    elif draft_campaigns > 0:
+    elif deployable > 0:
         action, reason = "send_campaign", f"{draft_campaigns} draft campaign(s) ready to deploy"
     elif new_prospects > 0:
         action, reason = "write_campaign", f"{new_prospects} new prospect(s) with no drafts ready"
@@ -179,6 +185,11 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
         + (f" ({brain.model})" if brain.model else "")
         + ". Change brain.provider in harvey.yaml to switch."
     )
+    notice = sending_notice(config)
+    if notice:
+        logger.warning("=" * 60)
+        logger.warning(notice)
+        logger.warning("=" * 60)
 
     await state.init_db()
     logger.info("Database initialized.")

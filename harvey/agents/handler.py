@@ -11,7 +11,7 @@ import logging
 from datetime import datetime, timezone
 
 from harvey.brain import Brain, BrainUnavailable
-from harvey.config import HarveyConfig, EnvConfig
+from harvey.config import HarveyConfig, EnvConfig, legacy_sending_held
 from harvey.humanize import humanize, humanizer_enabled
 from harvey.integrations.instantly import InstantlyClient
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
@@ -259,9 +259,11 @@ class Handler:
         old_stage = convo.stage
         convo.stage = self._determine_stage(intent, convo.stage, reply_text)
 
-        # 2b. Draft the reply now, while nothing is stored yet.
+        # 2b. Draft the reply now, while nothing is stored yet. A held
+        # Instantly setup can't send it, so don't spend a model call on it.
+        held = not self.is_native and legacy_sending_held(self.config)
         response = ""
-        if intent in AUTO_REPLY_INTENTS:
+        if intent in AUTO_REPLY_INTENTS and not held:
             response = await self._generate_response(intent, reply_text, prospect, convo)
 
         # 2c. Store the conversation in one write.
@@ -318,6 +320,20 @@ class Handler:
 
         if intent not in AUTO_REPLY_INTENTS:
             logger.warning(f"Handler: No auto-reply policy for intent '{intent}'. Skipping reply.")
+            return
+
+        if held:
+            # Instantly has no approval queue: a human answers this one.
+            await self.state.update_conversation(convo.id, status="needs_human")
+            await self.state.log_action(
+                action_type="escalation", agent="handler",
+                details={"prospect_email": lead_email, "reason": "instantly_approval_required",
+                         "reply_preview": reply_text[:200]},
+            )
+            logger.warning(
+                f"Handler: reply from {lead_email} held for a human: Instantly can't "
+                "queue replies for approval while require_approval is true."
+            )
             return
 
         # For interested, objection, question, wrong_person — the reply drafted above

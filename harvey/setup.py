@@ -634,6 +634,10 @@ class SetupWizard:
                     existing = yaml.safe_load(f) or {}
                 existing["usage"] = self.config.get("usage", existing.get("usage", {}))
                 existing["brain"] = self.config["brain"]
+                if "LINKEDIN_EMAIL" in self.env_vars:
+                    existing.setdefault("channels", {}).setdefault("linkedin", {})["enabled"] = bool(
+                        self.env_vars["LINKEDIN_EMAIL"]
+                    )
                 if "channels" in self.config:
                     existing.setdefault("channels", {})
                     if "email" in self.config["channels"]:
