@@ -131,7 +131,8 @@ python3.13 -m venv .venv && source .venv/bin/activate && pip install -e .
 # 2. Configure — every variable is documented inline with where to get it
 cp .env.example .env && $EDITOR .env
 
-# 3. Learn your product from your website
+# 3. Learn your product from your website (writes harvey.local.yaml; re-running
+#    it updates the product, targeting and company and keeps your other settings)
 harvey train https://your-company.com
 
 # 4. Choose what makes a good prospect (see below — this one matters)

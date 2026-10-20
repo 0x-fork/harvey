@@ -5,8 +5,10 @@ Falls back to manual scraping if no Cloudflare credentials are configured.
 """
 
 import asyncio
+import copy
 import logging
 import os
+import shutil
 import time
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -320,6 +322,102 @@ def brain_section(brain_config: BrainConfig) -> dict:
     return section
 
 
+# What training learns from a website. Retraining replaces exactly these and
+# keeps everything else in the existing config (email provider, quiet hours,
+# send limits, compliance, offer, the sender's name, email and tone, ...),
+# which are the operator's choices.
+LEARNED_FIELDS = {
+    "persona": ("company",),
+    "product": ("name", "description", "pricing", "key_benefits", "objection_responses"),
+    "icp": ("industries", "company_size", "titles", "geography"),
+}
+# The shipped template's placeholder company: a persona still carrying it
+# was never set up, so training fills in the whole persona.
+UNTRAINED_COMPANY = "Your Company"
+
+
+def _persona_untrained(persona) -> bool:
+    return (
+        not isinstance(persona, dict)
+        or persona.get("company") == UNTRAINED_COMPANY
+        or not persona.get("email")
+    )
+
+
+def merge_trained_config(learned: dict, existing: dict | None) -> dict:
+    """``existing`` with what training learned laid over it.
+
+    Sections the existing config lacks come from ``learned`` (its defaults).
+    The brain selection always comes from the trainer, which already starts
+    from the existing choice unless ``--provider`` overrode it.
+    """
+    if not isinstance(existing, dict) or not existing:
+        return learned
+    merged = copy.deepcopy(existing)
+    untrained = _persona_untrained(existing.get("persona"))
+    for section, value in learned.items():
+        if not isinstance(merged.get(section), dict):
+            merged[section] = copy.deepcopy(value)
+    for section, keys in LEARNED_FIELDS.items():
+        for key in keys:
+            if key in learned.get(section, {}):
+                merged[section][key] = copy.deepcopy(learned[section][key])
+    if untrained:
+        merged["persona"].update(copy.deepcopy(learned.get("persona", {})))
+    if "brain" in learned:
+        merged["brain"] = copy.deepcopy(learned["brain"])
+    return merged
+
+
+def _backup(path: Path, raw: str) -> Path:
+    """Save ``raw`` next to ``path`` without overwriting an earlier backup."""
+    backup = path.with_name(path.name + ".bak")
+    if backup.exists():
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        backup = path.with_name(f"{path.name}.{stamp}.bak")
+    backup.write_text(raw, encoding="utf-8")
+    return backup
+
+
+def write_trained_config(learned: dict, path: Path) -> dict:
+    """Write a trained config to ``path`` without losing the operator's settings.
+
+    The base is ``path`` itself when it exists. On a first training it is the
+    harvey.yaml next to it (the template Harvey ships, with the provider and
+    compliance blocks), never a config found elsewhere on disk. A base that
+    has content but can't be read as YAML is backed up before it is
+    replaced. The new file is swapped in whole, so a failed write never
+    leaves a half-written config. Returns what was written.
+    """
+    path = Path(path)
+    source = path if path.exists() else path.with_name("harvey.yaml")
+    existing = None
+    if source.exists():
+        raw = source.read_text(encoding="utf-8")
+        try:
+            existing = yaml.safe_load(raw)
+        except yaml.YAMLError:
+            existing = None
+        if not isinstance(existing, dict) and source == path and raw.strip():
+            backup = _backup(path, raw)
+            print(f"      Couldn't read the existing {path.name}; saved it as {backup.name}.")
+    config = merge_trained_config(learned, existing)
+    if config is not learned and source == path:
+        print(f"      Kept your settings from {path.name} (email provider, schedule, limits,")
+        print("      compliance, sender identity); updated the product, targeting and company.")
+
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            yaml.safe_dump(config, f, default_flow_style=False, sort_keys=False)
+        if path.exists():
+            shutil.copymode(path, tmp)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return config
+
+
 class Trainer:
     def __init__(self, brain_config: BrainConfig | None = None):
         # Without an explicit choice, train with whatever provider the
@@ -414,8 +512,8 @@ class Trainer:
         config_path = Path(output_path)
         if not config_path.is_absolute():
             config_path = PROJECT_ROOT / config_path
-        with open(config_path, "w") as f:
-            yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+        guessed_email = config["persona"]["email"]
+        config = write_trained_config(config, config_path)
 
         # Generate product knowledge skill
         await self._generate_product_knowledge(product_info, icp_info, competitive_intel)
@@ -437,8 +535,12 @@ class Trainer:
         print(f"    - skills/product_knowledge.md")
         if competitive_intel.get("competitors"):
             print(f"    - skills/competitive_intel.md")
-        print(f"\n  Review {config_path} and adjust as needed — especially the")
-        print(f"  persona name/email, which I guessed from your domain.")
+        if config["persona"].get("email") == guessed_email:
+            print(f"\n  Review {config_path} and adjust as needed — especially the")
+            print(f"  persona name/email, which I guessed from your domain.")
+        else:
+            print(f"\n  Review {config_path} and adjust as needed. Emails still go out as")
+            print(f"  {config['persona'].get('name', '')} <{config['persona']['email']}>.")
         print(f"  Then run: harvey run\n")
 
         return config
