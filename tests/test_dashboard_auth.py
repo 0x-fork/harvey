@@ -9,6 +9,7 @@ persistence, loopback-only binding, a real server started as the CLI does,
 and the browser-side token handling under node.
 """
 
+import errno
 import json
 import os
 import re
@@ -447,7 +448,8 @@ def test_token_is_stable_and_unique_per_install(tmp_path):
     assert auth.load_or_create_token(tmp_path / "b" / "t") != a
 
 
-def test_concurrent_creation_yields_one_token(tmp_path):
+@pytest.mark.parametrize("round_number", range(10))
+def test_concurrent_creation_yields_one_token(tmp_path, round_number):
     path = tmp_path / "data" / "dashboard-token"
     results, errors = [], []
     barrier = threading.Barrier(8)
@@ -463,9 +465,105 @@ def test_concurrent_creation_yields_one_token(tmp_path):
     for t in threads:
         t.start()
     for t in threads:
-        t.join()
-    assert not errors and len(set(results)) == 1
+        t.join(timeout=10)
+    assert not any(t.is_alive() for t in threads)
+    assert not errors and len(results) == 8 and len(set(results)) == 1
     assert [p.name for p in path.parent.iterdir()] == ["dashboard-token"]
+
+
+@pytest.mark.parametrize("error_code, winerror", [
+    (errno.EACCES, None), (errno.EINVAL, 5), (errno.EINVAL, 32), (errno.EINVAL, 33),
+])
+def test_windows_transient_token_open_recovers_without_replacing(tmp_path, monkeypatch, error_code, winerror):
+    path = tmp_path / "dashboard-token"
+    original = auth.load_or_create_token(path)
+    before = path.read_bytes()
+    real_open = auth.os.open
+    calls, sleeps = [], []
+
+    def open_busy(name, flags, *args, **kwargs):
+        if Path(name) == path:
+            calls.append(name)
+            if len(calls) <= 2:
+                error = OSError(error_code, "Permission denied")
+                if winerror is not None:
+                    error.winerror = winerror
+                raise error
+        return real_open(name, flags, *args, **kwargs)
+
+    monkeypatch.setattr(auth, "_IS_WINDOWS", True)
+    monkeypatch.setattr(auth.os, "open", open_busy)
+    monkeypatch.setattr(auth.time, "sleep", sleeps.append)
+    monkeypatch.setattr(auth, "_publish_token", lambda *a: pytest.fail("existing token must not be replaced"))
+    assert auth.load_or_create_token(path) == original
+    assert len(calls) == 3 and sleeps == [0.01, 0.01]
+    assert path.read_bytes() == before
+    assert list(tmp_path.iterdir()) == [path]
+
+
+@pytest.mark.parametrize("windows, expected_attempts", [(True, 51), (False, 1)])
+def test_token_open_denied_fails_closed_with_bounded_retry(tmp_path, monkeypatch, windows, expected_attempts):
+    path = tmp_path / "dashboard-token"
+    auth.load_or_create_token(path)
+    before = path.read_bytes()
+    attempts, sleeps = [], []
+    denied = PermissionError(errno.EACCES, "Permission denied")
+
+    def open_denied(*args, **kwargs):
+        attempts.append(1)
+        raise denied
+
+    monkeypatch.setattr(auth, "_IS_WINDOWS", windows)
+    monkeypatch.setattr(auth.os, "open", open_denied)
+    monkeypatch.setattr(auth.time, "sleep", sleeps.append)
+    monkeypatch.setattr(auth, "_publish_token", lambda *a: pytest.fail("denial must not create a token"))
+    with pytest.raises(auth.TokenError, match="Can't read") as caught:
+        auth.load_or_create_token(path)
+    assert caught.value.__cause__ is denied
+    assert len(attempts) == expected_attempts
+    assert sleeps == [0.01] * (expected_attempts - 1)
+    assert path.read_bytes() == before
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_windows_unrelated_open_error_is_not_retried(tmp_path, monkeypatch):
+    path = tmp_path / "dashboard-token"
+    auth.load_or_create_token(path)
+    before = path.read_bytes()
+    error = OSError(errno.EIO, "I/O error")
+
+    def fail_open(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(auth, "_IS_WINDOWS", True)
+    monkeypatch.setattr(auth.os, "open", fail_open)
+    monkeypatch.setattr(auth.time, "sleep", lambda *a: pytest.fail("I/O failure must fail immediately"))
+    monkeypatch.setattr(auth, "_publish_token", lambda *a: pytest.fail("read errors must not replace the token"))
+    with pytest.raises(auth.TokenError, match="Can't read") as caught:
+        auth.load_or_create_token(path)
+    assert caught.value.__cause__ is error
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("failure", ["malformed", "symlink", "security"])
+def test_windows_validation_errors_are_not_retried(tmp_path, monkeypatch, failure):
+    path = tmp_path / "dashboard-token"
+    auth.load_or_create_token(path)
+    if failure == "malformed":
+        path.write_text("invalid")
+    before = path.read_bytes()
+    monkeypatch.setattr(auth, "_IS_WINDOWS", True)
+    monkeypatch.setattr(auth.time, "sleep", lambda *a: pytest.fail("validation must fail immediately"))
+    monkeypatch.setattr(auth, "_publish_token", lambda *a: pytest.fail("invalid token must not be replaced"))
+    if failure == "symlink":
+        monkeypatch.setattr(auth.os.path, "islink", lambda p: True)
+    elif failure == "security":
+        def reject(*args):
+            raise auth.TokenError("not a regular file")
+        monkeypatch.setattr(auth, "_check_open_file", reject)
+    with pytest.raises(auth.TokenError):
+        auth.load_or_create_token(path)
+    assert path.read_bytes() == before
 
 
 def _expect_locked(path, match):
