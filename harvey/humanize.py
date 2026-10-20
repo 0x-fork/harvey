@@ -29,7 +29,7 @@ SKILL_PATH = Path(
     )
 )
 MERGE_VAR = re.compile(r"\{\{\s*\w+\s*\}\}")
-MAX_GROWTH = 1.2  # a rewrite may not be more than 20% longer than the draft
+MAX_GROWTH_WORDS = 2  # a rewrite may not be more than two words longer
 # A rewrite that talks about itself instead of being the email.
 META_PREFIXES = ("i can't", "i cannot", "as an ai", "sorry,", "here is", "here's")
 
@@ -67,7 +67,8 @@ def _acceptable(original: dict, rewrite) -> bool:
         return False
     if "—" in after and "—" not in before:
         return False
-    return len(body.split()) <= len(original["body"].split()) * MAX_GROWTH + 2
+    # The writer's word caps were met by the draft; an edit must not undo that.
+    return len(body.split()) <= len(original["body"].split()) + MAX_GROWTH_WORDS
 
 
 async def humanize(
@@ -76,10 +77,11 @@ async def humanize(
 ) -> list[dict]:
     """Return ``drafts`` ({"subject", "body"} dicts) rewritten by the skill.
 
-    A no-op unless ``enabled`` (see ``humanizer_enabled``).
-
-    One brain call for the whole list. Any draft whose rewrite fails a check
-    comes back unchanged, so the result always has the same length and order.
+    A no-op unless ``enabled`` (see ``humanizer_enabled``). One brain call
+    per draft: personal drafts carry real names and companies, so a batched
+    call that came back reordered could hand one prospect another's email.
+    Any draft whose rewrite fails a check comes back unchanged, so the
+    result always has the same length and order.
     """
     if not enabled or not drafts:
         return drafts
@@ -87,49 +89,45 @@ async def humanize(
     if not skill:
         return drafts
 
-    payload = [{"subject": d.get("subject", ""), "body": d["body"]} for d in drafts]
-    prompt = f"""{skill}
-
----
-
-Apply the Humanizer instructions above to the cold-email drafts below. They
-are short plain-text business emails, so return email text only.
-
-Hard limits on the rewrite, on top of the instructions above:
-- Same number of items, same order.
-- Keep every merge variable such as {{{{first_name}}}} or {{{{company}}}} exactly as written.
-- Add no fact, name, number or claim that is not already in the draft.
-- No em dashes, no bullets, no bold, no exclamation marks.
-- Do not make any email longer. Keep exactly one question per email.
-- Subjects stay lowercase, 2-5 words. An empty subject stays empty.
-
-Drafts:
-{json.dumps(payload, ensure_ascii=False, indent=2)}
-
-Return ONLY a JSON array: [{{"subject": "...", "body": "..."}}, ...]"""
-
-    try:
-        result = await brain.think_json(
-            prompt, session_id="harvey-humanizer", agent=agent, task="humanize",
-        )
-    except Exception as e:
-        logger.warning(f"Humanizer pass failed, keeping drafts: {e}")
-        return drafts
-    if not isinstance(result, list) or len(result) != len(drafts):
-        logger.warning("Humanizer pass returned the wrong shape, keeping drafts.")
-        return drafts
-
-    out = []
-    for original, rewrite in zip(drafts, result):
-        if _acceptable(original, rewrite):
-            out.append({
-                **original,
-                "subject": str(rewrite.get("subject") or "").strip(),
-                "body": str(rewrite["body"]).strip(),
-            })
-        else:
-            out.append(original)
+    out = [await _humanize_one(brain, skill, draft, agent) for draft in drafts]
     kept = sum(1 for a, b in zip(drafts, out) if a is b)
     if kept:
         logger.info(f"Humanizer: kept {kept} of {len(drafts)} draft(s) unchanged after checks.")
     return out
+
+
+async def _humanize_one(brain, skill: str, draft: dict, agent: str) -> dict:
+    payload = {"subject": draft.get("subject", ""), "body": draft["body"]}
+    prompt = f"""{skill}
+
+---
+
+Apply the Humanizer instructions above to the cold-email draft below. It is
+a short plain-text business email, so return email text only.
+
+Hard limits on the rewrite, on top of the instructions above:
+- Keep every merge variable such as {{{{first_name}}}} or {{{{company}}}} exactly as written.
+- Add no fact, name, number or claim that is not already in the draft.
+- No em dashes, no bullets, no bold, no exclamation marks.
+- Do not make the email longer. Keep exactly one question.
+- The subject stays lowercase, 2-5 words. An empty subject stays empty.
+
+Draft:
+{json.dumps(payload, ensure_ascii=False, indent=2)}
+
+Return ONLY a JSON object: {{"subject": "...", "body": "..."}}"""
+
+    try:
+        rewrite = await brain.think_json(
+            prompt, session_id="harvey-humanizer", agent=agent, task="humanize",
+        )
+    except Exception as e:
+        logger.warning(f"Humanizer pass failed, keeping draft: {e}")
+        return draft
+    if not _acceptable(draft, rewrite):
+        return draft
+    return {
+        **draft,
+        "subject": str(rewrite.get("subject") or "").strip(),
+        "body": str(rewrite["body"]).strip(),
+    }

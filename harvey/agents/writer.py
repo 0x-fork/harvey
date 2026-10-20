@@ -11,6 +11,7 @@ design). Every draft still passes the deterministic pre-send gate.
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
 
 from harvey.brain import Brain
@@ -21,6 +22,9 @@ from harvey.models.campaign import Campaign, EmailStep
 from harvey.state import StateManager
 
 logger = logging.getLogger("harvey.writer")
+
+# Merge variables that name a person; a company inbox has none of them.
+PERSON_VAR = re.compile(r"\{\{\s*(first_name|last_name|title)\s*\}\}")
 
 # Native mode: one Claude call per prospect for email 1, so batches stay
 # small — the rest of the 'new' pool is picked up on later cycles.
@@ -332,6 +336,13 @@ Return ONLY a JSON array (no markdown fences, no commentary):
             agent="writer", task="write_sequence",
         )
         steps = self._parse_sequence(result)
+        if inbox_batch and any(
+            PERSON_VAR.search(s.subject + s.body) for s in steps
+        ):
+            # Nobody's name is known: "Hi {{first_name}}" or "as {{title}}"
+            # would render as "Hi there" at best and "as General inbox" at worst.
+            logger.warning("Writer: inbox sequence used a person merge variable; discarding it.")
+            return []
         polished = await humanize(
             self.brain, [{"subject": s.subject, "body": s.body} for s in steps],
             agent="writer", enabled=humanizer_enabled(self.config),

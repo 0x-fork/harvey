@@ -226,7 +226,7 @@ Agency detection is the compounding one. Almost every agency credits itself in t
 
 Free public registries first. Name plus title from the team page, confirmed against an authoritative registry where one exists — which also filters out your own parsing artifacts, because a "person" who matches nothing usually wasn't one.
 
-When a company's site names nobody and Harvey has no contact there yet — common for small trades — it falls back to a general address the company prints on its own homepage or contact page (`owner@`, `office@`, `info@` preferred; `careers@`, `noreply@` and similar skipped). It is never guessed, it is verified like any other address, and those emails greet the company's team instead of a first name.
+When a company's site names nobody and Harvey has no contact there yet — common for small trades — it falls back to a general address the company prints on its own homepage or contact page (only general mailboxes such as `owner@`, `office@`, `info@` or `hello@`, never a person's own address). It is never guessed, it is verified like any other address, and those emails greet the company's team instead of a first name.
 
 ### 4. VERIFY — can you reach them
 

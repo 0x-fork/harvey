@@ -79,6 +79,33 @@ async def test_published_address_without_mail_server_is_invalid(monkeypatch):
     assert await ef.verify_published_address("info@acme.com") == "invalid"
 
 
+@pytest.mark.parametrize("deliverable, expected", [(True, "valid"), ("false", "unknown"), (None, "unknown")])
+@pytest.mark.asyncio
+async def test_reoon_role_account_needs_a_real_deliverable_flag(monkeypatch, deliverable, expected):
+    class Resp:
+        status_code = 200
+
+        def json(self):
+            return {"status": "role_account", "is_deliverable": deliverable}
+
+    class Client:
+        def __init__(self, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, params=None):
+            return Resp()
+
+    monkeypatch.setattr(ef.httpx, "AsyncClient", Client)
+    verdict = await ef.verify_reoon("info@acme.com", "key")
+    assert verdict["status"] == expected
+
+
 # ── scout ──
 
 PAGES = {
@@ -129,6 +156,24 @@ async def test_inbox_prospect_carries_its_verification(monkeypatch):
     p = await make_scout(PAGES)._company_inbox_prospect("c1", "acme.com", "Acme Roofing", "Roofing")
     assert p.email == "office@acme.com" and p.email_status == "verified"
     assert p.is_company_inbox and p.company_id == "c1"
+
+
+@pytest.mark.asyncio
+async def test_a_personal_address_is_not_a_company_inbox():
+    # Jane may have been skipped on purpose as non-ICP; she isn't "the team".
+    pages = {"https://acme.com": "Jane Doe, receptionist: jane.doe@acme.com"}
+    assert await make_scout(pages)._find_inbox_address("acme.com") == ""
+
+
+@pytest.mark.parametrize("html", [
+    '<a href="mailto:%20info@acme.com">Email</a>',
+    '<a href="MAILTO:Info@Acme.com?subject=Quote">Email</a>',
+    "Email us at info@acme.com.",
+    "Email us at %20info@acme.com",
+])
+@pytest.mark.asyncio
+async def test_published_address_is_cleaned(html):
+    assert await make_scout({"https://acme.com": html})._find_inbox_address("acme.com") == "info@acme.com"
 
 
 # ── fallback only when the company has nobody ──
@@ -209,3 +254,46 @@ def test_inbox_prospects_get_their_own_campaign():
     named = Prospect(first_name="Jo", last_name="Li", title="Owner", industry="Roofing", email="jo@a.com")
     batches = writer._group_prospects([named, inbox(industry="Roofing")])
     assert set(batches) == {"Roofing-outreach", "Roofing-inbox-outreach"}
+
+
+class SequenceBrain:
+    def __init__(self, steps):
+        self.steps = steps
+
+    def load_prompt(self, name, **kw):
+        return "prompt"
+
+    async def think_json(self, prompt, **kw):
+        return self.steps
+
+
+def sequence_writer(steps):
+    from harvey.agents.writer import Writer
+    writer = Writer.__new__(Writer)
+    writer.brain = SequenceBrain(steps)
+    writer.skills = ""
+    writer.config = SimpleNamespace(
+        product=SimpleNamespace(name="P", description="D", key_benefits=[], pricing=""),
+        persona=SimpleNamespace(name="S", company="C", role="R", tone="t"),
+    )
+    return writer
+
+
+@pytest.mark.parametrize("var", ["{{first_name}}", "{{last_name}}", "{{title}}"])
+@pytest.mark.asyncio
+async def test_inbox_sequence_using_a_person_variable_is_rejected(var):
+    # "as General inbox at Acme" must never be rendered and sent.
+    steps = [
+        {"step": 1, "subject": "quick one", "body": f"Hi {var}, who answers at {{{{company}}}}?", "delay_days": 0},
+        {"step": 2, "subject": "following up", "body": "Still curious about {{company}}?", "delay_days": 3},
+    ]
+    assert await sequence_writer(steps)._write_sequence([inbox(industry="Roofing")]) == []
+
+
+@pytest.mark.asyncio
+async def test_inbox_sequence_with_company_only_is_kept():
+    steps = [
+        {"step": 1, "subject": "quick one", "body": "Hi there, who answers at {{company}}?", "delay_days": 0},
+    ]
+    out = await sequence_writer(steps)._write_sequence([inbox(industry="Roofing")])
+    assert [s.body for s in out] == ["Hi there, who answers at {{company}}?"]

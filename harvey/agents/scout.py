@@ -30,7 +30,7 @@ import logging
 import random
 import re
 from datetime import datetime, timezone
-from urllib.parse import parse_qs, quote_plus, urlparse
+from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -58,17 +58,15 @@ BACKOFF_BASE = 1.5  # seconds; grows exponentially per attempt
 MAX_RESULTS_PER_QUERY = 20
 MAX_COMPANIES_PER_CYCLE = 10
 
-# Company-inbox fallback: pages that publish a general address, the
-# mailboxes most likely read by the owner (best first), and addresses that
-# never reach a decision-maker.
+# Company-inbox fallback: pages that publish a general address, and the
+# only mailboxes it will use, most likely read by the owner first. An
+# allowlist, not a blocklist: a personal address (jane.doe@) on a contact
+# page is a person Harvey chose not to target, never "the team".
 INBOX_PAGES = ("/contact", "/contact-us")
-INBOX_PREFERRED = ("owner", "office", "info", "contact", "service", "hello",
-                   "sales", "admin", "support")
-INBOX_SKIP_LOCALS = {
-    "noreply", "no-reply", "donotreply", "careers", "jobs", "hr", "billing",
-    "accounting", "invoices", "ap", "press", "media", "marketing", "privacy",
-    "webmaster", "abuse", "postmaster", "example", "email", "name", "your",
-}
+INBOX_PREFERRED = ("owner", "office", "info", "contact", "contactus", "hello",
+                   "team", "service", "sales", "estimates", "quotes",
+                   "inquiries", "enquiries", "admin", "support")
+INBOX_ADDRESS = re.compile(r"[a-z0-9._+\-]+@[a-z0-9.\-]+\.[a-z]{2,}")
 MAX_PROSPECTS_PER_CYCLE = 25
 
 # Hunter domain-searches per heartbeat. The monthly budget itself is shared
@@ -1461,10 +1459,10 @@ Respond ONLY with the JSON array."""
             self._remember_prospect(prospect)
             contacts.append(prospect)
 
-        # The inbox is a last resort for a company nobody at Harvey has a
-        # contact for. A named person found here (even one skipped as a
-        # duplicate on a revisit) or already on file from another source
-        # means the company is covered: never email it a second time.
+        # The inbox is a last resort for a company Harvey has no contact at.
+        # A named person found here (even one skipped as a duplicate on a
+        # revisit) or already on file from another source means the
+        # company is covered, so its inbox isn't added on top.
         if not contacts and not named_on_site and await self._company_uncontacted(company_id):
             inbox = await self._company_inbox_prospect(
                 company_id, domain, company_name, industry, signal_note,
@@ -1540,25 +1538,23 @@ Respond ONLY with the JSON array."""
                 for a in soup.find_all("a", href=True):
                     href = self._attr_str(a.get("href"))
                     if href.lower().startswith("mailto:"):
-                        found.append(href[7:].split("?")[0])
-            found += re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", text[:50000])
+                        found.append(unquote(href[7:].split("?")[0]))
+            found.append(unquote(text[:50000]))
 
+        # Pull clean addresses out of everything found ("%20info@x.com",
+        # a trailing full stop), then keep only general on-domain inboxes.
         candidates = []
-        for addr in found:
-            addr = addr.strip().lower()
-            local, _, adomain = addr.partition("@")
-            if adomain.removeprefix("www.") != domain or local in INBOX_SKIP_LOCALS:
-                continue
-            if addr not in candidates:
-                candidates.append(addr)
+        for chunk in found:
+            for addr in INBOX_ADDRESS.findall(chunk.lower()):
+                addr = addr.rstrip(".")
+                local, _, adomain = addr.partition("@")
+                if adomain.removeprefix("www.") != domain or local not in INBOX_PREFERRED:
+                    continue
+                if addr not in candidates:
+                    candidates.append(addr)
         if not candidates:
             return ""
-
-        def rank(addr: str) -> int:
-            local = addr.partition("@")[0]
-            return INBOX_PREFERRED.index(local) if local in INBOX_PREFERRED else len(INBOX_PREFERRED)
-
-        return min(candidates, key=rank)
+        return min(candidates, key=lambda a: INBOX_PREFERRED.index(a.partition("@")[0]))
 
     # ── Strategy 4: Job boards — companies hiring for signal roles ──
 
