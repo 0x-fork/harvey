@@ -8,6 +8,7 @@ import pytest_asyncio
 
 from harvey.collectors.profile import ProfileCollector, title_looks_like_role, _strip_code
 from harvey.models.company import Company
+from harvey.models.prospect import Prospect
 from harvey.signals import SIGNAL_CATALOG, seed_signal_catalog
 from harvey.state import StateManager
 
@@ -225,3 +226,65 @@ async def test_profile_upgrades_a_name_the_domain_does_not_back(state, monkeypat
     assert names["managementharbor.com"] == "Management Harbor"
     assert names["birchmgt.com"] == "Birch Management"   # already right: untouched
     assert names["growwithus.us"] == "Grow Community Management"   # was domain-derived
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("current,domain,homepage,expected", [
+    ("Roofing Services in Denver", "kettlemanroofing.com", "Kettleman Roofing", "Kettleman Roofing"),
+    ("Plumbing Services in Austin", "acmeplumbing.com", "Acme Plumbing", "Acme Plumbing"),
+    ("Contact Us", "contactcraft.com", "ContactCraft", "ContactCraft"),
+    ("Birch Management", "birchmgt.com", "Birch Management Group", "Birch Management"),
+    ("NVCM", "nvcmnet.com", "NVCM Group", "NVCM"),
+    ("Northvale Association of Community Managers", "nacm.org",
+     "Northvale Association of Community Managers Group", "Northvale Association of Community Managers"),
+    ("Grow With Us", "growwithus.us", "Grow Community Management", "Grow Community Management"),
+    ("Roofing Services in Denver", "kettlemanroofing.com", "", "Roofing Services in Denver"),
+])
+async def test_profile_repairs_weak_names_and_retains_brands(
+        state, monkeypatch, current, domain, homepage, expected):
+    cid = await state.add_company(Company(name=current, domain=domain))
+    pid = await state.add_prospect(Prospect(company_id=cid, company=current,
+                                            first_name="Test", last_name="Person"))
+
+    async def fake_resolve(self, domain):
+        return f"https://{domain}", f"<title>{homepage}</title>"
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(ProfileCollector, "_resolve_site", fake_resolve)
+    monkeypatch.setattr("harvey.collectors.profile.asyncio.sleep", no_sleep)
+    async with ProfileCollector(state, set()) as c:
+        await c.run([{"id": cid, "name": current, "domain": domain}])
+    import sqlite3
+    with sqlite3.connect(state.db_path) as db:
+        assert db.execute("SELECT name FROM companies WHERE id = ?", (cid,)).fetchone() == (expected,)
+        assert db.execute("SELECT company FROM prospects WHERE id = ?", (pid,)).fetchone() == (expected,)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("industry", ["Landscaping", "Electrical"])
+@pytest.mark.parametrize("use_fallback", [False, True])
+async def test_profile_uses_homepage_brand_over_service_location_title(
+        state, monkeypatch, industry, use_fallback):
+    from harvey.collectors.discover import name_from_domain
+    domain = f"kettleman{industry.lower()}.com"
+    brand = f"Kettleman {industry}"
+    label = f"{industry} Services in Denver"
+    current = name_from_domain(domain) if use_fallback else label
+    cid = await state.add_company(Company(name=current, domain=domain))
+    pid = await state.add_prospect(Prospect(company_id=cid, company=current))
+
+    async def fake_resolve(self, domain):
+        return f"https://{domain}", (
+            f'<meta property="og:site_name" content="{brand}"><title>{label}</title>')
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(ProfileCollector, "_resolve_site", fake_resolve)
+    monkeypatch.setattr("harvey.collectors.profile.asyncio.sleep", no_sleep)
+    async with ProfileCollector(state, set()) as c:
+        await c.run([{"id": cid, "name": current, "domain": domain}])
+    assert (await state.get_company_by_domain(domain)).name == brand
+    assert (await state.get_prospect(pid)).company == brand

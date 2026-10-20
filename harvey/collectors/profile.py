@@ -505,7 +505,8 @@ class ProfileCollector:
     async def _improve_name(self, company: dict, domain: str):
         """Replace a name the domain doesn't back up ("Denver, CO | HOA
         Management Firm") or one merely derived from the domain ("Grow With
-        Us") with the one the homepage gives itself. A real match is kept."""
+        Us") with the one the homepage gives itself. Only a distinctive brand match
+        is kept; generic industry and navigation text does not establish identity."""
         better = self.site_names.pop(company["id"], "")
         current = company.get("name") or ""
         fallback = current == name_from_domain(domain)
@@ -573,3 +574,4 @@ async def profile_companies(state, companies: list[dict]) -> tuple[int, str]:
     except Exception as e:
         await state.finish_run(run_id, status="failed", error=str(e))
         raise
+

@@ -15,7 +15,7 @@ import pytest
 import pytest_asyncio
 
 from harvey.collectors import discover as D
-from harvey.config import load_config
+from harvey.config import EnvConfig, load_config
 from harvey.signals import SIGNAL_CATALOG, seed_signal_catalog
 from harvey.state import StateManager
 
@@ -698,3 +698,69 @@ def test_site_name_prefers_og_then_title_and_needs_domain_backing():
     assert D.site_name_from_html(both, "managementharbor.com") == "The Management Harbor"
     assert D.site_name_from_html("<title>Attention Required! | Cloudflare</title>",
                                  "lumenam.com") == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('provider', ['serper', 'dataforseo_serp'])
+async def test_directory_title_still_filtered_after_adapter(provider, tmp_path, monkeypatch):
+    title = 'Top 10 Roofing Companies in Denver'
+    domain = 'milehighguide.com'
+    assert D.is_junk(domain, title)
+    item = {'title': title, 'link': f'https://{domain}/roofers',
+            'url': f'https://{domain}/roofers', 'domain': domain,
+            'position': 1, 'rank_group': 1, 'type': 'organic'}
+    valid = dict(item, title='Kettleman Roofing | Denver',
+                 domain='kettlemanroofing.com', link='https://kettlemanroofing.com',
+                 url='https://kettlemanroofing.com', position=2, rank_group=2)
+    payload = ({'organic': [item, valid]} if provider == 'serper' else
+               {'status_code': 20000, 'tasks': [{'status_code': 20000,
+                 'result': [{'items': [item, valid]}]}]})
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(D.httpx, 'AsyncClient', lambda **kw: real_client(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json=payload)), **kw))
+    monkeypatch.setattr('harvey.config.load_env', lambda: EnvConfig(
+        serper_api_key='dummy', dataforseo_login='dummy', dataforseo_password='dummy'))
+    state = StateManager(str(tmp_path / 'test.db'))
+    await state.init_db()
+    await seed_signal_catalog(state)
+    for signal in SIGNAL_CATALOG:
+        await state.set_signal_status(signal['code'], 'confirmed')
+    report = await D.run_discovery(state, load_config(), provider_key=provider,
+        queries=[D.DiscoveryQuery(term='roofer', location='Denver')])
+    assert report.errors == []
+    assert report.junk == 1, report.as_dict()
+    assert report.found == 2
+    assert report.new_companies == 1
+    import sqlite3
+    with sqlite3.connect(state.db_path) as db:
+        assert db.execute("SELECT domain, name FROM companies").fetchall() == [
+            ("kettlemanroofing.com", "Kettleman Roofing")]
+
+
+@pytest.mark.parametrize('title,domain,expected', [
+    ('Contact Us | ContactCraft', 'contactcraft.com', 'ContactCraft'),
+    ('Craft | ContactCraft', 'contactcraft.com', 'ContactCraft'),
+    ('Roofing Services in Denver | Kettleman Roofing', 'kettlemanroofing.com', 'Kettleman Roofing'),
+    ('Plumbing Services in Austin | Acme Plumbing', 'acmeplumbing.com', 'Acme Plumbing'),
+])
+def test_brand_wins_over_generic_service_segment(title, domain, expected):
+    assert D.business_name(title, domain) == expected
+
+
+@pytest.mark.parametrize("service,brand,domain", [
+    ("Landscaping", "Kettleman Landscaping", "kettlemanlandscaping.com"),
+    ("Electrical", "Kettleman Electrical", "kettlemanelectrical.com"),
+])
+def test_service_location_labels_do_not_establish_brand_identity(service, brand, domain):
+    label = f"{service} Services in Denver"
+    assert not D.name_matches_domain(label, domain)
+    assert D.business_name(f"{label} | {brand}", domain) == brand
+    html = f'<meta property="og:site_name" content="{brand}"><title>{label}</title>'
+    assert D.site_name_from_html(html, domain) == brand
+    assert D.site_name_from_html(f"<title>{label}</title>", domain) == ""
+
+
+def test_homepage_prefers_stronger_brand_over_longer_partial_match():
+    html = ('<meta property="og:site_name" content="Kettleman Landscaping">'
+            '<title>Landscaping Professionals</title>')
+    assert D.site_name_from_html(html, "kettlemanlandscaping.com") == "Kettleman Landscaping"
