@@ -218,6 +218,12 @@ Cities geocode themselves (cached forever, one lookup each). Directories, aggreg
 
 **Free.** Three HTTP requests per business. No browser, no model call. This is the highest value-per-effort stage in the whole system, because it produces the facts that make an email specific.
 
+Website requests from Scout, Profile, and the local training crawler are limited
+to public HTTP(S) destinations. Every DNS answer and redirect is checked; local,
+private, link-local, and metadata addresses are rejected. Connections use a
+validated IP while preserving the website's TLS identity. These website clients
+ignore environment proxies, so proxy routing cannot bypass that boundary.
+
 Homepage, `robots.txt`, `sitemap.xml`, plus the team and careers pages when they exist — then regex over HTML already in hand. Out comes the incumbent agency, the ad pixels, the missing schema, the abandoned blog, the open roles, the named humans.
 
 Agency detection is the compounding one. Almost every agency credits itself in the footer, and Harvey scores the wording: *"Powered by"* / *"Website by"* → 0.9 confidence; a bare descriptive link → 0.75; an unlabelled link → 0.35 and **not recorded**. A wrong incumbent in an email is worse than saying nothing.
@@ -326,6 +332,13 @@ Before anything leaves, a **deterministic pre-send gate** — no model involved 
 Optionally, the same step can ask [Precleared](https://precleared.dev) whether cold email to each new address is allowed before the first one goes out. See [Legal and deliverability](#legal-and-deliverability).
 
 When you trust it, set `channels.email.require_approval: false` for full autopilot.
+
+**Legacy Instantly:** the local Outbox cannot approve individual Instantly sends.
+With `require_approval: true`, Harvey holds campaign deployment (including
+activation retries) and routes replies to a human. Choose Gmail, Microsoft 365,
+or SMTP for the approval queue. Set `require_approval: false` explicitly to use
+Instantly's automatic sending. This does not pause campaigns already running
+on Instantly; manage those in Instantly itself.
 
 ---
 
@@ -478,6 +491,10 @@ Harvey automates outreach, but **you are the sender.** Cold email is legal in mo
 **Bot disclosure.** Some jurisdictions require disclosing automation. Harvey is instructed to answer truthfully, always, if a prospect asks whether they're talking to an AI. Never configure it otherwise.
 
 **LinkedIn.** Browser automation violates LinkedIn's ToS and can get the account restricted. Off by default. If you turn it on, use an account you can afford to lose.
+
+LinkedIn requires both `channels.linkedin.enabled: true` and configured
+credentials. Training a product does not enable it; the setup wizard records
+your explicit choice.
 
 **Deliverability — warm up or burn out.** Sending cold email from your main domain, or at volume on day one, lands you in spam permanently.
 

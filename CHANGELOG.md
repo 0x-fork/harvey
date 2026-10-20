@@ -9,6 +9,13 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- Keep local website requests out of private networks, including redirects and
+  DNS rebinding. Preserve the original hostname for TLS verification.
+- Hold legacy Instantly campaign deployment and replies when approval is
+  required, instead of silently bypassing the setting. Instantly autopilot now
+  requires explicitly setting `channels.email.require_approval: false`.
+- Disable LinkedIn by default in the model, sample config, and product trainer;
+  save the setup wizard's explicit LinkedIn choice when updating a config.
 - Protect the local dashboard with an access token, restrict requests to trusted
   local origins, and save settings with owner-only permissions. Update and restart
   Harvey, then open the dashboard link printed in your terminal.

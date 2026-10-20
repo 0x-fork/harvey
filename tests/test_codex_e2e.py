@@ -593,7 +593,8 @@ async def test_instantly_reply_survives_an_outage_while_drafting(harvey):
 
     await harvey.state.init_db()
     _, convo_id = await _open_thread(harvey.state)
-    config = HarveyConfig(**{**BASE, "channels": {"email": {"provider": "instantly"}},
+    config = HarveyConfig(**{**BASE, "channels": {"email": {
+                                "provider": "instantly", "require_approval": False}},
                              "brain": {"provider": "codex", "model": "gpt-5.5"}})
     brain = Brain(harvey.state, config.brain)
     handler = Handler(brain=brain, state=harvey.state, config=config, env=EnvConfig())

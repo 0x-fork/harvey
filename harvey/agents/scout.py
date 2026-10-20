@@ -41,6 +41,7 @@ from harvey.integrations.email_finder import find_email, verify_published_addres
 from harvey.integrations.linkedin import LinkedInAutomation
 from harvey.models.company import Company
 from harvey.models.prospect import COMPANY_INBOX_SOURCE, Prospect
+from harvey.public_http import public_http_client
 from harvey.state import StateManager
 
 logger = logging.getLogger("harvey.scout")
@@ -248,9 +249,7 @@ class Scout:
         last_status = None
         for attempt in range(retries):
             try:
-                async with httpx.AsyncClient(
-                    timeout=timeout, follow_redirects=True
-                ) as client:
+                async with public_http_client(timeout=timeout) as client:
                     resp = await client.request(
                         method,
                         url,

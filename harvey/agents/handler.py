@@ -344,6 +344,18 @@ class Handler:
                 response, prospect, convo, reply_meta or {}, intent
             )
         elif reply_uuid:
+            if getattr(self.config.channels.email, "require_approval", True):
+                await self.state.update_conversation(convo.id, status="needs_human")
+                await self.state.log_action(
+                    action_type="escalation", agent="handler",
+                    details={"prospect_email": lead_email, "reason": "instantly_approval_required"},
+                )
+                logger.warning(
+                    "Handler: Instantly reply held for human handling because "
+                    "require_approval is true. Use a native provider for outbox "
+                    "review, or explicitly disable require_approval for autopilot."
+                )
+                return
             result = await self.instantly.send_reply(reply_uuid, response)
             if result is not None:
                 # Add our response to conversation

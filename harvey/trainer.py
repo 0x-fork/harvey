@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 
 from harvey.brain import Brain
 from harvey.config import BrainConfig, load_brain_config
+from harvey.public_http import public_http_client
 from harvey.state import StateManager
 
 logger = logging.getLogger("harvey.trainer")
@@ -210,9 +211,8 @@ class FallbackCrawler:
         # Queue starts with priority paths, then discovered links
         queue: list[str] = [urljoin(base_url, p) for p in FALLBACK_PATHS]
 
-        async with httpx.AsyncClient(
+        async with public_http_client(
             timeout=15,
-            follow_redirects=True,
             headers={
                 "User-Agent": (
                     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -762,7 +762,7 @@ What prospects do instead of buying a solution like ours:
                     "max_daily_sends": 50,
                 },
                 "linkedin": {
-                    "enabled": True,
+                    "enabled": False,
                     "max_daily_connections": 20,
                     "max_daily_messages": 10,
                 },
