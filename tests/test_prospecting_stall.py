@@ -54,12 +54,28 @@ async def test_guessed_emails_alone_lead_back_to_prospecting(state):
 
 
 @pytest.mark.asyncio
-async def test_many_guessed_emails_still_lead_back_to_prospecting(state):
-    # 20+ unusable prospects must not tip Harvey into idle either.
-    for n in range(25):
+async def test_a_backlog_of_unusable_prospects_stops_spending_and_says_why(state):
+    # With no usable email at all (say, no verifier key), prospecting every
+    # cycle would burn search and verifier credits on people Harvey can
+    # never email. At the backlog cap it idles, and status explains why.
+    from harvey.main import PROSPECT_BACKLOG, unusable_backlog_notice
+    for n in range(PROSPECT_BACKLOG):
         await add(state, n, f"p{n}@co{n}.test", "guess")
     summary = await state.get_state_summary()
-    assert await decide_next_action(None, state, CONFIG, summary=summary) == "prospect"
+    assert await decide_next_action(None, state, CONFIG, summary=summary) == "idle"
+    notice = unusable_backlog_notice(summary)
+    assert str(PROSPECT_BACKLOG) in notice and "verifier" in notice
+
+
+@pytest.mark.asyncio
+async def test_no_backlog_notice_while_things_are_moving(state):
+    from harvey.main import unusable_backlog_notice
+    await add(state, 1, "p1@co1.test", "guess")
+    assert unusable_backlog_notice(await state.get_state_summary()) == ""
+    await add(state, 2, "p2@co2.test", "verified")
+    for n in range(3, 30):
+        await add(state, n, f"p{n}@co{n}.test", "guess")
+    assert unusable_backlog_notice(await state.get_state_summary()) == ""
 
 
 @pytest.mark.asyncio

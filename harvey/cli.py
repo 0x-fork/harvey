@@ -203,6 +203,8 @@ def cmd_status(args):
         print("\n  Harvey Pipeline Status")
         print("  " + "=" * 40)
         print(f"  Prospects:            {summary['prospects']}")
+        print(f"  Ready to write for:   {summary.get('writable_prospects', 0)} "
+              "(new, with a verified or catch-all email)")
         print(f"  Draft campaigns:      {summary['draft_campaigns']}")
         print(f"  Active campaigns:     {summary['active_campaigns']}")
         print(f"  Open conversations:   {summary['open_conversations']}")
@@ -216,6 +218,12 @@ def cmd_status(args):
             # Status must still print when harvey.yaml is broken; that's
             # when people run it. The --check path reports config errors.
             notice = ""
+        from harvey.main import unusable_backlog_notice
+        backlog = unusable_backlog_notice(summary)
+        if backlog:
+            print("  Prospecting:          PAUSED")
+            print(textwrap.fill(backlog, width=72, initial_indent="                        ",
+                                subsequent_indent="                        "))
         if notice:
             print("  Sending:              HELD")
             print(textwrap.fill(notice, width=72, initial_indent="                        ",
