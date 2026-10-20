@@ -895,32 +895,35 @@ async def outbox_edit(item_id: str, request: Request):
         body = {}
     subject = str(body.get("subject") or "").strip()
     text = str(body.get("body") or "").strip()
-    if not subject or not text:
-        return JSONResponse({"success": False, "message": "Subject and body are both required."},
-                            status_code=400)
-    # The sender re-checks every email before it goes out; an edit it would
-    # block is refused now, while the reviewer can still fix it, instead of
-    # failing quietly at send time. Content rules only: the recipient isn't
-    # something an edit can change.
-    from harvey.gate import pre_send_check
-    gate = pre_send_check("reviewer@example.com", subject, text)
-    if not gate:
-        return JSONResponse({"success": False,
-                             "message": "The sender would have blocked this: "
-                                        + "; ".join(gate.reasons)},
-                            status_code=400)
     try:
         state = _state()
         await state.init_db()
         item = await state.get_outbox_item(item_id)
-        if item and item.get("kind") == "reply" and subject != (item.get("subject") or "").strip():
-            # Gmail threads a reply by its subject: a new one would land as a
-            # fresh, unthreaded email to someone who wrote in.
+        if not item or item.get("status") != "pending_review":
             return JSONResponse({"success": False,
-                                 "message": "A reply keeps its subject so it stays in the "
-                                            "thread. Edit the body only."},
+                                 "message": "Only drafts awaiting review can be edited."},
+                                status_code=409)
+        if item.get("kind") == "reply":
+            # Gmail threads a reply by its subject: a new one would land as a
+            # fresh, unthreaded email to someone who wrote in. Only the body
+            # of a reply is editable; its stored subject is kept exactly.
+            subject = item.get("subject") or ""
+        if not subject.strip() or not text:
+            return JSONResponse({"success": False,
+                                 "message": "Subject and body are both required."},
                                 status_code=400)
-        if not item or not await state.edit_outbox_draft(item_id, subject, text):
+        # The sender re-checks every email before it goes out; an edit it
+        # would block is refused now, while the reviewer can still fix it,
+        # instead of failing quietly at send time. Content rules only: the
+        # recipient isn't something an edit can change.
+        from harvey.gate import pre_send_check
+        gate = pre_send_check("reviewer@example.com", subject, text)
+        if not gate:
+            return JSONResponse({"success": False,
+                                 "message": "The sender would have blocked this: "
+                                            + "; ".join(gate.reasons)},
+                                status_code=400)
+        if not await state.edit_outbox_draft(item_id, subject, text):
             return JSONResponse({"success": False,
                                  "message": "Only drafts awaiting review can be edited."},
                                 status_code=409)

@@ -1193,7 +1193,10 @@ async function loadOutbox() {
 
   const pending = data.pending || [];
   _desk.items = pending;
-  if (_desk.editing && !pending.some(p => p.id === _desk.editing)) {
+  // Keep the desk on the draft being edited even if the list shifted.
+  const editingAt = _desk.editing ? pending.findIndex(p => p.id === _desk.editing) : -1;
+  if (editingAt >= 0) _desk.i = editingAt;
+  else if (_desk.editing) {
     _desk.editing = null;
     _desk.unsaved = null;
   }

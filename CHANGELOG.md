@@ -40,8 +40,11 @@ minor versions can still change behaviour.
   tech / agency / hiring / ads / booking signals, and the Writer's notes, so
   every claim can be checked against what Harvey actually found. **Edit** (or
   `E`) turns subject and body into fields; Save rewrites the draft only while
-  it is still `pending_review` and never approves it.
-  `POST /api/outbox/{id}/edit` backs it.
+  it is still `pending_review` and never approves it. An edit the sender
+  would block (merge tags, HTML, banned phrases) is refused on save with the
+  reason; a reply keeps its subject so it stays in the thread; every edit is
+  logged with what it replaced. While editing, the shortcuts and Approve all
+  can't act on the unedited draft. `POST /api/outbox/{id}/edit` backs it.
 
 - **Microsoft 365 mail provider.** Set `channels.email.provider: microsoft` to
   send and read through a Microsoft 365 / Outlook mailbox via Microsoft Graph,

@@ -127,12 +127,26 @@ def test_a_reply_keeps_its_subject_so_it_stays_in_the_thread(client):
     state, item_id = asyncio.run(_seed(client.db_path, kind="reply"))
     r = client.post(f"/api/outbox/{item_id}/edit",
                     json={"subject": "something new", "body": "Thanks, Tuesday works."})
-    assert r.status_code == 400
-    assert "thread" in r.json()["message"]
-    r = client.post(f"/api/outbox/{item_id}/edit",
-                    json={"subject": "your client portal", "body": "Thanks, Tuesday works."})
     assert r.json() == {"success": True}
-    assert asyncio.run(state.get_outbox_item(item_id))["body"] == "Thanks, Tuesday works."
+    item = asyncio.run(state.get_outbox_item(item_id))
+    assert item["subject"] == "your client portal"
+    assert item["body"] == "Thanks, Tuesday works."
+
+
+def test_a_reply_with_a_folded_subject_can_still_have_its_body_edited(client):
+    state, item_id = asyncio.run(_seed(client.db_path, kind="reply"))
+
+    async def fold():
+        async with aiosqlite.connect(client.db_path) as db:
+            await db.execute("UPDATE outbox SET subject = 'Re: your client\n portal' WHERE id = ?",
+                             (item_id,))
+            await db.commit()
+    asyncio.run(fold())
+    # The browser's <input> drops the newline; the server keeps the original.
+    r = client.post(f"/api/outbox/{item_id}/edit",
+                    json={"subject": "Re: your client portal", "body": "Tuesday works."})
+    assert r.json() == {"success": True}
+    assert asyncio.run(state.get_outbox_item(item_id))["subject"] == "Re: your client\n portal"
 
 
 @pytest.mark.parametrize("payload", [[], "text", 5])
