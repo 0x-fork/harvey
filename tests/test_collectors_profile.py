@@ -1,6 +1,7 @@
 """Tests for the free PROFILE collector and the observation model."""
 
 import os
+from contextlib import closing
 import tempfile
 
 import pytest
@@ -221,7 +222,7 @@ async def test_profile_upgrades_a_name_the_domain_does_not_back(state, monkeypat
                      {"id": keep, "name": "Birch Management", "domain": "birchmgt.com"},
                      {"id": derived, "name": "Grow With Us", "domain": "growwithus.us"}])
     import sqlite3
-    with sqlite3.connect(state.db_path) as db:
+    with closing(sqlite3.connect(state.db_path)) as db:
         names = dict(db.execute("SELECT domain, name FROM companies"))
     assert names["managementharbor.com"] == "Management Harbor"
     assert names["birchmgt.com"] == "Birch Management"   # already right: untouched
@@ -257,7 +258,7 @@ async def test_profile_repairs_weak_names_and_retains_brands(
     async with ProfileCollector(state, set()) as c:
         await c.run([{"id": cid, "name": current, "domain": domain}])
     import sqlite3
-    with sqlite3.connect(state.db_path) as db:
+    with closing(sqlite3.connect(state.db_path)) as db:
         assert db.execute("SELECT name FROM companies WHERE id = ?", (cid,)).fetchone() == (expected,)
         assert db.execute("SELECT company FROM prospects WHERE id = ?", (pid,)).fetchone() == (expected,)
 

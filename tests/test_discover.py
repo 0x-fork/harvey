@@ -8,6 +8,7 @@ anyone, and that directories never make it in.
 
 import asyncio
 import os
+from contextlib import closing
 import tempfile
 
 import httpx
@@ -732,7 +733,7 @@ async def test_directory_title_still_filtered_after_adapter(provider, tmp_path, 
     assert report.found == 2
     assert report.new_companies == 1
     import sqlite3
-    with sqlite3.connect(state.db_path) as db:
+    with closing(sqlite3.connect(state.db_path)) as db:
         assert db.execute("SELECT domain, name FROM companies").fetchall() == [
             ("kettlemanroofing.com", "Kettleman Roofing")]
 
