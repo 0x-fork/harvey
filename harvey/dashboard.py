@@ -802,6 +802,38 @@ async def outbox_approve(item_id: str):
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 
 
+@app.post("/api/prospects/{prospect_id}/sent")
+async def mark_prospect_sent(prospect_id: str, request: Request):
+    """The user sent this email by hand (e.g. from Gmail): record it, or undo it."""
+    try:
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        sent = bool((body or {}).get("sent", True))
+        rows = await query_db("SELECT status FROM prospects WHERE id = ?", (prospect_id,))
+        if not rows:
+            return JSONResponse({"success": False, "message": "unknown prospect"},
+                                status_code=404)
+        current = rows[0].get("status") or "new"
+        # Only toggle between "not sent" and "sent". A prospect who already
+        # replied, booked or closed keeps that status — unticking a box must
+        # never erase a reply.
+        if current not in ("new", "queued", "contacted"):
+            return {"success": True, "sent": True, "status": current}
+        state = _state()
+        await state.init_db()
+        await state.update_prospect_status(prospect_id, "contacted" if sent else "new")
+        await state.log_action(
+            action_type="manual_send" if sent else "manual_send_undone",
+            agent="user",
+            details={"prospect_id": prospect_id},
+        )
+        return {"success": True, "sent": sent}
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)
+
+
 @app.post("/api/outbox/{item_id}/reject")
 async def outbox_reject(item_id: str):
     try:
@@ -865,6 +897,13 @@ async def get_campaigns():
             row["prospect_ids"] = json.loads(row.get("prospect_ids_json", "[]"))
         except (json.JSONDecodeError, TypeError):
             row["prospect_ids"] = []
+        # Who each draft goes to, so the UI can open it in the user's own mail client.
+        ids = row["prospect_ids"]
+        row["recipients"] = await query_db(
+            f"SELECT id, email, first_name, last_name, company, title, status FROM prospects "
+            f"WHERE id IN ({','.join('?' * len(ids))}) AND email != ''",
+            tuple(ids),
+        ) if ids else []
     return rows
 
 

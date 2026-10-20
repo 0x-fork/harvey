@@ -1408,6 +1408,50 @@ async function loadProspects() {
   el.innerHTML = html + '</tbody></table></div>';
 }
 
+// Opens a filled-in compose window in whatever Gmail account the browser is
+// logged into. Nothing is sent from here — the user reads it and presses Send.
+function fillMergeVars(text, r) {
+  const vals = {
+    first_name: r.first_name || 'there', last_name: r.last_name || '',
+    company: r.company || '', title: r.title || '',
+  };
+  return String(text || '').replace(/\{\{\s*(\w+)\s*\}\}/g,
+    (m, k) => (k.toLowerCase() in vals ? vals[k.toLowerCase()] : m));
+}
+
+function openInGmail(ci, si, ri) {
+  const c = _campaigns[ci];
+  const step = c && (c.sequence || [])[si];
+  const r = c && (c.recipients || [])[ri];
+  if (!step || !r) return;
+  const url = 'https://mail.google.com/mail/?view=cm&fs=1' +
+    '&to=' + encodeURIComponent(r.email) +
+    '&su=' + encodeURIComponent(fillMergeVars(step.subject, r)) +
+    '&body=' + encodeURIComponent(fillMergeVars(step.body, r));
+  const left = /\{\{\s*\w+\s*\}\}/.test(fillMergeVars(step.subject, r) + fillMergeVars(step.body, r));
+  // No 'noopener' feature string: with it window.open always returns null,
+  // so a blocked pop-up could not be told apart from a successful one.
+  const w = window.open(url, '_blank');
+  if (!w) {
+    showToast('Your browser blocked the Gmail tab. Allow pop-ups for this page and click again.', 'error');
+    return;
+  }
+  w.opener = null;
+  if (left) showToast('This draft still has a {{placeholder}} in it. Fix it in Gmail before sending.', 'error');
+}
+
+async function markSent(ci, ri, sent) {
+  const r = (_campaigns[ci] && _campaigns[ci].recipients || [])[ri];
+  if (!r) return;
+  const res = await api('/api/prospects/' + encodeURIComponent(r.id) + '/sent', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({sent}),
+  });
+  if (!res || !res.success) showToast('Could not save that. Try again.', 'error');
+  else if (!sent && res.sent) showToast('They already replied, so this stays marked as sent.');
+  loadCampaigns();
+}
+
 async function loadCampaigns() {
   const el = document.getElementById('campaigns-list');
   const data = await api('/api/campaigns');
@@ -1421,12 +1465,24 @@ async function loadCampaigns() {
   let html = '';
   data.forEach((c, i) => {
     let stepsHtml = '';
-    for (const step of (c.sequence || [])) {
+    (c.sequence || []).forEach((step, s) => {
+      const sendBtns = (c.recipients || []).map((r, ri) => {
+        // 'queued' only means Harvey wrote a draft — it is not a send.
+        const sent = ['contacted', 'replied', 'meeting', 'closed', 'lost'].includes(r.status);
+        return '<button class="btn btn-primary btn-sm" onclick="openInGmail(' + i + ',' + s + ',' + ri + ')">' +
+          'Open in Gmail &rarr; ' + escHtml(r.email) + '</button>' +
+          '<label style="display:inline-flex;align-items:center;gap:4px;font-size:13px;cursor:pointer">' +
+          '<input type="checkbox"' + (sent ? ' checked' : '') +
+          ' onchange="markSent(' + i + ',' + ri + ',this.checked)"> ' +
+          (sent ? '&#10003; Sent' : 'Mark as sent') + '</label>';
+      }).join(' ');
       stepsHtml += '<div class="email-step"><div class="step-num">Email ' + escHtml(String(step.step || '?')) +
         (step.delay_days ? ' &middot; send after ' + escHtml(String(step.delay_days)) + ' days' : '') + '</div>' +
         '<div class="subject">' + escHtml(step.subject) + '</div>' +
-        '<div class="body">' + escHtml(step.body) + '</div></div>';
-    }
+        '<div class="body">' + escHtml(step.body) + '</div>' +
+        (sendBtns ? '<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">' + sendBtns + '</div>' : '') +
+        '</div>';
+    });
     const pc = (c.prospect_ids || []).length;
     html += '<div class="campaign-card"><h3>' + escHtml(c.name || 'Untitled Campaign') + '</h3>' +
       '<div class="meta">' + badge(c.status) + '<span>' + escHtml(c.channel || 'email') + '</span>' +
