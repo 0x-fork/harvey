@@ -11,6 +11,7 @@ import pytz
 from harvey.brain import Brain
 from harvey.config import (
     ConfigError, load_config, load_env, HarveyConfig, legacy_sending_held, sending_notice,
+    compliance_notice,
 )
 from harvey.pipeline import run_profile_stage
 from harvey.state import StateManager
@@ -220,11 +221,11 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
         + (f" ({brain.model})" if brain.model else "")
         + ". Change brain.provider in harvey.yaml to switch."
     )
-    notice = sending_notice(config)
-    if notice:
-        logger.warning("=" * 60)
-        logger.warning(notice)
-        logger.warning("=" * 60)
+    for notice in (sending_notice(config), compliance_notice(config)):
+        if notice:
+            logger.warning("=" * 60)
+            logger.warning(notice)
+            logger.warning("=" * 60)
 
     await state.init_db()
     logger.info("Database initialized.")

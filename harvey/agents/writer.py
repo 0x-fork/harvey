@@ -295,6 +295,7 @@ Requirements:
   question. No pitch, no product name.
 - Write the actual text (no merge variables — you know their name/company).
 - Subject: lowercase, 2-5 words.
+- No postal address, unsubscribe or opt-out line: Harvey adds them when it sends.
 - Follow every STRICT EMAIL RULE above.
 
 Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
@@ -370,6 +371,7 @@ Requirements:
 {merge_rule}
 - Never be pushy or salesy. Be consultative and value-driven.
 - Subject lines: lowercase, 2-5 words.
+- No postal address, unsubscribe or opt-out line: Harvey adds them when it sends.
 - Follow every rule in the STRICT EMAIL RULES above. No exceptions.
 
 Return ONLY a JSON array (no markdown fences, no commentary):

@@ -17,7 +17,9 @@ import re
 from datetime import date, datetime, timedelta, timezone
 
 from harvey.brain import Brain
-from harvey.config import HarveyConfig, EnvConfig
+from harvey.config import (
+    HarveyConfig, EnvConfig, compliance_footer_lines, compliance_notice, compliance_of,
+)
 from harvey.gate import pre_send_check
 from harvey.integrations.instantly import InstantlyClient
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
@@ -173,12 +175,13 @@ class Sender:
         sequences = [
             {
                 "subject": step.subject.strip(),
-                "body": step.body.strip(),
+                "body": self._with_footer(step.body.strip()),
                 "wait": step.delay_days,
             }
             for step in campaign.sequence
         ]
 
+        await self.state.remember_footer_lines(compliance_footer_lines(self.config))
         result = await self.instantly.set_campaign_emails(campaign_id, sequences)
         if result is None:
             logger.error(f"Sender: Failed to set emails for campaign {campaign_id}")
@@ -445,6 +448,22 @@ class Sender:
                 details={"campaign": campaign.name, "staged": staged, "mode": mode},
             )
 
+    def _with_footer(self, body: str) -> str:
+        """A cold email as it leaves: the postal address and opt-out line
+        underneath (CAN-SPAM). Added at send time, so a changed address
+        applies to mail already queued; not added again when the body already
+        ends with it."""
+        footer = "\n".join(compliance_footer_lines(self.config))
+        if not footer or body.rstrip().endswith(footer):
+            return body
+        return body.rstrip() + "\n\n" + footer
+
+    def _outgoing_body(self, item: dict) -> str:
+        """The exact body that goes out: cold email gets the footer, replies don't."""
+        if item["kind"] == "sequence":
+            return self._with_footer(item["body"])
+        return item["body"]
+
     async def _blocked(self, item: dict, prospect, allow_risky: bool) -> tuple[str, str] | None:
         """Why this email must not go out, as (status, error), or None."""
         if prospect is None:
@@ -461,8 +480,9 @@ class Sender:
             if item["step"] == 1 and prospect.status == "contacted":
                 return "cancelled", "already contacted"
         gate = pre_send_check(
-            item["to_email"], item["subject"], item["body"],
+            item["to_email"], item["subject"], self._outgoing_body(item),
             prospect=prospect, allow_risky=allow_risky, kind=item["kind"],
+            postal_address=compliance_of(self.config).postal_address,
         )
         if not gate:
             logger.warning(
@@ -513,6 +533,7 @@ class Sender:
 
         allow_risky = getattr(self.config.channels.email, "send_to_risky", False)
         sent = 0
+        sent_cold = 0
         # Set when Precleared can't be asked (allowance used up, network):
         # cold emails wait for a later cycle, replies still go out.
         compliance_paused = False
@@ -571,9 +592,10 @@ class Sender:
                     item["id"], status=blocked[0], error=blocked[1])
                 continue
 
+            body = self._outgoing_body(item)
             try:
                 result = await self.provider.send_email(
-                    item["to_email"], item["subject"], item["body"],
+                    item["to_email"], item["subject"], body,
                     thread_ref=item.get("thread_ref", ""),
                     in_reply_to=item.get("in_reply_to", ""),
                 )
@@ -592,9 +614,11 @@ class Sender:
                 continue
 
             sent += 1
+            if item["kind"] == "sequence":
+                sent_cold += 1
             now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
             await self.state.update_outbox_item(
-                item["id"], status="sent", sent_at=now_iso,
+                item["id"], status="sent", sent_at=now_iso, body=body,
                 message_id=result.message_id, thread_ref=result.thread_ref,
             )
             if prospect.status in ("new", "queued"):
@@ -634,6 +658,11 @@ class Sender:
             if self.send_pacing and sent < budget:
                 await asyncio.sleep(random.uniform(*SEND_JITTER_SECONDS))
 
+        if sent_cold:
+            await self.state.remember_footer_lines(compliance_footer_lines(self.config))
+            notice = compliance_notice(self.config)
+            if notice:
+                logger.warning(f"Sender: {notice}")
         if sent:
             logger.info(f"Sender: {sent} email(s) sent this cycle "
                         f"({sent_today + sent}/{max_daily} today).")

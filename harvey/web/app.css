@@ -428,6 +428,10 @@ td a:hover { text-decoration: underline; }
   font-size: 14.5px; line-height: 1.75; white-space: pre-wrap; max-width: 64ch;
   padding: 18px 0; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
 }
+.desk-footer {
+  font-size: 13px; line-height: 1.6; white-space: pre-wrap; max-width: 64ch;
+  color: var(--text-3); padding: 10px 0; border-bottom: 1px solid var(--border);
+}
 .desk-actions { display: flex; align-items: center; gap: 10px; margin-top: 18px; }
 .desk-context {
   display: grid; grid-template-columns: 110px minmax(0,1fr); gap: 6px 14px;

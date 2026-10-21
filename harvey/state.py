@@ -912,6 +912,35 @@ class StateManager:
             async with db.execute(sql, params) as cursor:
                 return [dict(r) for r in await cursor.fetchall()]
 
+    async def get_texts_for_prospect(self, prospect_id: str, limit: int = 50) -> list[str]:
+        """Everything Harvey wrote for this person, which a reply may quote
+        back: their Outbox emails (a sent one with its footer, whatever it
+        said then) and the templates of campaigns they're in (Instantly and
+        hand sends never pass through the Outbox; merge tags unfilled)."""
+        texts: list[str] = []
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT body FROM outbox WHERE prospect_id = ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (prospect_id, int(limit)),
+            ) as cursor:
+                texts += [r[0] or "" for r in await cursor.fetchall()]
+            async with db.execute(
+                "SELECT sequence_json, prospect_ids_json FROM campaigns "
+                "WHERE prospect_ids_json LIKE ? ORDER BY created_at DESC LIMIT ?",
+                ("%" + prospect_id + "%", int(limit)),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        for sequence_json, ids_json in rows:
+            try:
+                if prospect_id not in json.loads(ids_json or "[]"):
+                    continue
+                texts += [str(step.get("body") or "") for step in json.loads(sequence_json or "[]")
+                          if isinstance(step, dict)]
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                continue
+        return texts
+
     async def get_outbox_item(self, item_id: str) -> dict | None:
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
@@ -1534,6 +1563,32 @@ class StateManager:
                 return [dict(r) for r in await cursor.fetchall()]
 
     # ── Settings (operational flags: kill switch, counters) ──
+
+    FOOTER_HISTORY_KEY = "compliance_footer_history"
+
+    async def remember_footer_lines(self, lines) -> None:
+        """Keep every footer line Harvey has sent under a cold email, so a
+        reply quoting an old one (since reworded) is still known as ours."""
+        lines = [l.strip() for l in lines if l and l.strip()]
+        if not lines:
+            return
+        try:
+            known = json.loads(await self.get_setting(self.FOOTER_HISTORY_KEY) or "[]")
+        except (json.JSONDecodeError, TypeError):
+            known = []
+        if not isinstance(known, list):
+            known = []
+        merged = [l for l in known if isinstance(l, str)]
+        merged += [l for l in lines if l not in merged]
+        if merged != known:
+            await self.set_setting(self.FOOTER_HISTORY_KEY, json.dumps(merged[-50:]))
+
+    async def get_footer_history(self) -> list[str]:
+        try:
+            known = json.loads(await self.get_setting(self.FOOTER_HISTORY_KEY) or "[]")
+        except (json.JSONDecodeError, TypeError):
+            return []
+        return [l for l in known if isinstance(l, str)] if isinstance(known, list) else []
 
     async def get_setting(self, key: str, default: str = "") -> str:
         async with self._connect() as db:
