@@ -1238,6 +1238,30 @@ async def get_conversations():
     return rows
 
 
+@app.get("/api/trend")
+async def get_trend(days: int = 14):
+    """Daily counts for the last `days` UTC days (stored times are UTC):
+    contacts found, emails sent, first replies. Days with nothing are 0."""
+    from datetime import datetime, timedelta, timezone
+    days = max(1, min(90, days))
+    today = datetime.now(timezone.utc).date()
+    labels = [(today - timedelta(days=n)).isoformat() for n in range(days - 1, -1, -1)]
+
+    async def per_day(table: str, column: str, where: str = "") -> list[int]:
+        rows = await query_db(
+            f"SELECT date({column}) AS d, COUNT(*) AS n FROM {table} "
+            f"WHERE date({column}) >= ? {where} GROUP BY d", (labels[0],))
+        counts = {r["d"]: r["n"] for r in rows}
+        return [counts.get(day, 0) for day in labels]
+
+    return {
+        "days": labels,
+        "found": await per_day("prospects", "created_at"),
+        "sent": await per_day("outbox", "sent_at", "AND status = 'sent'"),
+        "replies": await per_day("conversations", "created_at"),
+    }
+
+
 @app.get("/api/activity")
 async def get_activity():
     rows = await query_db("SELECT * FROM actions ORDER BY created_at DESC LIMIT 100")
