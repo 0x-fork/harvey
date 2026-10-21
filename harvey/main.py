@@ -11,6 +11,7 @@ import pytz
 from harvey.brain import Brain
 from harvey.config import (
     ConfigError, load_config, load_env, HarveyConfig, legacy_sending_held, sending_notice,
+    compliance_notice,
 )
 from harvey.pipeline import run_profile_stage
 from harvey.state import StateManager
@@ -220,11 +221,11 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
         + (f" ({brain.model})" if brain.model else "")
         + ". Change brain.provider in harvey.yaml to switch."
     )
-    notice = sending_notice(config)
-    if notice:
-        logger.warning("=" * 60)
-        logger.warning(notice)
-        logger.warning("=" * 60)
+    for notice in (sending_notice(config), compliance_notice(config)):
+        if notice:
+            logger.warning("=" * 60)
+            logger.warning(notice)
+            logger.warning("=" * 60)
 
     await state.init_db()
     logger.info("Database initialized.")
@@ -417,9 +418,9 @@ def _needs_setup() -> bool:
         return True
 
     try:
-        with open(config_file) as f:
-            import yaml
-            config = yaml.safe_load(f)
+        import yaml
+        from harvey.textio import read_user_text
+        config = yaml.safe_load(read_user_text(config_file))
         if not isinstance(config, dict):
             return True
         company = (config.get("persona") or {}).get("company", "")
@@ -469,4 +470,6 @@ def main():
 
 
 if __name__ == "__main__":
+    from harvey.textio import utf8_stdio
+    utf8_stdio()
     main()

@@ -17,12 +17,21 @@ import re
 from datetime import date, datetime, timedelta, timezone
 
 from harvey.brain import Brain
-from harvey.config import HarveyConfig, EnvConfig
+from harvey.config import (
+    HarveyConfig, EnvConfig, cold_daily_cap, compliance_footer_lines, compliance_notice,
+    compliance_of,
+)
 from harvey.gate import pre_send_check
 from harvey.integrations.instantly import InstantlyClient
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
 from harvey.integrations.precleared import PreclearedClient
-from harvey.state import StateManager
+from harvey.state import (
+    HAND_SENT_REASON, MANUAL_SEND_KEY, MAYBE_SENT_PREFIX, StateManager,
+)
+
+# A follow-up waits at least this long after the email it follows went out,
+# whatever its schedule says.
+MIN_FOLLOW_UP_GAP = timedelta(days=1)
 
 logger = logging.getLogger("harvey.sender")
 
@@ -171,12 +180,13 @@ class Sender:
         sequences = [
             {
                 "subject": step.subject.strip(),
-                "body": step.body.strip(),
+                "body": self._with_footer(step.body.strip()),
                 "wait": step.delay_days,
             }
             for step in campaign.sequence
         ]
 
+        await self.state.remember_footer_lines(compliance_footer_lines(self.config))
         result = await self.instantly.set_campaign_emails(campaign_id, sequences)
         if result is None:
             logger.error(f"Sender: Failed to set emails for campaign {campaign_id}")
@@ -207,6 +217,8 @@ class Sender:
                     f"Sender: Skipping {email} (status '{prospect.status}' is not sendable)."
                 )
                 continue
+            if await self.state.get_setting(MANUAL_SEND_KEY + prospect.id):
+                continue  # the user emailed them by hand
             # Deliverability gate: never send to unverified/guessed addresses —
             # bounces are the fastest way to torch a sending domain.
             if (prospect.email_status or "guess") not in sendable_email:
@@ -328,6 +340,14 @@ class Sender:
 
     async def _run_native(self):
         """Stage new campaigns into the outbox, then drain what's due."""
+        # Before any early return: a send cut off mid-way must show up as
+        # failed even while sending is paused or no mailbox is connected.
+        stale = await self.state.fail_stale_sending_outbox()
+        if stale:
+            logger.warning(
+                f"Sender: {stale} email(s) were interrupted mid-send and won't be "
+                "retried. Check your Sent folder; they're under Didn't send."
+            )
         paused = await self.state.get_setting(KILL_SWITCH_KEY)
         if paused:
             logger.warning(
@@ -411,7 +431,9 @@ class Sender:
                 )
                 if item_id:
                     staged += 1
-            await self.state.update_prospect_status(prospect.id, "queued")
+            # Conditional: never overwrite a status set while staging
+            # (marked sent by hand, a reply).
+            await self.state.queue_prospect_if_unsent(prospect.id)
 
         await self.state.update_campaign(campaign.id, status="active")
         if skipped:
@@ -431,6 +453,90 @@ class Sender:
                 details={"campaign": campaign.name, "staged": staged, "mode": mode},
             )
 
+    def _with_footer(self, body: str) -> str:
+        """A cold email as it leaves: the postal address and opt-out line
+        underneath (CAN-SPAM). Added at send time, so a changed address
+        applies to mail already queued; not added again when the body already
+        ends with it."""
+        footer = "\n".join(compliance_footer_lines(self.config))
+        if not footer or body.rstrip().endswith(footer):
+            return body
+        return body.rstrip() + "\n\n" + footer
+
+    def _outgoing_body(self, item: dict) -> str:
+        """The exact body that goes out: cold email gets the footer, replies don't."""
+        if item["kind"] == "sequence":
+            return self._with_footer(item["body"])
+        return item["body"]
+
+    async def _follow_up_order(self, item: dict) -> str | tuple[str, str] | None:
+        """For a follow-up: "wait" until the email before it went out and its
+        gap has passed, (status, error) when that email never will, else None.
+
+        Without this, a step held for any reason (approval, a pause, a
+        compliance hold, the warmup ramp) lets its follow-ups' scheduled
+        times arrive first: a late "Approve all" sent the whole sequence in
+        one go, or step 2 before step 1.
+        """
+        if item["kind"] != "sequence" or int(item["step"]) <= 1:
+            return None
+        prev = await self.state.get_previous_step(item)
+        if prev is None:
+            return None
+        if prev["status"] in ("pending_review", "approved", "sending"):
+            return "wait"
+        if prev["status"] != "sent":
+            return "cancelled", f"step {prev['step']} wasn't sent ({prev['status']})"
+
+        def _at(value):
+            try:
+                return datetime.fromisoformat(str(value))
+            except (TypeError, ValueError):
+                return None
+        sent_at = _at(prev["sent_at"])
+        if sent_at is None:
+            return None
+        delay = await self.state.get_step_delay_days(item.get("campaign_id"), item["step"])
+        if delay is None:  # campaign unknown: fall back to the planned spacing
+            planned, prev_planned = _at(item["send_at"]), _at(prev["send_at"])
+            gap = (planned - prev_planned) if planned and prev_planned else MIN_FOLLOW_UP_GAP
+        else:
+            gap = timedelta(days=delay)
+        ready_at = sent_at + max(MIN_FOLLOW_UP_GAP, gap)
+        if datetime.now(timezone.utc).replace(tzinfo=None) >= ready_at:
+            return None
+        # Reschedule it for then, so it leaves the due queue until it's ready.
+        await self.state.update_outbox_item(item["id"], send_at=ready_at.isoformat())
+        return "wait"
+
+    async def _blocked(self, item: dict, prospect, allow_risky: bool) -> tuple[str, str] | None:
+        """Why this email must not go out, as (status, error), or None."""
+        if prospect is None:
+            return "failed", "prospect missing"
+        if item["kind"] == "sequence":
+            # Stop-on-reply / opt-out: never continue a sequence after contact.
+            if prospect.status in STOP_STATUSES:
+                return "cancelled", f"prospect status '{prospect.status}'"
+            # The user already emailed them by hand: whatever Harvey staged
+            # (before, during or after that) would be a second email.
+            if await self.state.get_setting(MANUAL_SEND_KEY + prospect.id):
+                return "cancelled", HAND_SENT_REASON
+            # A first email to someone already contacted is always a duplicate.
+            if item["step"] == 1 and prospect.status == "contacted":
+                return "cancelled", "already contacted"
+        gate = pre_send_check(
+            item["to_email"], item["subject"], self._outgoing_body(item),
+            prospect=prospect, allow_risky=allow_risky, kind=item["kind"],
+            postal_address=compliance_of(self.config).postal_address,
+        )
+        if not gate:
+            logger.warning(
+                f"Sender: gate blocked email to {item['to_email']}: "
+                f"{gate.reasons}"
+            )
+            return "failed", "gate: " + "; ".join(gate.reasons)[:300]
+        return None
+
     async def _drain_due(self):
         """Send due, approved outbox items through the provider."""
         if not self.provider.is_configured():
@@ -446,70 +552,66 @@ class Sender:
         if budget <= 0:
             logger.info(f"Sender: daily send cap reached ({sent_today}/{max_daily}).")
             return
+        # Cold email has its own cap under the warmup ramp; replies don't.
+        # Counted from local midnight, the day the ramp counts in.
+        cold_cap = cold_daily_cap(self.config.channels.email)
+        midnight = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+        cold_left = cold_cap - await self.state.count_outbox_sent_today(
+            kind="sequence",
+            since=midnight.astimezone(timezone.utc).replace(tzinfo=None).isoformat())
 
         now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         due = await self.state.get_outbox(
-            status="approved", due_before=now, limit=budget * 3
+            status="approved", due_before=now, limit=budget * 3,
+            skip_unready_follow_ups=True,
         )
-        if self.precleared is not None:
-            # Cold emails held by an unavailable compliance check stay
-            # approved at the front of the queue and could fill the page
-            # above, so fetch replies (and any other unchecked kind) on their
-            # own too. Bounded: one extra query of the same size.
-            seen = {item["id"] for item in due}
-            unchecked = await self.state.get_outbox(
-                status="approved", due_before=now, limit=budget * 3,
-                exclude_kind="sequence",
+        # Cold emails held (by an unavailable compliance check, the cold
+        # cap, a follow-up's spacing) stay approved and could fill the
+        # page above, so replies (and any other kind) are fetched on
+        # their own too and never wait behind them. Bounded: one extra
+        # query of the same size.
+        seen = {item["id"] for item in due}
+        unchecked = await self.state.get_outbox(
+            status="approved", due_before=now, limit=budget * 3,
+            exclude_kind="sequence",
+        )
+        extra = [item for item in unchecked if item["id"] not in seen]
+        if extra:
+            due = sorted(
+                due + extra,
+                key=lambda i: (i.get("send_at") or "", i.get("created_at") or ""),
             )
-            extra = [item for item in unchecked if item["id"] not in seen]
-            if extra:
-                due = sorted(
-                    due + extra,
-                    key=lambda i: (i.get("send_at") or "", i.get("created_at") or ""),
-                )
         if not due:
             return
 
         allow_risky = getattr(self.config.channels.email, "send_to_risky", False)
         sent = 0
+        sent_cold = 0
         # Set when Precleared can't be asked (allowance used up, network):
         # cold emails wait for a later cycle, replies still go out.
         compliance_paused = False
+        held_cold = 0
         for item in due:
             if sent >= budget:
                 break
+            if item["kind"] == "sequence" and sent_cold >= cold_left:
+                held_cold += 1
+                continue
             needs_check = self.precleared is not None and item["kind"] == "sequence"
             if needs_check and compliance_paused:
                 continue
 
             prospect = await self.state.get_prospect(item["prospect_id"])
-            if prospect is None:
+            blocked = await self._blocked(item, prospect, allow_risky)
+            if blocked:
                 await self.state.update_outbox_item(
-                    item["id"], status="failed", error="prospect missing"
-                )
+                    item["id"], status=blocked[0], error=blocked[1])
                 continue
-
-            # Stop-on-reply / opt-out: never continue a sequence after contact.
-            if item["kind"] == "sequence" and prospect.status in STOP_STATUSES:
-                await self.state.update_outbox_item(
-                    item["id"], status="cancelled",
-                    error=f"prospect status '{prospect.status}'",
-                )
+            order = await self._follow_up_order(item)
+            if order == "wait":
                 continue
-
-            gate = pre_send_check(
-                item["to_email"], item["subject"], item["body"],
-                prospect=prospect, allow_risky=allow_risky, kind=item["kind"],
-            )
-            if not gate:
-                await self.state.update_outbox_item(
-                    item["id"], status="failed",
-                    error="gate: " + "; ".join(gate.reasons)[:300],
-                )
-                logger.warning(
-                    f"Sender: gate blocked email to {item['to_email']}: "
-                    f"{gate.reasons}"
-                )
+            if order:
+                await self.state.update_outbox_item(item["id"], status=order[0], error=order[1])
                 continue
 
             # Optional compliance check (compliance.precleared): one per
@@ -536,11 +638,38 @@ class Sender:
                     continue
                 receipt_id = clearance.receipt_id
 
-            result = await self.provider.send_email(
-                item["to_email"], item["subject"], item["body"],
-                thread_ref=item.get("thread_ref", ""),
-                in_reply_to=item.get("in_reply_to", ""),
-            )
+            # Claim it. A reply, bounce, hand send or rejection may have
+            # cancelled it since the queue was read; then it stays cancelled.
+            if not await self.state.claim_outbox_item(item["id"]):
+                continue
+            # Send the email as it is now, not as the queue read it: it may
+            # have been edited and approved again since.
+            item = await self.state.get_outbox_item(item["id"]) or item
+            # Whatever landed between the checks above and the claim (a reply
+            # sets the status before it cancels) is caught here, with fresh
+            # data. From now on nothing else can cancel this email.
+            prospect = await self.state.get_prospect(item["prospect_id"])
+            blocked = await self._blocked(item, prospect, allow_risky)
+            if blocked:
+                await self.state.update_outbox_item(
+                    item["id"], status=blocked[0], error=blocked[1])
+                continue
+
+            body = self._outgoing_body(item)
+            try:
+                result = await self.provider.send_email(
+                    item["to_email"], item["subject"], body,
+                    thread_ref=item.get("thread_ref", ""),
+                    in_reply_to=item.get("in_reply_to", ""),
+                )
+            except Exception as e:
+                # It may have gone out before the error: never retry it.
+                await self.state.update_outbox_item(
+                    item["id"], status="failed",
+                    error=f"{MAYBE_SENT_PREFIX}send error: {e}"[:300],
+                )
+                logger.warning(f"Sender: send to {item['to_email']} raised: {e}")
+                continue
             if not result.ok:
                 await self.state.update_outbox_item(
                     item["id"], status="failed", error=result.error[:300]
@@ -548,9 +677,11 @@ class Sender:
                 continue
 
             sent += 1
+            if item["kind"] == "sequence":
+                sent_cold += 1
             now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
             await self.state.update_outbox_item(
-                item["id"], status="sent", sent_at=now_iso,
+                item["id"], status="sent", sent_at=now_iso, body=body,
                 message_id=result.message_id, thread_ref=result.thread_ref,
             )
             if prospect.status in ("new", "queued"):
@@ -590,6 +721,20 @@ class Sender:
             if self.send_pacing and sent < budget:
                 await asyncio.sleep(random.uniform(*SEND_JITTER_SECONDS))
 
+        if held_cold:
+            warmup = getattr(self.config.channels.email, "warmup", None)
+            days = warmup.days_in() if warmup is not None else None
+            if days is not None and cold_cap < max_daily:
+                logger.info(
+                    f"Sender: warmup day {days}: {held_cold} cold email(s) wait; today's "
+                    f"cold cap is {cold_cap}. Replies still go out. See `harvey warmup`.")
+            else:
+                logger.info(f"Sender: cold email cap reached for today ({cold_cap}).")
+        if sent_cold:
+            await self.state.remember_footer_lines(compliance_footer_lines(self.config))
+            notice = compliance_notice(self.config)
+            if notice:
+                logger.warning(f"Sender: {notice}")
         if sent:
             logger.info(f"Sender: {sent} email(s) sent this cycle "
                         f"({sent_today + sent}/{max_daily} today).")

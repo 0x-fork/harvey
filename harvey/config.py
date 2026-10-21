@@ -3,10 +3,12 @@
 import logging
 import os
 import re
-from datetime import time as _time
+from datetime import date as _date, time as _time
 from pathlib import Path
 
 import yaml
+
+from harvey.textio import read_user_text
 from dotenv import load_dotenv
 from pydantic import BaseModel, ValidationError, field_validator, model_validator
 
@@ -68,6 +70,76 @@ class ICPConfig(BaseModel):
     geo_coordinates: dict[str, str] = {}
 
 
+class WarmupConfig(BaseModel):
+    """Cold-email ramp for a new domain or mailbox.
+
+    Harvey doesn't run a warmup network itself; that needs a pool of real
+    inboxes (Instantly, Lemwarm, Mailreach...). This is the other half: no
+    cold email goes out for ``min_days`` after ``start_date``, then the cold
+    cap climbs from ``start_sends`` by ``daily_increase`` a day until it
+    reaches ``max_daily_sends``. Replies are never held. Empty
+    ``start_date`` means no ramp.
+    """
+
+    start_date: str = ""      # YYYY-MM-DD the warmup service was switched on
+    min_days: int = 14        # warmup-only days before any cold email
+    start_sends: int = 5      # cold-email cap on the first sending day
+    daily_increase: int = 3   # added to the cap each day after that
+    dkim_selector: str = ""   # for `harvey warmup`, if not a common one
+
+    @field_validator("start_date", "dkim_selector", mode="before")
+    @classmethod
+    def _blank_is_empty(cls, v, info):
+        if v is None:
+            return ""
+        if info.field_name != "start_date":
+            return v
+        # YAML reads an unquoted 2026-10-01 as a date (with a time, a datetime).
+        if isinstance(v, _date):
+            return (v.date() if hasattr(v, "date") and callable(v.date) else v).isoformat()
+        if isinstance(v, str) and len(v.strip()) > 10 and v.strip()[10] in " T":
+            return v.strip()[:10]  # "2026-10-01 09:00": the day is what counts
+        return "" if v is None else v
+
+    @field_validator("min_days", "start_sends", "daily_increase", mode="before")
+    @classmethod
+    def _blank_is_default(cls, v, info):
+        return cls.model_fields[info.field_name].default if v is None else v
+
+    @field_validator("start_date")
+    @classmethod
+    def _valid_date(cls, v: str) -> str:
+        v = (v or "").strip()
+        if v:
+            try:
+                _date.fromisoformat(v)
+            except ValueError:
+                raise ValueError(f"warmup.start_date '{v}' must be YYYY-MM-DD.")
+        return v
+
+    @field_validator("min_days", "start_sends", "daily_increase")
+    @classmethod
+    def _non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("warmup values must be >= 0")
+        return v
+
+    def days_in(self, today: _date | None = None) -> int | None:
+        """Days since warmup started, or None when no ramp is configured."""
+        if not self.start_date:
+            return None
+        return ((today or _date.today()) - _date.fromisoformat(self.start_date)).days
+
+    def daily_cap(self, ceiling: int, today: _date | None = None) -> int:
+        """Today's cold-email cap under the ramp (never above ``ceiling``)."""
+        days = self.days_in(today)
+        if days is None:
+            return ceiling
+        if days < self.min_days:
+            return 0
+        return min(ceiling, self.start_sends + (days - self.min_days) * self.daily_increase)
+
+
 class EmailChannelConfig(BaseModel):
     enabled: bool = True
     # "instantly" (legacy), "gmail" (Gmail/Workspace via API — recommended),
@@ -86,6 +158,14 @@ class EmailChannelConfig(BaseModel):
     # Kill switch: pause all sending when bounces exceed this fraction of
     # sent mail (measured over the trailing sends). 0 disables the switch.
     max_bounce_rate: float = 0.05
+    # New domain? Ramp cold email up slowly (see WarmupConfig). Native
+    # providers only: Instantly has its own warmup and per-account limits.
+    warmup: WarmupConfig = WarmupConfig()
+
+    @field_validator("warmup", mode="before")
+    @classmethod
+    def _blank_warmup(cls, v):
+        return WarmupConfig() if v is None else v
 
     @field_validator("max_daily_sends")
     @classmethod
@@ -93,6 +173,19 @@ class EmailChannelConfig(BaseModel):
         if v < 0:
             raise ValueError("max_daily_sends must be >= 0")
         return v
+
+    def cold_daily_cap(self, today: _date | None = None) -> int:
+        """Today's cap on cold (sequence) email: max_daily_sends, throttled
+        by the warmup ramp. Replies count only toward max_daily_sends."""
+        return self.warmup.daily_cap(self.max_daily_sends, today)
+
+
+def cold_daily_cap(email_config, today: _date | None = None) -> int:
+    """cold_daily_cap for any email config, including ones without a ramp."""
+    warmup = getattr(email_config, "warmup", None)
+    if isinstance(warmup, WarmupConfig):
+        return warmup.daily_cap(email_config.max_daily_sends, today)
+    return email_config.max_daily_sends
 
 
 def legacy_sending_held(config) -> bool:
@@ -207,8 +300,85 @@ class PreclearedConfig(BaseModel):
         return self
 
 
+DEFAULT_OPT_OUT_LINE = 'Not interested? Reply "no thanks" and I won\'t email again.'
+# The replies the Handler always honours as an opt-out on their own; an
+# opt_out_line must ask for one of them ("Reply STOP", 'reply "no thanks"').
+OPT_OUT_WORDS = ("no thanks", "no thank you", "unsubscribe", "stop", "remove me",
+                 "opt out")
+_ASKS_FOR_OPT_OUT_RE = re.compile(
+    r"\breply(?:\s+with)?\s*[\"'\u201c\u2018]?\s*(?:"
+    + "|".join(re.escape(w) for w in OPT_OUT_WORDS) + r")\b", re.IGNORECASE)
+
+
 class ComplianceConfig(BaseModel):
     precleared: PreclearedConfig = PreclearedConfig()
+    # Added under every cold (sequence) email at send time; never to replies.
+    # CAN-SPAM requires a postal address you receive mail at (a street
+    # address, PO box or virtual mailbox) and a working way to opt out.
+    postal_address: str = ""
+    # Must ask for wording Harvey recognises as an opt-out (OPT_OUT_WORDS).
+    # "" leaves it off (and harvey warns).
+    opt_out_line: str = DEFAULT_OPT_OUT_LINE
+
+    @field_validator("postal_address", "opt_out_line", mode="before")
+    @classmethod
+    def _blank_is_empty(cls, v):
+        return "" if v is None else v
+
+    @field_validator("opt_out_line")
+    @classmethod
+    def _recognisable_opt_out(cls, v: str) -> str:
+        v = v.strip()
+        lowered = v.lower()
+        if not v:
+            return v
+        if any(bit in lowered for bit in ("http", "www.", "click", "@")):
+            raise ValueError(
+                "opt_out_line can't contain a link or an email address: cold email "
+                "allows one link, and opting out must be as simple as replying."
+            )
+        if not _ASKS_FOR_OPT_OUT_RE.search(v):
+            raise ValueError(
+                "opt_out_line must ask for a reply Harvey recognises as an opt-out, "
+                'e.g. Reply "no thanks" / Reply STOP. Recognised: '
+                + ", ".join(f'"{w}"' for w in OPT_OUT_WORDS) + "."
+            )
+        return v
+
+
+def compliance_of(config) -> ComplianceConfig:
+    """The compliance section, or the defaults when a config has none."""
+    found = getattr(config, "compliance", None)
+    return found if isinstance(found, ComplianceConfig) else ComplianceConfig()
+
+
+def compliance_footer_lines(config) -> list[str]:
+    """The lines added under every cold email: address, then opt-out line."""
+    compliance = compliance_of(config)
+    return [line for line in (compliance.postal_address.strip(),
+                              compliance.opt_out_line.strip()) if line]
+
+
+def compliance_notice(config) -> str:
+    """A plain-language warning when cold email goes out without a postal
+    address, or "". Sending isn't held for it: this is the nudge."""
+    email = getattr(getattr(config, "channels", None), "email", None)
+    if not getattr(email, "enabled", False):
+        return ""
+    compliance = compliance_of(config)
+    missing = []
+    if not compliance.postal_address.strip():
+        missing.append("a postal address (compliance.postal_address: a street "
+                       "address, PO box or virtual mailbox)")
+    if not compliance.opt_out_line.strip():
+        missing.append("a way to opt out (compliance.opt_out_line)")
+    if not missing:
+        return ""
+    return (
+        "Cold emails are going out without " + " or ".join(missing) + ". US law "
+        "(CAN-SPAM) requires both in every cold email. Set them in harvey.yaml "
+        "(or harvey.local.yaml if you trained Harvey)."
+    )
 
 
 class QuietHoursConfig(BaseModel):
@@ -378,8 +548,7 @@ def load_config(config_path: str | None = None) -> HarveyConfig:
         config_path = _find_config_file()
 
     try:
-        with open(config_path) as f:
-            data = yaml.safe_load(f)
+        data = yaml.safe_load(read_user_text(config_path))
     except FileNotFoundError:
         raise ConfigFileNotFoundError(
             f"Config file not found: {config_path}. "
@@ -425,8 +594,7 @@ def load_brain_config(config_path: str | None = None) -> BrainConfig:
         except ConfigFileNotFoundError:
             return BrainConfig()
     try:
-        with open(config_path) as f:
-            data = yaml.safe_load(f)
+        data = yaml.safe_load(read_user_text(config_path))
     except FileNotFoundError:
         return BrainConfig()
     except (yaml.YAMLError, OSError) as e:

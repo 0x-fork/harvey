@@ -20,6 +20,8 @@ import os
 import re
 from pathlib import Path
 
+from harvey.textio import read_user_text
+
 logger = logging.getLogger("harvey.humanize")
 
 SKILL_PATH = Path(
@@ -42,7 +44,7 @@ def humanizer_enabled(config) -> bool:
 def load_skill(path: Path | None = None) -> str:
     """The skill's instructions without its YAML frontmatter, or ""."""
     try:
-        text = (path or SKILL_PATH).read_text(encoding="utf-8")
+        text = read_user_text(path or SKILL_PATH)
     except OSError:
         return ""
     if text.startswith("---"):

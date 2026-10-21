@@ -215,13 +215,15 @@ def cmd_status(args):
         by_provider = summary.get("usage_today_by_provider", {})
         print(f"  Claude calls today:   {by_provider.get('claude', summary['usage_today'])}")
         print(f"  Codex calls today:    {by_provider.get('codex', 0)}")
-        from harvey.config import load_config, sending_notice
+        from harvey.config import compliance_notice, load_config, sending_notice
         try:
-            notice = sending_notice(load_config())
+            loaded = load_config()
+            notice = sending_notice(loaded)
+            address_notice = compliance_notice(loaded)
         except Exception:
             # Status must still print when harvey.yaml is broken; that's
             # when people run it. The --check path reports config errors.
-            notice = ""
+            notice = address_notice = ""
         from harvey.main import unusable_backlog_notice
         backlog = unusable_backlog_notice(summary)
         if backlog:
@@ -231,6 +233,10 @@ def cmd_status(args):
         if notice:
             print("  Sending:              HELD")
             print(textwrap.fill(notice, width=72, initial_indent="                        ",
+                                subsequent_indent="                        "))
+        if address_notice:
+            print("  Postal address:       MISSING")
+            print(textwrap.fill(address_notice, width=72, initial_indent="                        ",
                                 subsequent_indent="                        "))
         from harvey.brain import BRAIN_STATUS_KEY, Brain, active_brain_status
         from harvey.config import ConfigError, load_brain_config
@@ -464,8 +470,8 @@ def cmd_outbox(args):
             print(f"\n  {'Approved.' if n else 'No pending item with that id.'}\n")
             return
         if args.reject:
-            await state.update_outbox_item(args.reject, status="rejected")
-            print("\n  Rejected.\n")
+            n = await state.reject_outbox_item(args.reject)
+            print(f"\n  {'Rejected.' if n else 'Nothing waiting to send with that id (already sending or sent?).'}\n")
             return
 
         paused = await state.get_setting("sending_paused")
@@ -685,6 +691,80 @@ def cmd_retry_writes(args):
     asyncio.run(_run())
 
 
+def cmd_warmup(args):
+    """Check whether the sending domain is ready for cold email."""
+    import os
+
+    from dotenv import load_dotenv
+
+    from harvey import deliverability as d
+    from harvey.agents.handler import BOUNCE_COUNT_KEY
+    from harvey.config import ConfigError, load_config
+    from harvey.paths import PROJECT_ROOT
+    from harvey.state import StateManager
+
+    load_dotenv(PROJECT_ROOT / ".env")
+    try:
+        config = load_config()
+    except ConfigError as e:
+        print(f"\n  {e}\n")
+        raise SystemExit(1)
+    email = config.channels.email
+    smtp_user = os.getenv("SMTP_USERNAME", "").strip() if email.provider == "smtp" else ""
+    sender = smtp_user if "@" in smtp_user else config.persona.email
+    domain = (args.domain or sender.rpartition("@")[2]).strip().lower().rstrip(".")
+    if not d.DOMAIN_RE.match(domain):
+        print("\n  No valid sending domain found. Pass one: harvey warmup yourdomain.com\n")
+        raise SystemExit(1)
+
+    async def _history():
+        state = StateManager()
+        await state.init_db()
+        return (await state.count_outbox_sent(),
+                int(await state.get_setting(BOUNCE_COUNT_KEY) or 0))
+
+    smtp_host = os.getenv("SMTP_HOST", "").strip() if email.provider == "smtp" else ""
+    print(f"\n  Deliverability check - {domain}")
+    print("  " + "=" * 56)
+    sections = [
+        ("Authentication", [d.check_mx(domain), d.check_spf(domain),
+                            d.check_dkim(domain, email.warmup.dkim_selector),
+                            d.check_dmarc(domain)]),
+        ("Reputation", [d.check_domain_age(domain), *d.check_domain_blocklists(domain)]
+         + (d.check_ip_blocklists(smtp_host) if smtp_host else [])),
+        ("Warmup & sending", [d.check_warmup(email.warmup, email.max_daily_sends,
+                                             provider=email.provider),
+                              d.check_send_history(*asyncio.run(_history()))]),
+    ]
+    icons = {d.OK: "OK  ", d.WARN: "WARN", d.FAIL: "FAIL", d.INFO: "info"}
+    failed = warned = unknown = 0
+    for title, checks in sections:
+        print(f"\n  {title}")
+        for c in checks:
+            failed += c.status == d.FAIL
+            warned += c.status == d.WARN
+            unknown += c.unknown and title == "Authentication"
+            print(f"    [{icons[c.status]}] {c.name:<26} {c.detail}")
+
+    print("\n  " + "=" * 56)
+    if failed:
+        print(f"  NOT READY - fix the {failed} FAIL item(s) before any cold email.")
+    elif unknown:
+        print(f"  NOT CHECKED - {unknown} authentication lookup(s) failed; run again.")
+    elif warned:
+        print(f"  READY WITH CAVEATS - {warned} warning(s); keep volume low.")
+    else:
+        print("  READY - send within today's cap and watch bounces.")
+    print("\n  What DNS can't tell you (the real reputation signal):")
+    print("    - Google Postmaster Tools: https://postmaster.google.com - add the domain;")
+    print("      it shows Gmail's spam rate and domain reputation once you send volume.")
+    print("    - Inbox placement: send one email to a seed test (mail-tester.com is free)")
+    print("      and aim for 9/10+. Your warmup service's dashboard shows its inbox rate;")
+    print("      wait for ~95%+ inbox for a week before relying on cold sends.\n")
+    if failed or unknown:
+        raise SystemExit(1)
+
+
 def cmd_sending(args):
     """Pause/resume the sending kill switch."""
     from harvey.state import StateManager
@@ -707,6 +787,8 @@ def cmd_sending(args):
 
 
 def main():
+    from harvey.textio import utf8_stdio
+    utf8_stdio()
     from harvey.paths import PROJECT_ROOT
     project_root = str(PROJECT_ROOT)
 
@@ -846,6 +928,12 @@ def main():
     sub.add_argument("sending_action", nargs="?", default="status",
                      choices=["pause", "resume", "status"])
     sub.set_defaults(func=cmd_sending)
+
+    sub = subparsers.add_parser(
+        "warmup", help="Check if your sending domain is set up and warmed up for cold email")
+    sub.add_argument("domain", nargs="?", default="",
+                     help="Domain to check (default: your sending mailbox's domain)")
+    sub.set_defaults(func=cmd_warmup)
 
     # harvey usage
     sub = subparsers.add_parser("usage", help="Show brain usage and quota (Claude or Codex)")

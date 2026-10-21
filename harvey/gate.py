@@ -53,8 +53,12 @@ def pre_send_check(
     prospect=None,
     allow_risky: bool = False,
     kind: str = "sequence",
+    postal_address: str = "",
 ) -> GateResult:
-    """Run every deterministic check. Returns ok=False with reasons on any hit."""
+    """Run every deterministic check. Returns ok=False with reasons on any hit.
+
+    postal_address: when set, a cold (sequence) email must carry it (CAN-SPAM).
+    """
     reasons: list[str] = []
     subject = (subject or "").strip()
     body = (body or "").strip()
@@ -99,6 +103,9 @@ def pre_send_check(
     links = URL_RE.findall(body)
     if len(links) > MAX_LINKS:
         reasons.append(f"too many links ({len(links)} > {MAX_LINKS})")
+
+    if kind == "sequence" and postal_address.strip() and postal_address.strip() not in body:
+        reasons.append("postal address footer missing")
 
     # No HTML — Harvey sends plain text only
     if re.search(r"<\s*(html|body|div|table|img|a)\b", body, re.IGNORECASE):

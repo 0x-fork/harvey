@@ -284,6 +284,7 @@ harvey outbox                # Review queued emails; --approve <id> / --approve-
 harvey signals               # The signal vocabulary; --confirm / --reject CODES (or 'free' / 'all')
 harvey discover              # Find businesses; --providers / --estimate / --provider <key>
 harvey sending pause|resume  # Kill switch for all outbound
+harvey warmup [domain]       # Sending-domain readiness: SPF/DKIM/DMARC, age, blocklists, ramp
 ```
 
 ### Common Issues

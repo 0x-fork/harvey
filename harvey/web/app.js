@@ -82,6 +82,7 @@ const STATUS = {
   // outbox
   pending_review: ['Waiting on you', 'waiting'],
   approved:       ['Approved', 'good'],
+  sending:        ['Sending now', 'active'],
   scheduled:      ['Scheduled', 'active'],
   sent:           ['Sent', 'good'],
   failed:         ['Failed', 'bad'],
@@ -248,7 +249,7 @@ function showTab(id, btn) {
 
 function loadCurrentTab() {
   switch (currentTab) {
-    case 'today': loadToday(); loadSetupStatus(); loadRuns(); loadTodayActivity(); break;
+    case 'today': loadLiveStatus(); loadToday(); loadSetupStatus(); loadRuns(); loadTodayActivity(); break;
     case 'signals': loadSignals(); break;
     case 'discover': loadDiscoverProviders(); break;
     case 'companies': if (!companyDrill) loadCompanies(); break;
@@ -295,6 +296,62 @@ async function loadToday() {
         escHtml(it.action) + '</button>' +
     '</div>'
   ).join('') + '</div>';
+}
+
+// ── Live status: the "what's happening?" answer, kept on screen ──
+
+async function loadLiveStatus() {
+  const el = document.getElementById('live-status');
+  if (!el) return;
+  const d = await api('/api/live-status');
+  if (!d || !Array.isArray(d.steps)) {
+    // Keep the last good numbers on screen, but never let them pass for live.
+    const flag = el.querySelector('.live-flag');
+    if (flag) flag.textContent = "Can't reach Harvey right now — numbers below may be old.";
+    else el.innerHTML = '<div class="rail-block"><div class="subhead">Status — live</div>' +
+      '<p class="muted live-flag" style="font-size:13px">Can\'t reach Harvey right now. ' +
+      'Is the dashboard window still open?</p></div>';
+    return;
+  }
+  const icon = {done: '&#10003;', running: '&#9203;', partial: '&#9679;', waiting: '&#9675;'};
+  const color = {done: '#2e7d32', running: '#b26a00',
+                 partial: 'var(--text-2, #666)', waiting: 'var(--text-3, #999)'};
+  const rows = d.steps.map(s => {
+    const st = icon[s.state] ? s.state : 'waiting';
+    const pct = s.total ? Math.min(100, Math.round(100 * s.done / s.total)) : 0;
+    const bar = s.total
+      ? '<div style="height:5px;background:var(--border, #e5e5e5);border-radius:3px;margin-top:5px">' +
+        '<div style="height:5px;width:' + pct + '%;background:' + color[st] +
+        ';border-radius:3px;transition:width .4s"></div></div>'
+      : '';
+    return '<div style="display:flex;gap:10px;padding:8px 0;border-bottom:1px solid var(--border, #eee)">' +
+      '<span style="width:20px;text-align:center;color:' + color[st] + '">' + icon[st] + '</span>' +
+      '<div style="flex:1;min-width:0"><div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap">' +
+      '<strong style="font-size:13.5px">' + escHtml(s.label) + '</strong>' +
+      '<span class="muted" style="font-size:12.5px">' + escHtml(s.detail) + '</span></div>' + bar +
+      '</div></div>';
+  }).join('');
+  const jobName = r => r.stage === 'profile' ? 'Reading websites'
+    : r.stage === 'discover' ? 'Searching for businesses (' + (r.provider || '') + ')'
+    : String(r.stage || 'Job');
+  const running = d.running || [];
+  const runningHtml = running.length
+    ? running.map(r => '&#9203; ' + escHtml(jobName(r)) + ' · running ' + r.elapsed_min + ' min' +
+        (r.eta_text ? ' · ' + escHtml(r.eta_text) : '')).join('<br>')
+    : 'Nothing running right now.';
+  const stoppedHtml = (d.stopped || []).length
+    ? '<div style="margin-top:6px;font-size:13px;color:#b3261e">&#9888; ' +
+      (d.stopped || []).map(r => escHtml(jobName(r))).join(', ') +
+      ' stopped before finishing.</div>'
+    : '';
+  el.innerHTML = '<div class="rail-block">' +
+    '<div class="subhead">Status — live</div>' +
+    '<div style="font-size:13px;margin:6px 0 4px">' + runningHtml + '</div>' + stoppedHtml +
+    '<div style="margin-top:10px">' + rows + '</div>' +
+    '<div style="margin-top:10px;font-size:13px"><strong>Next:</strong> ' + escHtml(d.next || '') + '</div>' +
+    '<div class="muted live-flag" style="margin-top:4px;font-size:12px">Cost so far: $' +
+    Number(d.cost_usd || 0).toFixed(2) + ' · updated ' + new Date().toLocaleTimeString() +
+    ' · refreshes every 10 seconds</div></div>';
 }
 
 function renderFigures(stats) {
@@ -835,11 +892,18 @@ async function loadSettings() {
   document.getElementById('smtp-host').value = data.smtp_host || '';
   document.getElementById('smtp-port').value = data.smtp_port || '';
   document.getElementById('smtp-user').value = data.smtp_username || '';
+  document.getElementById('imap-host').value = data.imap_host || '';
+  document.getElementById('imap-port').value = data.imap_port || '';
+  document.getElementById('imap-user').value = data.imap_username || '';
+  document.getElementById('m365-client').value = data.m365_client_id || '';
+  document.getElementById('m365-tenant').value = data.m365_tenant_id || '';
   document.getElementById('linkedin-email').value = data.linkedin_email || '';
   document.getElementById('cf-account-id').value = data.cloudflare_account_id || '';
 
   savedPh('gmail-secret', data.gmail_client_secret_set, 'Enter client secret');
   savedPh('smtp-pass', data.smtp_password_set, 'Enter password / app password');
+  savedPh('imap-pass', data.imap_password_set, 'Same as SMTP password');
+  document.getElementById('imap-same-pass').checked = !data.imap_password_set;
   savedPh('instantly-key', data.instantly_api_key_set, 'Enter your Instantly API key');
   savedPh('reoon-key', data.reoon_api_key_set, '600 free/mo — reoon.com/email-verifier');
   savedPh('zerobounce-key', data.zerobounce_api_key_set, '100 free/mo — best for M365/Workspace catch-alls');
@@ -853,6 +917,12 @@ async function loadSettings() {
     if (data.gmail_authorized) { g.className = 'email-tag verified'; g.textContent = 'authorized'; }
     else if (data.gmail_client_secret_set) { g.className = 'email-tag risky'; g.textContent = 'run: harvey gmail auth'; }
     else { g.className = 'email-tag guess'; g.textContent = 'not set up'; }
+  }
+  const m = document.getElementById('m365-status');
+  if (m) {
+    if (data.m365_authorized) { m.className = 'email-tag verified'; m.textContent = 'authorized'; }
+    else if (data.m365_client_id) { m.className = 'email-tag risky'; m.textContent = 'run: harvey microsoft auth'; }
+    else { m.className = 'email-tag guess'; m.textContent = 'not set up'; }
   }
   tag('reoon-status', data.reoon_api_key_set, 'set');
   tag('zerobounce-status', data.zerobounce_api_key_set, 'set');
@@ -874,7 +944,23 @@ function saveSmtp() {
   };
   const pass = document.getElementById('smtp-pass').value;
   if (pass) payload.SMTP_PASSWORD = pass;
+  // Blank IMAP fields fall back to the SMTP ones. A typed IMAP password wins;
+  // otherwise the checkbox clears it back to the SMTP one, and an unticked
+  // empty box keeps whatever IMAP password is saved.
+  payload.IMAP_HOST = document.getElementById('imap-host').value.trim();
+  payload.IMAP_PORT = document.getElementById('imap-port').value.trim();
+  payload.IMAP_USERNAME = document.getElementById('imap-user').value.trim();
+  const imapPass = document.getElementById('imap-pass').value;
+  if (imapPass) payload.IMAP_PASSWORD = imapPass;
+  else if (document.getElementById('imap-same-pass').checked) payload.IMAP_PASSWORD = '';
   saveEnv(payload, 'SMTP settings saved.').then(loadSettings);
+}
+
+function saveMicrosoft() {
+  const client = document.getElementById('m365-client').value.trim();
+  if (!client) { showToast('Paste the Application (client) ID first.', 'error'); return; }
+  saveEnv({M365_CLIENT_ID: client, M365_TENANT_ID: document.getElementById('m365-tenant').value.trim()},
+          'Saved. Now run "harvey microsoft auth" in your terminal.').then(loadSettings);
 }
 
 function saveVerifiers() {
@@ -1193,6 +1279,14 @@ async function loadOutbox() {
 
   const pending = data.pending || [];
   _desk.items = pending;
+  _desk.footer = data.footer || '';
+  // Keep the desk on the draft being edited even if the list shifted.
+  const editingAt = _desk.editing ? pending.findIndex(p => p.id === _desk.editing) : -1;
+  if (editingAt >= 0) _desk.i = editingAt;
+  else if (_desk.editing) {
+    _desk.editing = null;
+    _desk.unsaved = null;
+  }
   if (_desk.i >= pending.length) _desk.i = Math.max(0, pending.length - 1);
   navCount('nav-outbox', pending.length);
 
@@ -1214,6 +1308,12 @@ async function loadOutbox() {
         '<p style="color:var(--text-2);font-size:13px">' + escHtml(data.paused) +
         '. Approved mail stays queued until you resume.</p></div>'
     : '';
+  if (data.compliance_notice) {
+    banner.innerHTML +=
+      '<div class="card" style="border-color:var(--s-wait-line);background:var(--s-wait-bg);margin-bottom:16px">' +
+        '<h2 style="color:var(--s-wait)">Add your postal address</h2>' +
+        '<p style="color:var(--text-2);font-size:13px">' + escHtml(data.compliance_notice) + '</p></div>';
+  }
 
   desk.innerHTML = pending.length ? renderDesk(pending, _desk.i) :
     '<div class="card">' + emptyState('&#10003;', 'Nothing to review',
@@ -1234,7 +1334,7 @@ async function loadOutbox() {
   list.innerHTML =
     table('Approved &amp; scheduled', data.approved, [
       ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => r.subject],
-      ['Sends', r => formatDate(r.send_at), true],
+      ['Sends', r => r.status === 'sending' ? badge(r.status) : escHtml(formatDate(r.send_at)), true, true],
     ]) +
     table('Recently sent', data.sent, [
       ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => r.subject],
@@ -1246,6 +1346,45 @@ async function loadOutbox() {
     ]);
 }
 
+const CONTACT_SOURCES = {
+  known_company_backfill: 'team page on their site',
+  company_website: 'team page on their site',
+  scraped_mailto: 'address published on their site',
+  linkedin_search: 'LinkedIn search',
+  hunter_domain_search: 'Hunter domain search',
+  job_board: 'job board',
+  web_search: 'web search',
+};
+
+// What the draft is built on, so every claim can be checked against it.
+function renderDeskContext(ctx) {
+  if (!ctx) return '';
+  const row = (k, v) => v ? '<div class="k">' + k + '</div><div class="v">' + v + '</div>' : '';
+  const href = safeHref(ctx.website);
+  const site = href
+    ? '<a href="' + href + '" target="_blank" rel="noopener noreferrer">' +
+        escHtml(ctx.website.replace(/^https?:\/\//i, '')) + ' &#8599;</a>'
+    : '';
+  const who = [ctx.contact, ctx.contact_title].filter(Boolean).map(escHtml).join(' &middot; ');
+  const email = [ctx.email_status, ctx.score ? 'score ' + ctx.score : '']
+    .filter(Boolean).map(escHtml).join(' &middot; ');
+  const signals = Object.entries(ctx.signals || {})
+    .map(([k, v]) => escHtml(k) + ': <b>' + escHtml(v) + '</b>').join('<br>');
+  return '<div class="desk-context">' +
+    row('Company', escHtml(ctx.company)) +
+    row('Website', site) +
+    row('About', escHtml(ctx.description)) +
+    row('Contact', who) +
+    row('Found via', escHtml(Object.prototype.hasOwnProperty.call(CONTACT_SOURCES, ctx.contact_source)
+      ? CONTACT_SOURCES[ctx.contact_source] : ctx.contact_source)) +
+    row('Email', email) +
+    row('Signals', signals) +
+    row('Campaign', ctx.campaign ? escHtml(ctx.campaign) +
+      ' <span class="muted">(how they were found, not a fact about them)</span>' : '') +
+    row('Writer notes', escHtml(ctx.notes)) +
+  '</div>';
+}
+
 function renderDesk(items, i) {
   const cur = items[i];
   const rail = items.map((it, n) =>
@@ -1254,27 +1393,98 @@ function renderDesk(items, i) {
       '<div class="sub">' + escHtml(it.subject || '(no subject)') + '</div>' +
     '</div>').join('');
 
+  const editing = _desk.editing === cur.id;
+  const unsaved = (editing && _desk.unsaved) || {subject: cur.subject || '', body: cur.body || ''};
+  // A reply keeps its subject: Gmail threads by it.
+  const fixedSubject = cur.kind === 'reply'
+    ? ' readonly title="A reply keeps its subject so it stays in the thread"' : '';
+  const draft = editing
+    ? '<input id="desk-subject" class="desk-edit-subject" value="' + escHtml(unsaved.subject) + '"' +
+        fixedSubject + ' oninput="deskKeep()">' +
+      '<textarea id="desk-body" class="desk-edit-body" rows="14" oninput="deskKeep()">' +
+        escHtml(unsaved.body) + '</textarea>'
+    : '<div class="subject">' + escHtml(cur.subject || '(no subject)') + '</div>' +
+      '<div class="body">' + escHtml(cur.body) + '</div>';
+  // Cold email leaves with the footer underneath; show it as it will go out.
+  // Not added again when the body already ends with it, as in the Sender.
+  const added = cur.kind === 'sequence' && !(cur.body || '').trimEnd().endsWith(_desk.footer)
+    ? _desk.footer : '';
+  const footer = added
+    ? '<div class="desk-footer" title="Added when it sends (compliance in harvey.yaml)">' +
+        escHtml(added) + '</div>' : '';
+  const actions = editing
+    ? '<button class="btn btn-primary" onclick="deskSave(\'' + cur.id + '\')">Save</button>' +
+      '<button class="btn btn-secondary" onclick="deskEdit(null)">Cancel</button>'
+    : '<button class="btn btn-primary" onclick="outboxAct(\'' + cur.id + '\',\'approve\')">' +
+        'Approve <kbd>A</kbd></button>' +
+      '<button class="btn btn-secondary" onclick="deskEdit(\'' + cur.id + '\')">' +
+        'Edit <kbd>E</kbd></button>' +
+      '<button class="btn btn-secondary" onclick="outboxAct(\'' + cur.id + '\',\'reject\')">' +
+        'Reject <kbd>R</kbd></button>';
+
   return '<div class="desk">' +
     '<div class="desk-list">' + rail + '</div>' +
     '<div class="desk-pane">' +
       '<div class="to-line">To <b>' + escHtml(cur.to_email) + '</b> &middot; step ' +
         cur.step + ' (' + escHtml(cur.kind) + ') &middot; sends ' +
         formatDate(cur.send_at) + '</div>' +
-      '<div class="subject">' + escHtml(cur.subject || '(no subject)') + '</div>' +
-      '<div class="body">' + escHtml(cur.body) + '</div>' +
-      '<div class="desk-actions">' +
-        '<button class="btn btn-primary" onclick="outboxAct(\'' + cur.id + '\',\'approve\')">' +
-          'Approve <kbd>A</kbd></button>' +
-        '<button class="btn btn-secondary" onclick="outboxAct(\'' + cur.id + '\',\'reject\')">' +
-          'Reject <kbd>R</kbd></button>' +
+      renderDeskContext(cur.context) +
+      draft + footer +
+      '<div class="desk-actions">' + actions +
         '<span class="muted" style="font-size:12px;margin-left:auto">' +
           (i + 1) + ' of ' + items.length + '</span>' +
       '</div>' +
     '</div></div>';
 }
 
+function deskEdit(id) {
+  _desk.editing = id;
+  _desk.unsaved = null;
+  document.getElementById('outbox-desk').innerHTML = renderDesk(_desk.items, _desk.i);
+  if (id) document.getElementById('desk-body').focus();
+}
+
+// What's typed survives a re-render (switching tabs and back reloads the desk).
+function deskKeep() {
+  _desk.unsaved = {
+    subject: document.getElementById('desk-subject').value,
+    body: document.getElementById('desk-body').value,
+  };
+}
+
+// While a draft is being edited, nothing else on the desk may act on the
+// stored version of it: Save or Cancel first.
+function deskBusy() {
+  if (!_desk.editing) return false;
+  showToast('Save or cancel your edit first.', 'error');
+  return true;
+}
+
+async function deskSave(id) {
+  const subject = document.getElementById('desk-subject').value.trim();
+  const body = document.getElementById('desk-body').value.trim();
+  if (!subject || !body) { showToast('Subject and body are both required.', 'error'); return; }
+  let data = null;
+  try {
+    const r = await authFetch('/api/outbox/' + encodeURIComponent(id) + '/edit', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({subject: subject, body: body}),
+    });
+    if (await lockIfRefused(r)) return;
+    data = await r.json();
+  } catch {}
+  if (data && data.success) {
+    _desk.editing = null;
+    _desk.unsaved = null;
+    showToast('Saved. Still waiting for your approval.', 'success');
+    loadOutbox();
+  } else {
+    showToast((data && data.message) || 'Save failed.', 'error');
+  }
+}
+
 function deskGo(n) {
-  if (n < 0 || n >= _desk.items.length) return;
+  if (n < 0 || n >= _desk.items.length || deskBusy()) return;
   _desk.i = n;
   document.getElementById('outbox-desk').innerHTML = renderDesk(_desk.items, n);
 }
@@ -1282,6 +1492,14 @@ function deskGo(n) {
 // Keyboard review. Ignored while typing into a field, so Settings still works.
 document.addEventListener('keydown', e => {
   if (currentTab !== 'outbox' || e.metaKey || e.ctrlKey || e.altKey) return;
+  // Mid-edit, A would approve the stored draft, not what's typed. Only
+  // Escape (cancel) works until the edit is saved or cancelled.
+  if (_desk.editing) {
+    const typing = /^(input|textarea)$/i.test(e.target.tagName || '');
+    if (e.key === 'Escape') { e.preventDefault(); deskEdit(null); }
+    else if (!typing && 'jkare'.includes(e.key.toLowerCase())) { e.preventDefault(); deskBusy(); }
+    return;
+  }
   const tag = (e.target.tagName || '').toLowerCase();
   if (tag === 'input' || tag === 'textarea' || e.target.isContentEditable) return;
   const cur = _desk.items[_desk.i];
@@ -1290,9 +1508,11 @@ document.addEventListener('keydown', e => {
   else if (k === 'k') { e.preventDefault(); deskGo(_desk.i - 1); }
   else if (k === 'a' && cur) { e.preventDefault(); outboxAct(cur.id, 'approve'); }
   else if (k === 'r' && cur) { e.preventDefault(); outboxAct(cur.id, 'reject'); }
+  else if (k === 'e' && cur) { e.preventDefault(); deskEdit(cur.id); }
 });
 
 async function outboxAct(id, action) {
+  if (deskBusy()) return;
   const data = await api('/api/outbox/' + encodeURIComponent(id) + '/' + action, {method: 'POST'});
   if (data && data.success) showToast(action === 'approve' ? 'Approved — will send on schedule.' : 'Rejected.', 'success');
   else showToast('Action failed.', 'error');
@@ -1300,6 +1520,7 @@ async function outboxAct(id, action) {
 }
 
 async function outboxApproveAll() {
+  if (deskBusy()) return;
   const data = await api('/api/outbox/approve-all', {method: 'POST'});
   if (data && data.success) showToast('Approved ' + data.approved + ' email(s).', 'success');
   else showToast('Approve-all failed.', 'error');
@@ -1372,18 +1593,20 @@ async function submitFeedback(entityType, entityId, promptText) {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({entity_type: entityType, entity_id: entityId, comment: comment})
   });
-  if (data && data.success) showToast('Feedback saved. Harvey will take it into account.', 'success');
+  if (data && data.success) showToast(entityType === 'campaign'
+    ? 'Saved. Harvey follows it in the emails it writes from now on.'
+    : 'Saved. Harvey uses it if it writes this person\'s first email (Gmail, SMTP or Microsoft 365).', 'success');
   else showToast((data && data.message) || 'Could not save feedback.', 'error');
 }
 
 function fbProspect(i) {
   const p = _prospects[i];
-  if (p) submitFeedback('contact', p.id, 'Feedback on this contact:');
+  if (p) submitFeedback('contact', p.id, 'Anything Harvey should know before writing to this person?');
 }
 
 function fbCampaign(i) {
   const c = _campaigns[i];
-  if (c) submitFeedback('campaign', c.id, 'Leave feedback on this campaign:');
+  if (c) submitFeedback('campaign', c.id, 'What should Harvey do differently in the emails it writes next? (e.g. "shorter; don\'t mention reviews")');
 }
 
 async function loadProspects() {
@@ -1409,6 +1632,82 @@ async function loadProspects() {
   el.innerHTML = html + '</tbody></table></div>';
 }
 
+// Opens a filled-in compose window in whatever Gmail account the browser is
+// logged into. Nothing is sent from here — the user reads it and presses Send.
+// Same values as the Sender's _render, so a hand-sent email reads the same.
+function fillMergeVars(text, r) {
+  const inbox = r.source === 'company_inbox';
+  const vals = {
+    first_name: r.first_name || (inbox ? 'there' : ''), last_name: r.last_name || '',
+    company: r.company || '', title: r.title || '',
+    personalization: r.personalization_notes || '',
+  };
+  return String(text || '').replace(/\{\{\s*(\w+)\s*\}\}/g, (m, k) => {
+    k = k.toLowerCase();
+    return Object.prototype.hasOwnProperty.call(vals, k) ? vals[k] : m;
+  });
+}
+
+let _gmailBusy = false;  // one compose window per click, never two
+
+async function openInGmail(ci, si, ri) {
+  if (_gmailBusy) return;
+  const c = _campaigns[ci];
+  const step = c && (c.sequence || [])[si];
+  const r = c && (c.recipients || [])[ri];
+  if (!step || !r) return;
+  // Cold email carries the postal address and opt-out line, sent by hand too.
+  const filled = fillMergeVars(step.body, r).trimEnd();
+  const body = filled + (c.footer && !filled.endsWith(c.footer) ? '\n\n' + c.footer : '');
+  // authuser picks the Google account Harvey sends as, not just whichever
+  // one the browser happens to be signed into.
+  const url = 'https://mail.google.com/mail/?view=cm&fs=1' +
+    (c.send_as ? '&authuser=' + encodeURIComponent(c.send_as) : '') +
+    '&to=' + encodeURIComponent(r.email) +
+    '&su=' + encodeURIComponent(fillMergeVars(step.subject, r)) +
+    '&body=' + encodeURIComponent(body);
+  const left = /\{\{\s*\w+\s*\}\}/.test(fillMergeVars(step.subject, r) + fillMergeVars(step.body, r));
+  // No 'noopener' feature string: with it window.open always returns null,
+  // so a blocked pop-up could not be told apart from a successful one. The
+  // tab opens blank right away (inside the click, so it isn't blocked) and
+  // only gets the draft once the send is recorded.
+  const w = window.open('', '_blank');
+  if (!w) {
+    showToast('Your browser blocked the Gmail tab. Allow pop-ups for this page and click again.', 'error');
+    return;
+  }
+  w.opener = null;
+  // Record the send BEFORE the user can press Send in Gmail, so Harvey can
+  // never email them as well — not even if they forget to tick the box.
+  _gmailBusy = true;
+  let claimed = r.sent_by_hand;
+  try { if (!claimed) claimed = await markSent(ci, ri, true); } finally { _gmailBusy = false; }
+  if (!claimed) { w.close(); return; }
+  w.location.href = url;
+  if (left) showToast('This draft still has a {{placeholder}} in it. Fix it in Gmail before sending.', 'error');
+}
+
+async function markSent(ci, ri, sent) {
+  const r = (_campaigns[ci] && _campaigns[ci].recipients || [])[ri];
+  if (!r) return;
+  let res = null;
+  try {
+    const resp = await authFetch('/api/prospects/' + encodeURIComponent(r.id) + '/sent', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({sent}),
+    });
+    if (await lockIfRefused(resp)) return;
+    res = await resp.json();
+  } catch {}
+  const ok = !!(res && res.success);
+  if (!ok) showToast((res && res.message) || 'Could not save that. Try again.', 'error');
+  else if (!sent && res.sent) showToast('They already replied, so this stays marked as sent.');
+  loadCampaigns();
+  // True only when this call changed it: a status means they replied or
+  // opted out, 'already' means another click or tab got there first.
+  return ok && sent === !!res.sent && !res.status && !res.already;
+}
+
 async function loadCampaigns() {
   const el = document.getElementById('campaigns-list');
   const data = await api('/api/campaigns');
@@ -1422,12 +1721,43 @@ async function loadCampaigns() {
   let html = '';
   data.forEach((c, i) => {
     let stepsHtml = '';
-    for (const step of (c.sequence || [])) {
+    (c.sequence || []).forEach((step, s) => {
+      const sendBtns = (c.recipients || []).map((r, ri) => {
+        // Only offered when Harvey can't send itself and this person can
+        // still be emailed (the server decides: can_send_by_hand).
+        if (r.sent_by_hand) {
+          const tick = '<label style="display:inline-flex;align-items:center;gap:4px;font-size:13px;cursor:pointer">' +
+            '<input type="checkbox" checked onchange="markSent(' + i + ',' + ri + ',this.checked)"> ' +
+            '&#10003; Sent by you</label>';
+          if (s === 0) return escHtml(r.email) + ' ' + tick;
+          // Follow-ups are the user's too: Harvey never emails someone they emailed.
+          return '<button class="btn btn-secondary btn-sm" onclick="openInGmail(' + i + ',' + s + ',' + ri + ')">' +
+            'Open in Gmail &rarr; ' + escHtml(r.email) + '</button>' +
+            '<span class="muted" style="font-size:12px">Harvey won\'t send follow-ups to people you emailed yourself.</span>';
+        }
+        if (s !== 0) return '';
+        if (!r.can_send_by_hand) {
+          // Harvey sends here; this only records an email the user already sent.
+          return r.can_mark_sent
+            ? '<label class="muted" style="display:inline-flex;align-items:center;gap:4px;font-size:12px;cursor:pointer">' +
+              '<input type="checkbox" onchange="markSent(' + i + ',' + ri + ',this.checked)"> ' +
+              'I already emailed ' + escHtml(r.email) + ' myself</label>'
+            : '';
+        }
+        const risky = r.email_status === 'risky'
+          ? ' <span class="muted" style="font-size:12px">(catch-all address, may bounce)</span>' : '';
+        return '<button class="btn btn-primary btn-sm" onclick="openInGmail(' + i + ',' + s + ',' + ri + ')">' +
+          'Open in Gmail &rarr; ' + escHtml(r.email) + '</button>' + risky +
+          '<label style="display:inline-flex;align-items:center;gap:4px;font-size:13px;cursor:pointer">' +
+          '<input type="checkbox" onchange="markSent(' + i + ',' + ri + ',this.checked)"> Mark as sent</label>'
+      }).filter(Boolean).join(' ');
       stepsHtml += '<div class="email-step"><div class="step-num">Email ' + escHtml(String(step.step || '?')) +
         (step.delay_days ? ' &middot; send after ' + escHtml(String(step.delay_days)) + ' days' : '') + '</div>' +
         '<div class="subject">' + escHtml(step.subject) + '</div>' +
-        '<div class="body">' + escHtml(step.body) + '</div></div>';
-    }
+        '<div class="body">' + escHtml(step.body) + '</div>' +
+        (sendBtns ? '<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">' + sendBtns + '</div>' : '') +
+        '</div>';
+    });
     const pc = (c.prospect_ids || []).length;
     html += '<div class="campaign-card"><h3>' + escHtml(c.name || 'Untitled Campaign') + '</h3>' +
       '<div class="meta">' + badge(c.status) + '<span>' + escHtml(c.channel || 'email') + '</span>' +
@@ -1491,8 +1821,15 @@ loadRuns();
 loadTodayActivity();
 loadHarveyStatus();
 
+loadLiveStatus();
+
 // Agent status: quick poll (not while locked: it would only be refused)
 setInterval(() => { if (!_locked) loadHarveyStatus(); }, 8000);
+
+// Live status panel: refreshed while the Today tab is open and visible.
+setInterval(() => {
+  if (!document.hidden && !_locked && currentTab === 'today') loadLiveStatus();
+}, 10000);
 
 // Nav counts stay live wherever you are, so "something needs me" is visible
 // from any tab without polling that tab's contents.

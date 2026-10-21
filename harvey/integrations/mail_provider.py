@@ -16,6 +16,7 @@ it isn't a MailProvider because Instantly owns sequencing/sending itself.
 """
 
 import logging
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
@@ -52,6 +53,58 @@ BOUNCE_SUBJECTS = (
     "delivery failure", "failure notice", "could not be delivered",
     "delivery incomplete", "address not found",
 )
+
+
+# Where a reply starts quoting the email it answers. Clients wrap the
+# "On ... wrote:" line, so one line break is allowed inside it.
+# After these, the quoted email is usually marked with ">", so any unmarked
+# lines under them are the person's own inline answers.
+_ATTRIBUTION_HEADERS = (
+    # Gmail / Apple Mail, and the Spanish, German and French equivalents
+    re.compile(r"^[ \t]*On\b[^\n]{0,300}(?:\n[^\n]{0,300})?\bwrote:[ \t]*$", re.MULTILINE),
+    re.compile(r"^[ \t]*El\b[^\n]{0,300}(?:\n[^\n]{0,300})?\bescribi[oó]:[ \t]*$", re.MULTILINE),
+    re.compile(r"^[ \t]*Am\b[^\n]{0,300}(?:\n[^\n]{0,300})?\bschrieb[^\n]{0,100}:[ \t]*$", re.MULTILINE),
+    re.compile(r"^[ \t]*Le\b[^\n]{0,300}(?:\n[^\n]{0,300})?\ba [ée]crit[ \t]*:[ \t]*$", re.MULTILINE),
+)
+# Outlook-style blocks: the quoted email follows unmarked, so everything
+# from here on is cut.
+_BLOCK_HEADERS = (
+    re.compile(r"^[ \t]*-{2,}[ \t]*Original Message[ \t]*-{2,}", re.MULTILINE | re.IGNORECASE),
+    re.compile(r"^[ \t]*(?:_{10,}[ \t]*\n[ \t]*)?(?:From|Von|De):[^\n]*\n[ \t]*"
+               r"(?:Sent|Date|Gesendet|Enviado|Envoy[ée]):", re.MULTILINE),
+)
+
+
+def _unquoted(text: str) -> str:
+    return "\n".join(l for l in text.split("\n") if not l.lstrip().startswith(">"))
+
+
+def strip_quoted_reply(body: str) -> str:
+    """What the sender wrote, without the email they're answering.
+
+    ">" lines are dropped wherever they are. An "On ... wrote:" line is
+    dropped too, and the unmarked lines under it are kept when the quote
+    below it is ">"-marked (inline answers); when it isn't, everything from
+    it on is the quote. An Outlook From:/Sent: block cuts the rest. Never
+    returns nothing for a non-empty reply. The Handler also drops any line
+    that repeats what Harvey sent, which catches quotes no header marks.
+    """
+    text = (body or "").replace("\r\n", "\n")
+    cut = len(text)
+    for pattern in _BLOCK_HEADERS:
+        m = pattern.search(text)
+        if m and m.start() < cut:
+            cut = m.start()
+    head, tail = text[:cut], ""
+    for pattern in _ATTRIBUTION_HEADERS:
+        m = pattern.search(head)
+        if not m:
+            continue
+        below = head[m.end():]
+        marked = any(l.lstrip().startswith(">") for l in below.split("\n"))
+        head = head[:m.start()] + ("\n" + below if marked else "")
+    kept = _unquoted(head).strip() or _unquoted(text).strip()
+    return re.sub(r"\n{3,}", "\n\n", kept)
 
 
 def looks_like_bounce(from_email: str, subject: str) -> bool:

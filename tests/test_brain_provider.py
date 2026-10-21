@@ -344,6 +344,8 @@ async def test_main_heartbeat_builds_brain_from_config(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_existing_usage_rows_become_claude(tmp_path):
+    from datetime import date
+
     import aiosqlite
     from harvey.state import MIGRATIONS
 
@@ -353,7 +355,10 @@ async def test_existing_usage_rows_become_claude(tmp_path):
             await db.executescript(script)
         await db.execute("PRAGMA user_version = 10")
         await db.execute("INSERT INTO usage_events (id, model, output_tokens) VALUES ('a', 'm', 5)")
-        await db.execute("INSERT INTO usage_log (id, date, claude_calls) VALUES ('u', date('now'), 7)")
+        # Harvey keys usage_log by the LOCAL date (date.today()); SQLite's
+        # date('now') is UTC, which is already tomorrow on a US evening.
+        await db.execute("INSERT INTO usage_log (id, date, claude_calls) VALUES ('u', ?, 7)",
+                         (date.today().isoformat(),))
         await db.commit()
 
     sm = StateManager(db_path)

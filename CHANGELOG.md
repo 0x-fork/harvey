@@ -7,8 +7,69 @@ minor versions can still change behaviour.
 
 ## [Unreleased]
 
+### Added
+
+- **`harvey warmup [domain]`**: checks whether a sending domain is ready for
+  cold email. It covers MX, SPF (`+all`, duplicates, top-level lookups), DKIM,
+  DMARC, domain age, domain and SMTP-IP blocklists (a list that refuses the
+  query is reported as such, not as a listing), warmup progress and bounce
+  rate, then gives a READY / NOT READY verdict. It's read-only, and a DNS
+  timeout is reported as unknown, never as a missing record.
+- **A cold-email ramp for new domains** (`channels.email.warmup`). From
+  `start_date`, no cold email goes out for `min_days`; then the cold cap starts
+  at `start_sends` and climbs by `daily_increase` a day up to
+  `max_daily_sends`, counted per local day. Gmail, Microsoft and SMTP only:
+  Instantly has its own warmup and per-account limits. Replies are never
+  held. Off unless `start_date` is set. Both based on #18 by Tariz Shahid.
+- **A postal address and opt-out line under every cold email** (CAN-SPAM).
+  Set `compliance.postal_address` in `harvey.yaml`; `compliance.opt_out_line`
+  defaults to *Not interested? Reply "no thanks" and I won't email again.*
+  Both are added when the email sends (native providers and Instantly), never
+  to replies, and the Outbox shows them under each draft; "Open in Gmail"
+  includes them too. Without an address (or with the opt-out line turned
+  off), cold email still sends, and `harvey run`, `harvey status` and the
+  Outbox tab warn until it's set. The opt-out line must ask for a reply
+  Harvey recognises and can't contain a link. Based on #13 by Camilo Cruz.
+
 ### Fixed
 
+- A follow-up no longer goes out before, or right after, the email it
+  follows. Each step now waits until the previous one has actually been sent
+  and its gap (at least a day) has passed. Before, approving a batch of drafts
+  late, or resuming after a pause or a compliance hold, could send a whole
+  sequence within minutes, or step 2 before step 1. A follow-up whose earlier
+  email was rejected or failed is cancelled instead of arriving as a first
+  email.
+- **Windows:** text files (harvey.yaml, .env, prompts, skills, trained
+  output, tokens, exports) are read and written as UTF-8 instead of the
+  locale code page, so `harvey train` no longer crashes on characters like
+  "★" and prompts aren't garbled; command output is UTF-8 too, so the
+  dashboard's log of `harvey run` can't crash on "⚠". An npm install's
+  `claude.cmd` shim is resolved to the native `claude.exe` it wraps and is
+  never run through cmd.exe, which would re-parse Harvey's isolation flags;
+  if the executable is missing, Harvey says how to fix it. Files an older
+  Harvey saved in the Windows code page (trained skills, harvey.yaml) still
+  load, with a warning to re-save them as UTF-8. `harvey export` CSVs are now
+  UTF-8 on Windows too, which sequencers expect (Excel needs Data > From
+  Text/CSV to show accents). Based on #18 by Tariz Shahid.
+- Replies are read without the email they quote. The model, the stored thread
+  and the answer get the reply without the quoted email, and any line that
+  repeats what Harvey sent that person is set aside, so Harvey's own words
+  (its footer, or an escalation word like "attorney" in its pitch) don't count
+  as theirs. Opt-out and escalation words the person wrote are still found
+  anywhere, including between or under quoted lines. "No thanks" / "no thank
+  you" as a phrase, and a reply of just "STOP", now count as opt-outs.
+
+- The Sender claims each email right before sending it. A reply, bounce, hand
+  send or rejection that cancels an approved email while the Sender is working
+  through its queue now stops it, instead of the Sender sending its earlier
+  copy and recording it as sent. Two Harvey processes running at once can no
+  longer send the same email twice. An email cut off mid-send (Harvey stopped,
+  or the mail library crashed mid-call) is marked failed and never retried, since
+  it may have gone out; it shows under "Didn't send" with a note to check your
+  Sent folder, and the dashboard won't offer to email that person by hand.
+  Rejecting an email that is already sending or sent is refused instead of
+  relabelling it.
 - Keep local website requests out of private networks, including redirects and
   DNS rebinding. Preserve the original hostname for TLS verification. Website
   fetching (search, company sites, profiling, the training crawler) now ignores
@@ -33,6 +94,27 @@ minor versions can still change behaviour.
   installation in Docker. Thanks to @EICCIO-Advisors for the private report.
 
 ### Added
+
+- **Send by hand from the dashboard, and a live status panel.** With no
+  mailbox connected (or email turned off), each campaign's first email has an
+  **Open in Gmail** button that fills in a compose window in the account
+  Harvey sends as, and a **Mark as sent** box. Harvey never sends to someone
+  marked sent by hand, even if a mailbox is connected later, and only offers
+  it for people it could still email (not opted out, replied, bounced, or
+  already queued by Harvey). The Today tab gains a panel showing each pipeline
+  step, what's running, and what to do next.
+
+- **Outbox review: see what a draft is based on, and edit it.** Each pending
+  draft now shows its campaign, the company (name, clickable website,
+  description), the contact and how they were found, email status and score,
+  tech / agency / hiring / ads / booking signals, and the Writer's notes, so
+  every claim can be checked against what Harvey actually found. **Edit** (or
+  `E`) turns subject and body into fields; Save rewrites the draft only while
+  it is still `pending_review` and never approves it. An edit the sender
+  would block (merge tags, HTML, banned phrases) is refused on save with the
+  reason; a reply keeps its subject so it stays in the thread; every edit is
+  logged with what it replaced. While editing, the shortcuts and Approve all
+  can't act on the unedited draft. `POST /api/outbox/{id}/edit` backs it.
 
 - **Microsoft 365 mail provider.** Set `channels.email.provider: microsoft` to
   send and read through a Microsoft 365 / Outlook mailbox via Microsoft Graph,
