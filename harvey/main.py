@@ -418,9 +418,9 @@ def _needs_setup() -> bool:
         return True
 
     try:
-        with open(config_file, encoding="utf-8") as f:
-            import yaml
-            config = yaml.safe_load(f)
+        import yaml
+        from harvey.textio import read_user_text
+        config = yaml.safe_load(read_user_text(config_file))
         if not isinstance(config, dict):
             return True
         company = (config.get("persona") or {}).get("company", "")
@@ -470,4 +470,6 @@ def main():
 
 
 if __name__ == "__main__":
+    from harvey.textio import utf8_stdio
+    utf8_stdio()
     main()

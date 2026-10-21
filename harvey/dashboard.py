@@ -26,6 +26,7 @@ logger = logging.getLogger("harvey.dashboard")
 
 from harvey import dashboard_auth as auth  # noqa: E402
 from harvey.paths import PROJECT_ROOT  # noqa: E402
+from harvey.textio import read_user_text  # noqa: E402
 DB_PATH = PROJECT_ROOT / "data" / "harvey.db"
 ENV_FILE = PROJECT_ROOT / ".env"
 CONFIG_FILE = PROJECT_ROOT / "harvey.yaml"
@@ -90,7 +91,7 @@ def _read_env_file() -> dict[str, str]:
     """Read .env file and return as dict."""
     env_vars = {}
     if ENV_FILE.exists():
-        for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+        for line in read_user_text(ENV_FILE).splitlines():
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 key, _, value = line.partition("=")
@@ -122,7 +123,7 @@ def _write_env_file(updates: dict[str, str]):
         raise OSError(f"{ENV_FILE} is a symbolic link; edit it by hand.")
     if ENV_FILE.exists() and not ENV_FILE.is_file():
         raise OSError(f"{ENV_FILE} is not a regular file.")
-    lines = (ENV_FILE.read_text(encoding="utf-8").splitlines()
+    lines = (read_user_text(ENV_FILE).splitlines()
              if ENV_FILE.exists() else [])
 
     out, written = [], set()
@@ -241,8 +242,7 @@ async def get_setup_status():
     config_path = _resolve_config_file()
     if config_path.exists():
         try:
-            with open(config_path, encoding="utf-8") as f:
-                cfg = yaml.safe_load(f)
+            cfg = yaml.safe_load(read_user_text(config_path))
             company = cfg.get("persona", {}).get("company", "")
             product = cfg.get("product", {}).get("name", "")
             config_valid = company not in ("Your Company", "") and product not in ("Your Product", "")
@@ -301,8 +301,7 @@ async def get_setup_status():
 def _current_provider() -> str:
     """Read channels.email.provider from the active config (best-effort)."""
     try:
-        with open(_resolve_config_file(), encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
+        cfg = yaml.safe_load(read_user_text(_resolve_config_file())) or {}
         return ((cfg.get("channels") or {}).get("email") or {}).get("provider", "instantly")
     except Exception:
         return "instantly"

@@ -19,6 +19,7 @@ from harvey.state import StateManager
 logger = logging.getLogger("harvey.brain")
 
 from harvey.paths import PROJECT_ROOT
+from harvey.textio import read_user_text
 
 PROMPTS_DIR = PROJECT_ROOT / "prompts"
 SKILLS_DIR = PROJECT_ROOT / "skills"
@@ -387,7 +388,7 @@ class Brain:
 
             except FileNotFoundError:
                 logger.error(
-                    "Claude CLI not found. Install it: https://claude.com/download"
+                    "Claude CLI not found. Install it: https://code.claude.com/docs/en/setup"
                 )
                 return ""  # not retryable
             except asyncio.CancelledError:
@@ -675,7 +676,7 @@ class Brain:
         """Load a prompt template from the prompts/ directory and fill in variables."""
         prompt_file = PROMPTS_DIR / f"{prompt_name}.md"
         try:
-            template = prompt_file.read_text(encoding="utf-8")
+            template = read_user_text(prompt_file)
         except FileNotFoundError:
             logger.warning(f"Prompt file not found: {prompt_file}")
             return ""
@@ -696,7 +697,7 @@ class Brain:
         """Load a skill knowledge file from the skills/ directory."""
         skill_file = SKILLS_DIR / f"{skill_name}.md"
         try:
-            return skill_file.read_text(encoding="utf-8")
+            return read_user_text(skill_file)
         except FileNotFoundError:
             logger.warning(f"Skill file not found: {skill_file}")
             return ""

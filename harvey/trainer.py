@@ -26,6 +26,7 @@ from harvey.state import StateManager
 logger = logging.getLogger("harvey.trainer")
 
 from harvey.paths import PROJECT_ROOT
+from harvey.textio import read_user_text
 
 
 def _normalize_start_url(url: str) -> str:
@@ -400,7 +401,7 @@ def write_trained_config(learned: dict, path: Path) -> dict:
     source = path if path.exists() else path.with_name("harvey.yaml")
     existing = None
     if source.exists():
-        raw = source.read_text(encoding="utf-8")
+        raw = read_user_text(source)
         try:
             existing = yaml.safe_load(raw)
         except yaml.YAMLError:
@@ -933,4 +934,6 @@ def main():
 
 
 if __name__ == "__main__":
+    from harvey.textio import utf8_stdio
+    utf8_stdio()
     main()

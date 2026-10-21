@@ -1,0 +1,41 @@
+"""Text files and console output, the same on every platform.
+
+Harvey reads and writes its files as UTF-8. Windows' default is the locale
+code page (cp1252), so files saved there by an older Harvey, or edited in a
+Windows tool, may not be UTF-8: those are still read, with a warning.
+"""
+
+import locale
+import logging
+import sys
+from pathlib import Path
+
+logger = logging.getLogger("harvey.textio")
+
+
+def read_user_text(path) -> str:
+    """A file a person or an older Harvey may have saved (harvey.yaml, .env,
+    skills, prompts): UTF-8, with or without a BOM, else the locale's code
+    page. Raises what reading the file raises (FileNotFoundError...)."""
+    data = Path(path).read_bytes()
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        encoding = locale.getpreferredencoding(False)
+        logger.warning(
+            f"{path} isn't saved as UTF-8; read it as {encoding}. Re-save it as "
+            "UTF-8 to keep characters like ★ or — intact.")
+        return data.decode(encoding, errors="replace")
+
+
+def utf8_stdio(*streams):
+    """Write output as UTF-8. On Windows, output going to a file or pipe (the
+    dashboard's log of `harvey run`) uses the locale code page, where "⚠" or
+    "→" in a message would crash print(). stderr keeps backslash escapes, so
+    odd bytes stay diagnosable."""
+    for stream in streams or (sys.stdout, sys.stderr):
+        errors = "backslashreplace" if stream is sys.stderr else "replace"
+        try:
+            stream.reconfigure(encoding="utf-8", errors=errors)
+        except (AttributeError, ValueError, OSError):
+            pass  # not a reconfigurable text stream (tests, embedded use)

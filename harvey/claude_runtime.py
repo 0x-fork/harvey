@@ -81,14 +81,39 @@ class ClaudeRuntimeError(Exception):
 _PLATFORM = sys.platform
 
 
+# npm/yarn/pnpm shims name their target relative to the shim's folder:
+#   "%dp0%\node_modules\@anthropic-ai\claude-code\bin\claude.exe"   %*
+_SHIM_TARGET_RE = re.compile(r'"%~?dp0%?\\([^"%]+?\.exe)"', re.IGNORECASE)
+# Before its install script runs, the package's bin/claude.exe is a small
+# text placeholder, not the real binary.
+_MIN_NATIVE_BYTES = 4096
+INSTALL_HINT = (
+    "Install Claude Code (https://code.claude.com/docs/en/setup): on Windows run "
+    "'irm https://claude.ai/install.ps1 | iex' in PowerShell or "
+    "'winget install Anthropic.ClaudeCode'; or 'npm install -g "
+    "@anthropic-ai/claude-code@latest' (without --ignore-scripts)."
+)
+
+
+def _shim_target(shim: Path) -> Path:
+    """The native exe a .cmd shim launches (read from the shim, else npm's
+    usual layout next to it)."""
+    try:
+        m = _SHIM_TARGET_RE.search(shim.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        m = None
+    if m:
+        return shim.parent / Path(m.group(1).replace("\\", "/"))
+    return shim.parent / "node_modules" / "@anthropic-ai" / "claude-code" / "bin" / "claude.exe"
+
+
 def _locate(env: dict | None) -> tuple[str | None, Path | None]:
-    """(what PATH finds, the native exe an npm shim wraps or None)."""
+    """(what PATH finds, the native exe a Windows shim wraps or None)."""
     path = (env if env is not None else os.environ).get("PATH")
     found = shutil.which("claude", path=path)
     if not found or _PLATFORM != "win32" or not found.lower().endswith((".cmd", ".bat")):
         return found, None
-    return found, (Path(found).parent / "node_modules" / "@anthropic-ai" / "claude-code"
-                   / "bin" / "claude.exe")
+    return found, _shim_target(Path(found))
 
 
 def find_claude(env: dict | None = None) -> str | None:
@@ -103,13 +128,14 @@ def find_claude(env: dict | None = None) -> str | None:
     found, native = _locate(env)
     if native is None:
         return found
-    if native.is_file():
+    if native.is_file() and native.stat().st_size >= _MIN_NATIVE_BYTES:
         return str(native)
+    problem = ("is only a placeholder: the package's install script didn't run"
+               if native.is_file() else "isn't there")
     raise ClaudeRuntimeError(
-        f"Found only npm's claude.cmd shim ({found}), which Harvey won't run: "
-        "cmd.exe would re-parse the flags that keep each call isolated. Install "
-        "the native Claude Code for Windows (https://claude.com/download), or "
-        "update the npm package so it includes claude.exe, then try again.")
+        f"Found the claude.cmd shim ({found}), but the claude.exe it launches "
+        f"({native}) {problem}. Harvey never runs Claude through cmd.exe, which "
+        f"re-parses the flags that keep each call isolated. {INSTALL_HINT}")
 
 
 def runtime_env(cwd: str, base: dict | None = None) -> dict:
@@ -177,8 +203,8 @@ def _fingerprint(executable: str) -> tuple:
 def fingerprint(env: dict | None = None) -> tuple:
     """Changes when the installed CLI changes (used to re-check a pause)."""
     found, native = _locate(env)
-    # A refused npm shim is tracked by the exe it should wrap: installing it
-    # changes the fingerprint, so a pause is re-checked.
+    # A Windows shim is tracked by the exe it wraps, so the fingerprint
+    # changes when that's installed or updated.
     exe = str(native) if native is not None else found
     return _fingerprint(exe) if exe else ("", None, None)
 
@@ -210,7 +236,7 @@ def check_cli(env: dict | None = None) -> str:
     exe = find_claude(env)
     if not exe:
         raise ClaudeRuntimeError(
-            "Claude CLI not found on PATH. Install it (https://claude.com/download) "
+            "Claude CLI not found on PATH. Install it (https://code.claude.com/docs/en/setup) "
             "and run 'claude login'.")
     key = _fingerprint(exe)
     with _capable_lock:

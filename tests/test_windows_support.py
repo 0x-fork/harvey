@@ -76,7 +76,7 @@ def _npm_install(tmp_path, with_native=True):
     native = shim.parent / "node_modules" / "@anthropic-ai" / "claude-code" / "bin" / "claude.exe"
     if with_native:
         native.parent.mkdir(parents=True)
-        native.write_bytes(b"MZ")
+        native.write_bytes(b"MZ" + bytes(8190))
     return shim, native
 
 
@@ -95,7 +95,35 @@ def test_windows_npm_shim_without_the_executable_is_refused(tmp_path, monkeypatc
     monkeypatch.setattr(claude_runtime.shutil, "which", lambda *a, **k: str(shim))
     with pytest.raises(claude_runtime.ClaudeRuntimeError) as err:
         real_find_claude()
-    assert "claude.cmd" in str(err.value).lower() and "install" in str(err.value).lower()
+    message = str(err.value)
+    assert "claude.cmd" in message.lower() and "isn't there" in message
+    assert "install.ps1" in message and "winget" in message
+
+
+def test_a_placeholder_exe_from_a_skipped_install_script_is_refused(tmp_path, monkeypatch):
+    shim, native = _npm_install(tmp_path, with_native=False)
+    native.parent.mkdir(parents=True)
+    native.write_text("placeholder until install.cjs runs", encoding="utf-8")
+    monkeypatch.setattr(claude_runtime, "_PLATFORM", "win32")
+    monkeypatch.setattr(claude_runtime.shutil, "which", lambda *a, **k: str(shim))
+    with pytest.raises(claude_runtime.ClaudeRuntimeError) as err:
+        real_find_claude()
+    assert "install script" in str(err.value)
+
+
+def test_the_shim_is_read_for_where_it_points(tmp_path, monkeypatch):
+    # pnpm/yarn keep the package somewhere else; the shim says where.
+    shim = tmp_path / "pnpm" / "claude.CMD"
+    shim.parent.mkdir()
+    shim.write_text('@ECHO off\r\n"%~dp0\\global\\5\\node_modules\\@anthropic-ai\\'
+                    'claude-code\\bin\\claude.exe"   %*\r\n', encoding="utf-8")
+    native = shim.parent / "global" / "5" / "node_modules" / "@anthropic-ai" / "claude-code" \
+        / "bin" / "claude.exe"
+    native.parent.mkdir(parents=True)
+    native.write_bytes(b"MZ" + bytes(8190))
+    monkeypatch.setattr(claude_runtime, "_PLATFORM", "win32")
+    monkeypatch.setattr(claude_runtime.shutil, "which", lambda *a, **k: str(shim))
+    assert Path(real_find_claude()) == native
 
 
 @pytest.mark.parametrize("platform, found", [
@@ -120,21 +148,46 @@ def test_not_installed_is_still_none(monkeypatch):
 def test_cli_output_never_crashes_on_a_legacy_code_page():
     # The dashboard runs `harvey run` with output going to a log file, which
     # Windows opens in cp1252: "⚠" or "→" in a message would crash print().
-    from harvey.cli import _utf8_stdio
+    from harvey.textio import utf8_stdio
     raw = io.BytesIO()
     stream = io.TextIOWrapper(raw, encoding="cp1252")
-    _utf8_stdio(stream)
+    utf8_stdio(stream)
     print("⚠ sending paused → resume", file=stream)
     stream.flush()
     assert raw.getvalue().decode("utf-8").startswith("⚠ sending paused → resume")
 
 
 def test_installing_the_missing_executable_changes_the_fingerprint(tmp_path, monkeypatch):
-    # A paused brain re-checks the CLI only when this changes.
+    # The fingerprint follows the exe a shim wraps, not the shim itself.
     shim, native = _npm_install(tmp_path, with_native=False)
     monkeypatch.setattr(claude_runtime, "_PLATFORM", "win32")
     monkeypatch.setattr(claude_runtime.shutil, "which", lambda *a, **k: str(shim))
     before = claude_runtime.fingerprint()
     native.parent.mkdir(parents=True)
-    native.write_bytes(b"MZ")
+    native.write_bytes(b"MZ" + bytes(8190))
     assert claude_runtime.fingerprint() != before
+
+
+def test_files_saved_in_the_old_windows_code_page_still_load(tmp_path, caplog):
+    # Before this fix, Harvey on Windows saved trained skills as cp1252.
+    from harvey.textio import read_user_text
+    old = tmp_path / "product_knowledge.md"
+    old.write_bytes("We\u2019re a caf\u00e9 \u2014 fast.".encode("cp1252"))
+    text = read_user_text(old)
+    assert "caf" in text and "fast" in text
+    assert "isn't saved as UTF-8" in caplog.text
+    bom = tmp_path / ".env"
+    bom.write_bytes("\ufeffGMAIL_CLIENT_ID=x\n".encode("utf-8"))
+    assert read_user_text(bom).startswith("GMAIL_CLIENT_ID=")  # Notepad's BOM dropped
+
+
+def test_a_cp1252_config_loads(tmp_path):
+    import yaml
+    from harvey.config import load_config
+    data = yaml.safe_load((HARVEY.parent / "harvey.yaml").read_text(encoding="utf-8"))
+    data["persona"]["company"] = "Caf\u00e9 \u2014 Studio"
+    config = tmp_path / "harvey.yaml"
+    config.write_bytes(yaml.safe_dump(data, allow_unicode=True).encode("cp1252"))
+    company = load_config(str(config)).persona.company
+    # Exact under a cp1252 locale (Windows CI); readable, not a crash, elsewhere.
+    assert company.startswith("Caf") and company.endswith("Studio")

@@ -17,6 +17,7 @@ from harvey.state import StateManager
 logger = logging.getLogger("harvey.setup")
 
 from harvey.paths import PROJECT_ROOT
+from harvey.textio import read_user_text
 ENV_FILE = PROJECT_ROOT / ".env"
 ENV_EXAMPLE = PROJECT_ROOT / ".env.example"
 CONFIG_FILE = PROJECT_ROOT / "harvey.yaml"
@@ -596,7 +597,7 @@ class SetupWizard:
         """Write the .env file, preserving any existing variables we didn't touch."""
         existing: dict[str, str] = {}
         if ENV_FILE.exists():
-            for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+            for line in read_user_text(ENV_FILE).splitlines():
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
                     key, _, value = line.partition("=")
@@ -630,8 +631,7 @@ class SetupWizard:
         elif self.config:
             # Config already exists (from trainer), update behavior settings only
             try:
-                with open(CONFIG_FILE, encoding="utf-8") as f:
-                    existing = yaml.safe_load(f) or {}
+                existing = yaml.safe_load(read_user_text(CONFIG_FILE)) or {}
                 existing["usage"] = self.config.get("usage", existing.get("usage", {}))
                 existing["brain"] = self.config["brain"]
                 if "LINKEDIN_EMAIL" in self.env_vars:
@@ -711,4 +711,6 @@ def main():
 
 
 if __name__ == "__main__":
+    from harvey.textio import utf8_stdio
+    utf8_stdio()
     main()
