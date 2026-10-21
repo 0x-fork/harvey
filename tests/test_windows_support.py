@@ -230,3 +230,10 @@ def test_a_shim_pointing_to_another_drive(tmp_path):
                     '\\claude.exe"   %*\r\n', encoding="utf-8")
     assert str(claude_runtime._shim_target(shim)).replace("\\", "/") == \
         "D:/pnpm/global/5/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+
+
+def test_windows_line_endings_read_as_newlines(tmp_path):
+    from harvey.textio import read_user_text
+    f = tmp_path / "skill.md"
+    f.write_bytes(b"# Humanizer\r\nCut the tells.\r\n")
+    assert read_user_text(f) == "# Humanizer\nCut the tells.\n"

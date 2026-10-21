@@ -16,10 +16,11 @@ logger = logging.getLogger("harvey.textio")
 def read_user_text(path) -> str:
     """A file a person or an older Harvey may have saved (harvey.yaml, .env,
     skills, prompts): UTF-8, with or without a BOM, else the locale's code
-    page. Raises what reading the file raises (FileNotFoundError...)."""
+    page. Line endings come back as \n, as text-mode reads give them.
+    Raises what reading the file raises (FileNotFoundError...)."""
     data = Path(path).read_bytes()
     try:
-        return data.decode("utf-8-sig")
+        return _newlines(data.decode("utf-8-sig"))
     except UnicodeDecodeError:
         # The system code page (cp1252 on most Windows), even in Python's
         # UTF-8 mode, where getpreferredencoding() would say utf-8.
@@ -27,7 +28,11 @@ def read_user_text(path) -> str:
         logger.warning(
             f"{path} isn't saved as UTF-8; read it as {encoding}. Re-save it as "
             "UTF-8 to keep characters like ★ or — intact.")
-        return data.decode(encoding, errors="replace")
+        return _newlines(data.decode(encoding, errors="replace"))
+
+
+def _newlines(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def utf8_stdio(*streams):
