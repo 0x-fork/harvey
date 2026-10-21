@@ -211,7 +211,7 @@ async def get_setup_status():
     elif provider == "microsoft":
         provider_done = _has("M365_CLIENT_ID") and \
             (PROJECT_ROOT / "data" / "m365_token.json").is_file()
-        provider_help = ("Set M365_CLIENT_ID and M365_TENANT_ID in .env, then run "
+        provider_help = ("Set the Microsoft 365 client and tenant IDs in Settings, then run "
                          "'harvey microsoft auth' in your terminal.")
     elif provider == "smtp":
         provider_done = _has("SMTP_HOST", "SMTP_USERNAME", "SMTP_PASSWORD")
@@ -317,6 +317,7 @@ async def get_settings():
         "GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET",
         "SMTP_HOST", "SMTP_PORT", "SMTP_USERNAME", "SMTP_PASSWORD",
         "IMAP_HOST", "IMAP_PORT", "IMAP_USERNAME", "IMAP_PASSWORD",
+        "M365_CLIENT_ID", "M365_TENANT_ID",
         "REOON_API_KEY", "ZEROBOUNCE_API_KEY", "HUNTER_API_KEY",
     ]
     for key in all_keys:
@@ -347,6 +348,13 @@ async def get_settings():
         "smtp_password_set": is_set("SMTP_PASSWORD"),
         "imap_host": env_vars.get("IMAP_HOST", ""),
         "imap_port": env_vars.get("IMAP_PORT", ""),
+        "imap_username": env_vars.get("IMAP_USERNAME", ""),
+        "imap_password_set": is_set("IMAP_PASSWORD"),
+        # Microsoft 365: ids aren't secret (no client secret: Harvey signs
+        # in as a public client with PKCE); the token file means signed in.
+        "m365_client_id": env_vars.get("M365_CLIENT_ID", ""),
+        "m365_tenant_id": env_vars.get("M365_TENANT_ID", ""),
+        "m365_authorized": (PROJECT_ROOT / "data" / "m365_token.json").is_file(),
         "reoon_api_key_set": is_set("REOON_API_KEY"),
         "zerobounce_api_key_set": is_set("ZEROBOUNCE_API_KEY"),
         "hunter_api_key_set": is_set("HUNTER_API_KEY"),
@@ -369,6 +377,7 @@ async def save_env_settings(request: Request):
                      "GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET",
                      "SMTP_HOST", "SMTP_PORT", "SMTP_USERNAME", "SMTP_PASSWORD",
                      "IMAP_HOST", "IMAP_PORT", "IMAP_USERNAME", "IMAP_PASSWORD",
+                     "M365_CLIENT_ID", "M365_TENANT_ID",
                      "REOON_API_KEY", "ZEROBOUNCE_API_KEY", "HUNTER_API_KEY"]:
             if key in data and data[key] is not None:
                 value = data[key]
@@ -376,6 +385,10 @@ async def save_env_settings(request: Request):
                     return JSONResponse({"success": False, "message": f"{key} must be text."},
                                         status_code=400)
                 value = str(value)
+                # A port Harvey can't parse would stop it starting at all.
+                if key.endswith("_PORT") and value.strip() and not value.strip().isdigit():
+                    return JSONResponse({"success": False, "message": f"{key} must be a number."},
+                                        status_code=400)
                 if len(value) > 4096 or "\x00" in value:
                     return JSONResponse({"success": False, "message": f"{key} is invalid."},
                                         status_code=400)

@@ -987,3 +987,6 @@ textarea.form-input { height: auto; padding: 8px 12px; }
 /* Long subjects end in an ellipsis; the card scrolls sideways if it must. */
 table.clip td { max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
 .live-next .btn { margin-left: auto; }
+.more-fields { margin-bottom: var(--sp-3); }
+.more-fields summary { cursor: pointer; font-size: var(--fs-ui); color: var(--text-2); margin-bottom: var(--sp-3); }
+.check-line { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-ui); color: var(--text-2); cursor: pointer; }

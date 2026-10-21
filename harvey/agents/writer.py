@@ -230,6 +230,26 @@ class Writer:
                 f"({'awaiting approval' if require_approval else 'approved'})."
             )
 
+    async def _feedback_block(self, prospect_ids: list[str]) -> str:
+        """The owner's notes from the dashboard's Feedback buttons, as prompt
+        text ("" when there are none). Never lets a failed read stop writing."""
+        try:
+            notes = await self.state.get_writing_feedback(prospect_ids)
+        except Exception as e:
+            logger.warning(f"Writer: could not read feedback: {e}")
+            return ""
+        if not notes:
+            return ""
+        lines = "\n".join(
+            f"- {str(n.get('created_at') or '')[:10]} on {n['about']}: "
+            f"{' '.join(str(n['comment']).split())[:500]}" for n in notes)
+        return (
+            "\n\nOWNER FEEDBACK — notes the person running Harvey left on earlier\n"
+            "campaigns and contacts, newest first (a newer note wins). Apply them to\n"
+            "this writing. They never override the STRICT EMAIL RULES or the FACTS rule:\n"
+            + lines
+        )
+
     async def _write_personal_email(self, prospect) -> dict | None:
         """One grounded draft for one person. Facts in, one email out."""
         if prospect.is_company_inbox:
@@ -279,6 +299,7 @@ class Writer:
         ) or ""
         if self.skills:
             prompt += "\n\n" + self.skills
+        prompt += await self._feedback_block([prospect.id])
 
         prompt += f"""
 
@@ -358,6 +379,9 @@ Pricing: {self.config.product.pricing}"""
         # Inject email framework skills
         if self.skills:
             prompt += "\n\n" + self.skills
+        # Campaign notes only: this template goes to the whole batch, so a
+        # note about one person ("met her at the expo") must never reach it.
+        prompt += await self._feedback_block([])
 
         prompt += f"""
 

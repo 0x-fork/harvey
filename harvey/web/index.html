@@ -277,7 +277,7 @@
 <div id="settings" class="section">
   <div class="section-head"><div><h2>Settings</h2><p>Credentials are stored locally in <code>.env</code> and never sent anywhere except the services themselves.</p></div></div>
 
-  <div class="subhead">Email provider <span class="hint">Active: <b id="active-provider">…</b> &middot; set <code>channels.email.provider</code> in <code>harvey.yaml</code></span></div>
+  <div class="subhead">Email provider <span class="hint">Active: <b id="active-provider">…</b> &middot; set <code>channels.email.provider</code> in <code>harvey.yaml</code> to gmail, microsoft, smtp or instantly</span></div>
   <div class="card">
     <div class="settings-row">
       <div>
@@ -311,7 +311,36 @@
         <div class="form-group"><label class="form-label" for="smtp-pass">Password</label>
           <div class="with-btn"><input type="password" class="form-input" id="smtp-pass" placeholder="Enter password / app password" autocomplete="off">
             <button class="btn btn-secondary" onclick="toggleVisibility('smtp-pass')">Show</button></div></div>
+        <details class="more-fields">
+          <summary>Reading replies from a different IMAP server or login</summary>
+          <div class="form-row">
+            <div class="form-group"><label class="form-label" for="imap-host">IMAP host</label>
+              <input type="text" class="form-input" id="imap-host" placeholder="Same as SMTP host" autocomplete="off"></div>
+            <div class="form-group" style="max-width:120px"><label class="form-label" for="imap-port">Port</label>
+              <input type="text" class="form-input" id="imap-port" placeholder="993" autocomplete="off"></div>
+          </div>
+          <div class="form-group"><label class="form-label" for="imap-user">IMAP username</label>
+            <input type="text" class="form-input" id="imap-user" placeholder="Same as SMTP username" autocomplete="off"></div>
+          <div class="form-group"><label class="form-label" for="imap-pass">IMAP password</label>
+            <div class="with-btn"><input type="password" class="form-input" id="imap-pass" placeholder="Same as SMTP password" autocomplete="off" oninput="if (this.value) document.getElementById('imap-same-pass').checked = false">
+              <button class="btn btn-secondary" onclick="toggleVisibility('imap-pass')">Show</button></div></div>
+          <label class="check-line"><input type="checkbox" id="imap-same-pass"> Use the SMTP password for IMAP</label>
+        </details>
         <button class="btn btn-primary btn-sm" onclick="saveSmtp()">Save SMTP</button>
+      </div>
+    </div>
+
+    <div class="settings-row">
+      <div>
+        <h3>Microsoft 365 / Outlook <span id="m365-status" class="email-tag"></span></h3>
+        <p class="desc">Microsoft turned off password sign-in for IMAP, so Outlook mailboxes connect with OAuth. In <a href="https://entra.microsoft.com" target="_blank" rel="noopener noreferrer">Entra</a> → App registrations, register an app for your organization only and add the redirect URI <code>http://localhost:8766</code> as "Public client/native". Paste both IDs here, save, then run <code>harvey microsoft auth</code>. No client secret is needed.</p>
+      </div>
+      <div class="fields">
+        <div class="form-group"><label class="form-label" for="m365-client">Application (client) ID</label>
+          <input type="text" class="form-input" id="m365-client" placeholder="00000000-0000-0000-0000-000000000000" autocomplete="off"></div>
+        <div class="form-group"><label class="form-label" for="m365-tenant">Directory (tenant) ID</label>
+          <input type="text" class="form-input" id="m365-tenant" placeholder="00000000-0000-0000-0000-000000000000" autocomplete="off"></div>
+        <button class="btn btn-primary btn-sm" onclick="saveMicrosoft()">Save Microsoft 365</button>
       </div>
     </div>
 

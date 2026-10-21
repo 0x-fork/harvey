@@ -1786,6 +1786,46 @@ class StateManager:
                 rows = await cursor.fetchall()
                 return [dict(r) for r in rows]
 
+    async def get_writing_feedback(
+        self, prospect_ids: list[str] | tuple = (), limit: int = 10
+    ) -> list[dict]:
+        """What the owner said about past campaigns (newest first), plus
+        anything said about these contacts: the Writer follows it.
+
+        Each row: {"about": "campaign 'Denver roofers'" | "Dana Ruiz",
+        "comment": ...}."""
+        out: list[dict] = []
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """SELECT f.comment, f.created_at, c.name FROM feedback f
+                   LEFT JOIN campaigns c ON c.id = f.entity_id
+                   WHERE f.entity_type = 'campaign' AND TRIM(f.comment) != ''
+                   ORDER BY f.created_at DESC LIMIT ?""",
+                (int(limit),),
+            ) as cursor:
+                for r in await cursor.fetchall():
+                    about = f"campaign '{r['name']}'" if r["name"] else "a past campaign"
+                    out.append({"about": about, "comment": r["comment"],
+                                "created_at": r["created_at"]})
+            ids = [i for i in prospect_ids if i][:50]
+            if ids:
+                marks = ",".join("?" * len(ids))
+                async with db.execute(
+                    f"""SELECT f.comment, f.created_at, p.first_name, p.last_name FROM feedback f
+                        JOIN prospects p ON p.id = f.entity_id
+                        WHERE f.entity_type = 'contact' AND f.entity_id IN ({marks})
+                          AND TRIM(f.comment) != ''
+                        ORDER BY f.created_at DESC LIMIT ?""",
+                    (*ids, int(limit)),
+                ) as cursor:
+                    for r in await cursor.fetchall():
+                        name = " ".join(x for x in (r["first_name"], r["last_name"]) if x)
+                        out.append({"about": name or "this contact", "comment": r["comment"],
+                                    "created_at": r["created_at"]})
+        out.sort(key=lambda n: str(n.get("created_at") or ""), reverse=True)  # newest first
+        return out
+
     # ── Reply Deduplication ──
 
     async def is_reply_processed(self, reply_id: str) -> bool:
