@@ -22,7 +22,9 @@ from harvey.gate import pre_send_check
 from harvey.integrations.instantly import InstantlyClient
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
 from harvey.integrations.precleared import PreclearedClient
-from harvey.state import HAND_SENT_REASON, MANUAL_SEND_KEY, StateManager
+from harvey.state import (
+    HAND_SENT_REASON, MANUAL_SEND_KEY, MAYBE_SENT_PREFIX, StateManager,
+)
 
 logger = logging.getLogger("harvey.sender")
 
@@ -330,6 +332,14 @@ class Sender:
 
     async def _run_native(self):
         """Stage new campaigns into the outbox, then drain what's due."""
+        # Before any early return: a send cut off mid-way must show up as
+        # failed even while sending is paused or no mailbox is connected.
+        stale = await self.state.fail_stale_sending_outbox()
+        if stale:
+            logger.warning(
+                f"Sender: {stale} email(s) were interrupted mid-send and won't be "
+                "retried. Check your Sent folder; they're under Didn't send."
+            )
         paused = await self.state.get_setting(KILL_SWITCH_KEY)
         if paused:
             logger.warning(
@@ -435,6 +445,33 @@ class Sender:
                 details={"campaign": campaign.name, "staged": staged, "mode": mode},
             )
 
+    async def _blocked(self, item: dict, prospect, allow_risky: bool) -> tuple[str, str] | None:
+        """Why this email must not go out, as (status, error), or None."""
+        if prospect is None:
+            return "failed", "prospect missing"
+        if item["kind"] == "sequence":
+            # Stop-on-reply / opt-out: never continue a sequence after contact.
+            if prospect.status in STOP_STATUSES:
+                return "cancelled", f"prospect status '{prospect.status}'"
+            # The user already emailed them by hand: whatever Harvey staged
+            # (before, during or after that) would be a second email.
+            if await self.state.get_setting(MANUAL_SEND_KEY + prospect.id):
+                return "cancelled", HAND_SENT_REASON
+            # A first email to someone already contacted is always a duplicate.
+            if item["step"] == 1 and prospect.status == "contacted":
+                return "cancelled", "already contacted"
+        gate = pre_send_check(
+            item["to_email"], item["subject"], item["body"],
+            prospect=prospect, allow_risky=allow_risky, kind=item["kind"],
+        )
+        if not gate:
+            logger.warning(
+                f"Sender: gate blocked email to {item['to_email']}: "
+                f"{gate.reasons}"
+            )
+            return "failed", "gate: " + "; ".join(gate.reasons)[:300]
+        return None
+
     async def _drain_due(self):
         """Send due, approved outbox items through the provider."""
         if not self.provider.is_configured():
@@ -487,45 +524,10 @@ class Sender:
                 continue
 
             prospect = await self.state.get_prospect(item["prospect_id"])
-            if prospect is None:
+            blocked = await self._blocked(item, prospect, allow_risky)
+            if blocked:
                 await self.state.update_outbox_item(
-                    item["id"], status="failed", error="prospect missing"
-                )
-                continue
-
-            # Stop-on-reply / opt-out: never continue a sequence after contact.
-            if item["kind"] == "sequence" and prospect.status in STOP_STATUSES:
-                await self.state.update_outbox_item(
-                    item["id"], status="cancelled",
-                    error=f"prospect status '{prospect.status}'",
-                )
-                continue
-            # The user already emailed them by hand: whatever Harvey staged
-            # (before, during or after that) would be a second email.
-            if item["kind"] == "sequence" and await self.state.get_setting(
-                    MANUAL_SEND_KEY + prospect.id):
-                await self.state.update_outbox_item(
-                    item["id"], status="cancelled", error=HAND_SENT_REASON)
-                continue
-            # A first email to someone already contacted is always a duplicate.
-            if item["kind"] == "sequence" and item["step"] == 1 and prospect.status == "contacted":
-                await self.state.update_outbox_item(
-                    item["id"], status="cancelled", error="already contacted")
-                continue
-
-            gate = pre_send_check(
-                item["to_email"], item["subject"], item["body"],
-                prospect=prospect, allow_risky=allow_risky, kind=item["kind"],
-            )
-            if not gate:
-                await self.state.update_outbox_item(
-                    item["id"], status="failed",
-                    error="gate: " + "; ".join(gate.reasons)[:300],
-                )
-                logger.warning(
-                    f"Sender: gate blocked email to {item['to_email']}: "
-                    f"{gate.reasons}"
-                )
+                    item["id"], status=blocked[0], error=blocked[1])
                 continue
 
             # Optional compliance check (compliance.precleared): one per
@@ -552,11 +554,37 @@ class Sender:
                     continue
                 receipt_id = clearance.receipt_id
 
-            result = await self.provider.send_email(
-                item["to_email"], item["subject"], item["body"],
-                thread_ref=item.get("thread_ref", ""),
-                in_reply_to=item.get("in_reply_to", ""),
-            )
+            # Claim it. A reply, bounce, hand send or rejection may have
+            # cancelled it since the queue was read; then it stays cancelled.
+            if not await self.state.claim_outbox_item(item["id"]):
+                continue
+            # Send the email as it is now, not as the queue read it: it may
+            # have been edited and approved again since.
+            item = await self.state.get_outbox_item(item["id"]) or item
+            # Whatever landed between the checks above and the claim (a reply
+            # sets the status before it cancels) is caught here, with fresh
+            # data. From now on nothing else can cancel this email.
+            prospect = await self.state.get_prospect(item["prospect_id"])
+            blocked = await self._blocked(item, prospect, allow_risky)
+            if blocked:
+                await self.state.update_outbox_item(
+                    item["id"], status=blocked[0], error=blocked[1])
+                continue
+
+            try:
+                result = await self.provider.send_email(
+                    item["to_email"], item["subject"], item["body"],
+                    thread_ref=item.get("thread_ref", ""),
+                    in_reply_to=item.get("in_reply_to", ""),
+                )
+            except Exception as e:
+                # It may have gone out before the error: never retry it.
+                await self.state.update_outbox_item(
+                    item["id"], status="failed",
+                    error=f"{MAYBE_SENT_PREFIX}send error: {e}"[:300],
+                )
+                logger.warning(f"Sender: send to {item['to_email']} raised: {e}")
+                continue
             if not result.ok:
                 await self.state.update_outbox_item(
                     item["id"], status="failed", error=result.error[:300]

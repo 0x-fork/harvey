@@ -38,6 +38,18 @@ WRITABLE_EMAIL_STATUSES = ("verified", "risky")
 MANUAL_SEND_KEY = "manual_send:"
 # Outbox cancel reason for mail the user sent by hand instead; undo restores it.
 HAND_SENT_REASON = "sent_by_hand"
+# Outbox errors starting with this: the send was cut off and the email may
+# have reached them. Never retried, and counted as Harvey's mail, so the
+# dashboard never offers a second one by hand.
+MAYBE_SENT_PREFIX = "may have gone out: "
+STALE_SENDING_ERROR = (
+    MAYBE_SENT_PREFIX + "Harvey stopped in the middle of sending it; check "
+    "your Sent folder before emailing them again"
+)
+# A claimed email still not finished after this long was cut off mid-send (a
+# send itself takes seconds, and a whole cycle is stopped after 10 minutes).
+# Long enough never to catch another sender's email in flight.
+STALE_SENDING_AFTER = timedelta(minutes=15)
 
 
 def _new_id() -> str:
@@ -926,6 +938,42 @@ class StateManager:
             )
             await db.commit()
 
+    async def claim_outbox_item(self, item_id: str) -> bool:
+        """Take an approved item for sending: approved → sending, atomically.
+
+        False when it is no longer approved and due (cancelled by a reply,
+        bounce or hand send, rejected, rescheduled, or taken by another
+        sender), so it must not go out now. Cancels never touch a claimed item: it is already on its way.
+        """
+        now = _utcnow().isoformat()
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE outbox SET status = 'sending', updated_at = ? "
+                "WHERE id = ? AND status = 'approved' "
+                "AND (send_at IS NULL OR send_at <= ?)",
+                (now, item_id, now),
+            )
+            await db.commit()
+            return cursor.rowcount == 1
+
+    async def fail_stale_sending_outbox(
+        self, older_than: timedelta = STALE_SENDING_AFTER
+    ) -> int:
+        """Items claimed long ago and never finished (Harvey stopped mid-send).
+
+        Whether they went out is unknown, so they are never retried: they
+        become failed with a note to check the Sent folder.
+        """
+        cutoff = (_utcnow() - older_than).isoformat()
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE outbox SET status = 'failed', error = ?, updated_at = ? "
+                "WHERE status = 'sending' AND datetime(updated_at) < datetime(?)",
+                (STALE_SENDING_ERROR, _utcnow().isoformat(), cutoff),
+            )
+            await db.commit()
+            return cursor.rowcount
+
     async def edit_outbox_draft(self, item_id: str, subject: str, body: str) -> int:
         """Rewrite a draft's subject and body — only while it awaits review.
 
@@ -977,6 +1025,18 @@ class StateManager:
                 )
             await db.commit()
             return len(rows)
+
+    async def reject_outbox_item(self, item_id: str) -> int:
+        """Reject an item still waiting to go out. Mail already on its way
+        or sent is never relabelled. Returns rows changed (0/1)."""
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE outbox SET status = 'rejected', updated_at = ? "
+                "WHERE id = ? AND status IN ('pending_review', 'approved')",
+                (_utcnow().isoformat(), item_id),
+            )
+            await db.commit()
+            return cursor.rowcount
 
     async def approve_outbox(self, item_id: str | None = None) -> int:
         """Approve one pending item, or ALL pending when item_id is None."""

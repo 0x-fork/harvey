@@ -7,6 +7,7 @@ the "Mark as sent" toggle (never erases a reply, refuses unknown prospects).
 import asyncio
 import json
 import sqlite3
+from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -200,6 +201,57 @@ def test_someone_with_approved_mail_cant_be_marked_sent(client, env):
     assert client.get("/api/campaigns").json()[0]["recipients"][0]["can_mark_sent"] is False
     assert client.post("/api/prospects/p1/sent", json={"sent": True}).status_code == 409
     assert _status(env, "outbox", "o1") == "approved"
+
+
+def test_someone_whose_mail_is_being_sent_cant_be_marked_sent(client, env):
+    _prospect(env, "p1", "a@acme.test", status="queued")
+    _campaign(env, "c1", ["p1"])
+    _outbox(env, "o1", "p1", "sending")
+    assert client.get("/api/campaigns").json()[0]["recipients"][0]["can_mark_sent"] is False
+    assert client.post("/api/prospects/p1/sent", json={"sent": True}).status_code == 409
+    assert _status(env, "outbox", "o1") == "sending"
+
+
+def test_mail_that_may_have_gone_out_counts_as_sent_by_harvey(client, env):
+    # A send cut off mid-way may have reached them: never offer a second one.
+    from harvey.state import MAYBE_SENT_PREFIX
+    _prospect(env, "p1", "a@acme.test", status="queued")
+    _campaign(env, "c1", ["p1"])
+    _outbox(env, "o1", "p1", "failed")
+    _sql(env, "UPDATE outbox SET error = ? WHERE id = 'o1'", (MAYBE_SENT_PREFIX + "timeout",))
+    recipient = client.get("/api/campaigns").json()[0]["recipients"][0]
+    assert recipient["can_mark_sent"] is False and recipient["can_send_by_hand"] is False
+    assert client.post("/api/prospects/p1/sent", json={"sent": True}).status_code == 409
+
+
+def test_mail_that_plainly_failed_doesnt_block_a_hand_send(client, env):
+    _prospect(env, "p1", "a@acme.test", status="queued")
+    _campaign(env, "c1", ["p1"])
+    _outbox(env, "o1", "p1", "failed")
+    _sql(env, "UPDATE outbox SET error = 'gate: unrendered merge tag' WHERE id = 'o1'")
+    assert client.get("/api/campaigns").json()[0]["recipients"][0]["can_send_by_hand"] is True
+
+
+def test_the_outbox_tab_shows_mail_being_sent_and_surfaces_stuck_mail(client, env):
+    _prospect(env, "p1", "a@acme.test", status="contacted")
+    _outbox(env, "o1", "p1", "sending")
+    _sql(env, "UPDATE outbox SET updated_at = ? WHERE id = 'o1'",
+         (datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),))
+    _outbox(env, "o2", "p1", "sending", step=2)
+    _sql(env, "UPDATE outbox SET updated_at = '2026-01-01T00:00:00' WHERE id = 'o2'")
+    data = client.get("/api/outbox").json()
+    assert [i["id"] for i in data["approved"]] == ["o1"]
+    assert [i["id"] for i in data["failed"]] == ["o2"]
+
+
+def test_rejecting_mail_already_on_its_way_is_refused(client, env):
+    _prospect(env, "p1", "a@acme.test", status="contacted")
+    _outbox(env, "o1", "p1", "sending")
+    _outbox(env, "o2", "p1", "sent", step=2)
+    assert client.post("/api/outbox/o1/reject").status_code == 409
+    assert client.post("/api/outbox/o2/reject").status_code == 409
+    assert _status(env, "outbox", "o1") == "sending"
+    assert _status(env, "outbox", "o2") == "sent"
 
 
 def test_drafts_awaiting_review_dont_hide_the_gmail_button_when_harvey_cant_send(client, env):

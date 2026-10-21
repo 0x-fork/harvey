@@ -846,11 +846,16 @@ async def get_outbox_api():
     try:
         state = _state()
         await state.init_db()
+        # A send cut off mid-way shows up under Didn't send even when Harvey
+        # isn't running.
+        await state.fail_stale_sending_outbox()
         return {
             "paused": await state.get_setting("sending_paused"),
             "pending": await _with_context(
                 await state.get_outbox(status="pending_review", limit=100)),
-            "approved": await state.get_outbox(status="approved", limit=50),
+            # Mail going out right now leads the list.
+            "approved": (await state.get_outbox(status="sending", limit=10)
+                         + await state.get_outbox(status="approved", limit=50)),
             "sent": (await query_db(
                 "SELECT * FROM outbox WHERE status = 'sent' "
                 "ORDER BY sent_at DESC LIMIT 25")),
@@ -978,11 +983,15 @@ async def _harvey_committed_ids() -> set[str]:
     """Everyone Harvey has approved or sent mail for (Outbox or Instantly).
 
     Approved mail can be going out at this moment, so these people are past
-    the point where a hand send can be recorded safely. A draft that only
+    the point where a hand send can be recorded safely. So is anyone whose
+    send was cut off mid-way: it may have reached them. A draft that only
     awaits review isn't: marking the person sent cancels it.
     """
+    from harvey.state import MAYBE_SENT_PREFIX
     ids = {r["prospect_id"] for r in await query_db(
-        "SELECT DISTINCT prospect_id FROM outbox WHERE status IN ('approved', 'sent')")}
+        "SELECT DISTINCT prospect_id FROM outbox WHERE status IN ('approved', 'sending', 'sent') "
+        "OR (status = 'failed' AND substr(error, 1, ?) = ?)",
+        (len(MAYBE_SENT_PREFIX), MAYBE_SENT_PREFIX))}
     for row in await query_db(
             "SELECT prospect_ids_json FROM campaigns WHERE COALESCE(instantly_campaign_id, '') != ''"):
         try:
@@ -1001,9 +1010,15 @@ async def _hand_sent_ids() -> set[str]:
 
 
 async def _harvey_sent_to(prospect_id: str) -> bool:
-    """Did Harvey itself email this person (native send, or an Instantly campaign)?"""
-    if await query_db("SELECT 1 FROM outbox WHERE prospect_id = ? AND status = 'sent' LIMIT 1",
-                      (prospect_id,)):
+    """Did Harvey itself email this person (native send, or an Instantly campaign)?
+
+    A send in flight, or cut off mid-way, counts: it may have reached them.
+    """
+    from harvey.state import MAYBE_SENT_PREFIX
+    if await query_db(
+            "SELECT 1 FROM outbox WHERE prospect_id = ? AND (status IN ('sending', 'sent') "
+            "OR (status = 'failed' AND substr(error, 1, ?) = ?)) LIMIT 1",
+            (prospect_id, len(MAYBE_SENT_PREFIX), MAYBE_SENT_PREFIX)):
         return True
     for row in await query_db(
             "SELECT prospect_ids_json FROM campaigns WHERE COALESCE(instantly_campaign_id, '') != ''"):
@@ -1097,7 +1112,8 @@ async def outbox_reject(item_id: str):
     try:
         state = _state()
         await state.init_db()
-        await state.update_outbox_item(item_id, status="rejected")
+        if not await state.reject_outbox_item(item_id):
+            return _refuse("That email is already sending or sent, so it can't be rejected.")
         return {"success": True}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
