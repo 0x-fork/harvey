@@ -1602,7 +1602,10 @@ function fillMergeVars(text, r) {
   });
 }
 
+let _gmailBusy = false;  // one compose window per click, never two
+
 async function openInGmail(ci, si, ri) {
+  if (_gmailBusy) return;
   const c = _campaigns[ci];
   const step = c && (c.sequence || [])[si];
   const r = c && (c.recipients || [])[ri];
@@ -1627,7 +1630,10 @@ async function openInGmail(ci, si, ri) {
   w.opener = null;
   // Record the send BEFORE the user can press Send in Gmail, so Harvey can
   // never email them as well — not even if they forget to tick the box.
-  if (!r.sent_by_hand && !(await markSent(ci, ri, true))) { w.close(); return; }
+  _gmailBusy = true;
+  let claimed = r.sent_by_hand;
+  try { if (!claimed) claimed = await markSent(ci, ri, true); } finally { _gmailBusy = false; }
+  if (!claimed) { w.close(); return; }
   w.location.href = url;
   if (left) showToast('This draft still has a {{placeholder}} in it. Fix it in Gmail before sending.', 'error');
 }
@@ -1648,8 +1654,9 @@ async function markSent(ci, ri, sent) {
   if (!ok) showToast((res && res.message) || 'Could not save that. Try again.', 'error');
   else if (!sent && res.sent) showToast('They already replied, so this stays marked as sent.');
   loadCampaigns();
-  // True only when this call changed it; a status in the reply means they replied or opted out.
-  return ok && sent === !!res.sent && !res.status;
+  // True only when this call changed it: a status means they replied or
+  // opted out, 'already' means another click or tab got there first.
+  return ok && sent === !!res.sent && !res.status && !res.already;
 }
 
 async function loadCampaigns() {

@@ -296,3 +296,29 @@ def test_an_unreadable_config_means_harvey_might_send(monkeypatch):
         raise ValueError("bad yaml")
     monkeypatch.setattr(harvey.config, "load_config", boom)
     assert dash._harvey_can_send() is True
+
+
+def test_marking_twice_says_it_was_already_marked(client, env):
+    # A double click must not open a second ready-to-send Gmail draft.
+    _prospect(env, "p1", "a@acme.test", status="queued")
+    assert client.post("/api/prospects/p1/sent", json={"sent": True}).json() == {
+        "success": True, "sent": True}
+    assert client.post("/api/prospects/p1/sent", json={"sent": True}).json()["already"] is True
+
+
+def test_mail_approved_while_marking_is_refused_and_the_marker_removed(client, env, monkeypatch):
+    # The marker goes down first; if mail got approved meanwhile, the drain
+    # may already hold it, so the mark is refused and undone.
+    _prospect(env, "p1", "a@acme.test", status="queued")
+    real = dash._harvey_committed_ids
+
+    async def approved_meanwhile():
+        _outbox(env, "o1", "p1", "approved")
+        with sqlite3.connect(env["db"]) as db:
+            assert db.execute("SELECT 1 FROM settings WHERE key = 'manual_send:p1'").fetchone()
+        return await real()
+    monkeypatch.setattr(dash, "_harvey_committed_ids", approved_meanwhile)
+    assert client.post("/api/prospects/p1/sent", json={"sent": True}).status_code == 409
+    with sqlite3.connect(env["db"]) as db:
+        assert db.execute("SELECT 1 FROM settings WHERE key = 'manual_send:p1'").fetchone() is None
+    assert _status(env, "prospects", "p1") == "queued"

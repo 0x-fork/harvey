@@ -1044,7 +1044,7 @@ async def mark_prospect_sent(prospect_id: str, request: Request):
 
         if sent:
             if marked:
-                return {"success": True, "sent": True}
+                return {"success": True, "sent": True, "already": True}
             if current not in HAND_SENDABLE_STATUSES:
                 # A reply, opt-out or close is never touched; neither is
                 # someone Harvey already emailed.
@@ -1052,10 +1052,14 @@ async def mark_prospect_sent(prospect_id: str, request: Request):
             # Allowed even when Harvey can send: recording "I already emailed
             # them" can only ever stop Harvey sending. Not once Harvey has
             # approved or sent mail to them, though: that may be going out now.
+            # The marker goes down FIRST: a drain that checks after this sees
+            # it and cancels; one that checked before only holds an approved
+            # row, which the check below then sees.
+            await state.set_setting(key, current)
             if prospect_id in await _harvey_committed_ids():
+                await state.delete_setting(key)
                 return _refuse("Harvey has already approved or sent an email to this person. "
                                "Check the Outbox.")
-            await state.set_setting(key, current)
             await state.update_prospect_status(prospect_id, "contacted")
             # Anything Harvey had queued for them must not go out as well.
             changed = await state.cancel_pending_outbox_for_prospect(
