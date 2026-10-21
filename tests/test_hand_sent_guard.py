@@ -36,7 +36,8 @@ async def test_drain_never_sends_to_someone_emailed_by_hand(state):
     provider = FakeProvider()
     await make_sender(state, provider)._drain_due()
     assert provider.sent == []
-    assert {i["error"] for i in await state.get_outbox(status="cancelled")} == {"sent by hand"}
+    # The same reason undo restores, so an undo brings these back too.
+    assert {i["error"] for i in await state.get_outbox(status="cancelled")} == {"sent_by_hand"}
 
 
 @pytest.mark.asyncio

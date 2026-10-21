@@ -1602,7 +1602,7 @@ function fillMergeVars(text, r) {
   });
 }
 
-function openInGmail(ci, si, ri) {
+async function openInGmail(ci, si, ri) {
   const c = _campaigns[ci];
   const step = c && (c.sequence || [])[si];
   const r = c && (c.recipients || [])[ri];
@@ -1616,13 +1616,19 @@ function openInGmail(ci, si, ri) {
     '&body=' + encodeURIComponent(fillMergeVars(step.body, r));
   const left = /\{\{\s*\w+\s*\}\}/.test(fillMergeVars(step.subject, r) + fillMergeVars(step.body, r));
   // No 'noopener' feature string: with it window.open always returns null,
-  // so a blocked pop-up could not be told apart from a successful one.
-  const w = window.open(url, '_blank');
+  // so a blocked pop-up could not be told apart from a successful one. The
+  // tab opens blank right away (inside the click, so it isn't blocked) and
+  // only gets the draft once the send is recorded.
+  const w = window.open('', '_blank');
   if (!w) {
     showToast('Your browser blocked the Gmail tab. Allow pop-ups for this page and click again.', 'error');
     return;
   }
   w.opener = null;
+  // Record the send BEFORE the user can press Send in Gmail, so Harvey can
+  // never email them as well — not even if they forget to tick the box.
+  if (!r.sent_by_hand && !(await markSent(ci, ri, true))) { w.close(); return; }
+  w.location.href = url;
   if (left) showToast('This draft still has a {{placeholder}} in it. Fix it in Gmail before sending.', 'error');
 }
 
@@ -1638,9 +1644,12 @@ async function markSent(ci, ri, sent) {
     if (await lockIfRefused(resp)) return;
     res = await resp.json();
   } catch {}
-  if (!res || !res.success) showToast((res && res.message) || 'Could not save that. Try again.', 'error');
+  const ok = !!(res && res.success);
+  if (!ok) showToast((res && res.message) || 'Could not save that. Try again.', 'error');
   else if (!sent && res.sent) showToast('They already replied, so this stays marked as sent.');
   loadCampaigns();
+  // True only when this call changed it; a status in the reply means they replied or opted out.
+  return ok && sent === !!res.sent && !res.status;
 }
 
 async function loadCampaigns() {
@@ -1670,7 +1679,15 @@ async function loadCampaigns() {
             'Open in Gmail &rarr; ' + escHtml(r.email) + '</button>' +
             '<span class="muted" style="font-size:12px">Harvey won\'t send follow-ups to people you emailed yourself.</span>';
         }
-        if (!r.can_send_by_hand || s !== 0) return '';
+        if (s !== 0) return '';
+        if (!r.can_send_by_hand) {
+          // Harvey sends here; this only records an email the user already sent.
+          return r.can_mark_sent
+            ? '<label class="muted" style="display:inline-flex;align-items:center;gap:4px;font-size:12px;cursor:pointer">' +
+              '<input type="checkbox" onchange="markSent(' + i + ',' + ri + ',this.checked)"> ' +
+              'I already emailed ' + escHtml(r.email) + ' myself</label>'
+            : '';
+        }
         const risky = r.email_status === 'risky'
           ? ' <span class="muted" style="font-size:12px">(catch-all address, may bounce)</span>' : '';
         return '<button class="btn btn-primary btn-sm" onclick="openInGmail(' + i + ',' + s + ',' + ri + ')">' +

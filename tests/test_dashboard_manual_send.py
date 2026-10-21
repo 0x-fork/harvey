@@ -123,7 +123,7 @@ def _status(env, table, row_id):
 
 def test_sending_by_hand_cancels_what_harvey_had_queued(client, env):
     _prospect(env, "p1", "a@acme.test", status="queued")
-    _outbox(env, "o1", "p1", "approved", step=1)
+    _outbox(env, "o1", "p1", "pending_review", step=1)
     _outbox(env, "o2", "p1", "pending_review", step=2)
     client.post("/api/prospects/p1/sent", json={"sent": True})
     assert _status(env, "outbox", "o1") == "cancelled"
@@ -132,11 +132,12 @@ def test_sending_by_hand_cancels_what_harvey_had_queued(client, env):
 
 def test_undo_puts_the_prospect_and_their_drafts_back_for_review(client, env):
     _prospect(env, "p1", "a@acme.test", status="queued")
-    _outbox(env, "o1", "p1", "approved")
+    _outbox(env, "o1", "p1", "pending_review")
     client.post("/api/prospects/p1/sent", json={"sent": True})
+    assert _status(env, "outbox", "o1") == "cancelled"
     assert client.post("/api/prospects/p1/sent", json={"sent": False}).json()["sent"] is False
     assert _status(env, "prospects", "p1") == "queued"   # not 'new': the Writer won't redraft
-    assert _status(env, "outbox", "o1") == "pending_review"  # back to you, never straight out
+    assert _status(env, "outbox", "o1") == "pending_review"  # back for review
 
 
 def test_undo_never_cancels_an_unrelated_cancellation(client, env):
@@ -165,24 +166,47 @@ def test_unticking_someone_sent_through_instantly_is_refused(client, env):
 
 def test_recipients_say_who_can_be_sent_by_hand(client, env):
     _prospect(env, "p1", "a@acme.test", status="queued")
-    _prospect(env, "p2", "b@acme.test", status="queued")              # Harvey queued mail
+    _prospect(env, "p2", "b@acme.test", status="queued")              # Harvey approved mail
     _prospect(env, "p3", "c@acme.test", status="opted_out")           # asked to be removed
     _prospect(env, "p4", "d@acme.test", email_status="guess")         # undeliverable
     _prospect(env, "p5", "e@acme.test", email_status="invalid")
     _prospect(env, "p6", "f@acme.test", email_status="risky")         # catch-all: allowed
     _campaign(env, "c1", ["p1", "p2", "p3", "p4", "p5", "p6"])
-    _outbox(env, "o1", "p2", "pending_review")
+    _outbox(env, "o1", "p2", "approved")
     recips = {r["id"]: r for r in client.get("/api/campaigns").json()[0]["recipients"]}
     assert {k for k, r in recips.items() if r["can_send_by_hand"]} == {"p1", "p6"}
 
 
-def test_nothing_is_sent_by_hand_while_harvey_can_send(client, env, monkeypatch):
+def test_no_gmail_button_while_harvey_can_send_but_a_hand_send_can_still_be_recorded(
+        client, env, monkeypatch):
+    # Recording "I already emailed them" can only stop Harvey sending, so it
+    # is never refused just because a mailbox is connected now.
     monkeypatch.setattr(dash, "_harvey_can_send", lambda: True)
     _prospect(env, "p1", "a@acme.test", status="queued")
     _campaign(env, "c1", ["p1"])
-    assert client.get("/api/campaigns").json()[0]["recipients"][0]["can_send_by_hand"] is False
+    _outbox(env, "o1", "p1", "pending_review")
+    r = client.get("/api/campaigns").json()[0]["recipients"][0]
+    assert r["can_send_by_hand"] is False and r["can_mark_sent"] is True
+    assert client.post("/api/prospects/p1/sent", json={"sent": True}).json()["sent"] is True
+    assert _status(env, "prospects", "p1") == "contacted"
+    assert _status(env, "outbox", "o1") == "cancelled"
+
+
+def test_someone_with_approved_mail_cant_be_marked_sent(client, env):
+    # Approved mail may be mid-send right now: the Outbox is where to stop it.
+    _prospect(env, "p1", "a@acme.test", status="queued")
+    _campaign(env, "c1", ["p1"])
+    _outbox(env, "o1", "p1", "approved")
+    assert client.get("/api/campaigns").json()[0]["recipients"][0]["can_mark_sent"] is False
     assert client.post("/api/prospects/p1/sent", json={"sent": True}).status_code == 409
-    assert _status(env, "prospects", "p1") == "queued"
+    assert _status(env, "outbox", "o1") == "approved"
+
+
+def test_drafts_awaiting_review_dont_hide_the_gmail_button_when_harvey_cant_send(client, env):
+    _prospect(env, "p1", "a@acme.test", status="queued")
+    _campaign(env, "c1", ["p1"])
+    _outbox(env, "o1", "p1", "pending_review")   # staged, but no mailbox to send it
+    assert client.get("/api/campaigns").json()[0]["recipients"][0]["can_send_by_hand"] is True
 
 
 def test_a_hand_sent_prospect_is_marked_for_the_sender(client, env):
@@ -225,8 +249,8 @@ def test_a_body_that_is_not_an_object_is_refused(client, env, payload):
 
 
 class _Email:
-    def __init__(self, enabled=True, provider="smtp"):
-        self.enabled, self.provider = enabled, provider
+    def __init__(self, enabled=True, provider="smtp", approval=False):
+        self.enabled, self.provider, self.require_approval = enabled, provider, approval
 
 
 class _Cfg:
@@ -253,6 +277,7 @@ class _Provider:
     (_Cfg(provider="gmail"), _Env(), True, True),               # connected: Harvey sends
     (_Cfg(provider="instantly"), _Env(instantly="k"), True, True),
     (_Cfg(provider="instantly"), _Env(), True, False),
+    (_Cfg(provider="instantly", approval=True), _Env(instantly="k"), True, False),  # held
 ])
 def test_harvey_can_send(monkeypatch, cfg, env, provider_ok, expected):
     import harvey.config

@@ -36,6 +36,8 @@ WRITABLE_EMAIL_STATUSES = ("verified", "risky")
 # dashboard. Its value is the status they had before, so undo is exact; its
 # presence tells the Sender never to email them as well.
 MANUAL_SEND_KEY = "manual_send:"
+# Outbox cancel reason for mail the user sent by hand instead; undo restores it.
+HAND_SENT_REASON = "sent_by_hand"
 
 
 def _new_id() -> str:

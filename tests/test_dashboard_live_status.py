@@ -165,7 +165,7 @@ def test_drafts_waiting_in_the_outbox_point_there_not_at_gmail(client, env, monk
 
 
 def test_approved_mail_harvey_will_send_is_not_a_job_for_the_user(client, env):
-    # Even with no mailbox connected now, mail Harvey queued is not the user's to send.
+    # Even with no mailbox connected now, mail already approved is not the user's to send.
     _prospect(env, "p1", "a@acme.test", status="queued")
     _campaign(env, "c1", ["p1"])
     _outbox(env, "o1", "p1", "approved")

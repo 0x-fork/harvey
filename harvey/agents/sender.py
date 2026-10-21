@@ -22,7 +22,7 @@ from harvey.gate import pre_send_check
 from harvey.integrations.instantly import InstantlyClient
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
 from harvey.integrations.precleared import PreclearedClient
-from harvey.state import MANUAL_SEND_KEY, StateManager
+from harvey.state import HAND_SENT_REASON, MANUAL_SEND_KEY, StateManager
 
 logger = logging.getLogger("harvey.sender")
 
@@ -505,7 +505,7 @@ class Sender:
             if item["kind"] == "sequence" and await self.state.get_setting(
                     MANUAL_SEND_KEY + prospect.id):
                 await self.state.update_outbox_item(
-                    item["id"], status="cancelled", error="sent by hand")
+                    item["id"], status="cancelled", error=HAND_SENT_REASON)
                 continue
             # A first email to someone already contacted is always a duplicate.
             if item["kind"] == "sequence" and item["step"] == 1 and prospect.status == "contacted":

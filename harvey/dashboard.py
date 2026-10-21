@@ -936,7 +936,6 @@ async def outbox_edit(item_id: str, request: Request):
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 
 
-HAND_SENT_REASON = "sent_by_hand"
 # A hand send is only offered to someone Harvey could still email: never to
 # someone who replied, opted out, bounced or was already contacted.
 HAND_SENDABLE_STATUSES = ("new", "queued")
@@ -954,8 +953,9 @@ def _harvey_can_send() -> bool:
         from harvey.config import load_config, load_env
         from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
         config, env = load_config(), load_env()
+        from harvey.config import legacy_sending_held
         email = config.channels.email
-        if not email.enabled:
+        if not email.enabled or legacy_sending_held(config):
             return False
         if (email.provider or "").strip().lower() in NATIVE_PROVIDERS:
             provider = get_mail_provider(config, env)
@@ -974,11 +974,15 @@ def _send_as() -> str:
         return ""
 
 
-async def _harvey_sending_ids() -> set[str]:
-    """Everyone Harvey has queued, approved or sent mail for (Outbox or Instantly)."""
+async def _harvey_committed_ids() -> set[str]:
+    """Everyone Harvey has approved or sent mail for (Outbox or Instantly).
+
+    Approved mail can be going out at this moment, so these people are past
+    the point where a hand send can be recorded safely. A draft that only
+    awaits review isn't: marking the person sent cancels it.
+    """
     ids = {r["prospect_id"] for r in await query_db(
-        "SELECT DISTINCT prospect_id FROM outbox "
-        "WHERE status IN ('pending_review', 'approved', 'sent')")}
+        "SELECT DISTINCT prospect_id FROM outbox WHERE status IN ('approved', 'sent')")}
     for row in await query_db(
             "SELECT prospect_ids_json FROM campaigns WHERE COALESCE(instantly_campaign_id, '') != ''"):
         try:
@@ -1018,7 +1022,7 @@ def _refuse(message: str, code: int = 409):
 @app.post("/api/prospects/{prospect_id}/sent")
 async def mark_prospect_sent(prospect_id: str, request: Request):
     """The user sent this email by hand (e.g. from Gmail): record it, or undo it."""
-    from harvey.state import MANUAL_SEND_KEY
+    from harvey.state import HAND_SENT_REASON, MANUAL_SEND_KEY
     try:
         try:
             body = await request.json()
@@ -1045,11 +1049,12 @@ async def mark_prospect_sent(prospect_id: str, request: Request):
                 # A reply, opt-out or close is never touched; neither is
                 # someone Harvey already emailed.
                 return {"success": True, "sent": True, "status": current}
-            if _harvey_can_send():
-                return _refuse("Harvey sends email for you here, so there's nothing to send by "
-                               "hand. Review it in the Outbox.")
-            if await _harvey_sent_to(prospect_id):
-                return _refuse("Harvey already emailed this person.")
+            # Allowed even when Harvey can send: recording "I already emailed
+            # them" can only ever stop Harvey sending. Not once Harvey has
+            # approved or sent mail to them, though: that may be going out now.
+            if prospect_id in await _harvey_committed_ids():
+                return _refuse("Harvey has already approved or sent an email to this person. "
+                               "Check the Outbox.")
             await state.set_setting(key, current)
             await state.update_prospect_status(prospect_id, "contacted")
             # Anything Harvey had queued for them must not go out as well.
@@ -1139,7 +1144,7 @@ async def get_campaigns():
     rows = await query_db("SELECT * FROM campaigns ORDER BY created_at DESC LIMIT 100")
     harvey_sends = _harvey_can_send()
     send_as = "" if harvey_sends else _send_as()
-    harvey = await _harvey_sending_ids()
+    committed = await _harvey_committed_ids()
     hand_sent = await _hand_sent_ids()
     for row in rows:
         try:
@@ -1161,10 +1166,14 @@ async def get_campaigns():
         row["send_as"] = send_as
         for r in row["recipients"]:
             r["sent_by_hand"] = r["id"] in hand_sent
-            r["can_send_by_hand"] = (
-                not harvey_sends
-                and r["id"] not in hand_sent and r["id"] not in harvey
+            # "I already emailed them": always recordable before Harvey commits.
+            r["can_mark_sent"] = (
+                r["id"] not in hand_sent and r["id"] not in committed
                 and (r.get("status") or "new") in HAND_SENDABLE_STATUSES
+            )
+            # The Gmail button: only when Harvey can't send itself.
+            r["can_send_by_hand"] = (
+                r["can_mark_sent"] and not harvey_sends
                 and (r.get("email_status") or "guess") in HAND_SENDABLE_EMAIL
             )
     return rows
@@ -1460,7 +1469,7 @@ async def get_live_status():
     awaiting_review = await _scalar("SELECT COUNT(*) FROM outbox WHERE status = 'pending_review'")
     by_hand: set[str] = set()
     if not harvey_sends:
-        skip = await _harvey_sending_ids() | await _hand_sent_ids()
+        skip = await _harvey_committed_ids() | await _hand_sent_ids()
         by_hand = {p["id"] for p in prospects
                    if p["id"] in drafted and p["id"] not in skip
                    and (p.get("status") or "new") in HAND_SENDABLE_STATUSES
