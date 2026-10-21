@@ -1625,11 +1625,16 @@ function openInGmail(ci, si, ri) {
 async function markSent(ci, ri, sent) {
   const r = (_campaigns[ci] && _campaigns[ci].recipients || [])[ri];
   if (!r) return;
-  const res = await api('/api/prospects/' + encodeURIComponent(r.id) + '/sent', {
-    method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({sent}),
-  });
-  if (!res || !res.success) showToast('Could not save that. Try again.', 'error');
+  let res = null;
+  try {
+    const resp = await authFetch('/api/prospects/' + encodeURIComponent(r.id) + '/sent', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({sent}),
+    });
+    if (await lockIfRefused(resp)) return;
+    res = await resp.json();
+  } catch {}
+  if (!res || !res.success) showToast((res && res.message) || 'Could not save that. Try again.', 'error');
   else if (!sent && res.sent) showToast('They already replied, so this stays marked as sent.');
   loadCampaigns();
 }
@@ -1649,6 +1654,11 @@ async function loadCampaigns() {
     let stepsHtml = '';
     (c.sequence || []).forEach((step, s) => {
       const sendBtns = (c.recipients || []).map((r, ri) => {
+        // Harvey is sending to them itself: a copy from Gmail would be a second email.
+        if (r.harvey_sending) {
+          return '<span class="muted" style="font-size:13px">' + escHtml(r.email) +
+            ' &middot; Harvey is sending this one (see Outbox)</span>';
+        }
         // 'queued' only means Harvey wrote a draft — it is not a send.
         const sent = ['contacted', 'replied', 'meeting', 'closed', 'lost'].includes(r.status);
         return '<button class="btn btn-primary btn-sm" onclick="openInGmail(' + i + ',' + s + ',' + ri + ')">' +

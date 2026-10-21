@@ -921,6 +921,21 @@ class StateManager:
             await db.commit()
             return cursor.rowcount
 
+    async def restore_hand_cancelled_outbox(self, prospect_id: str, reason: str) -> int:
+        """Undo a cancel made with `reason`: those items go back for review.
+
+        Always to pending_review, even if they were approved before: a human
+        decides again. Items cancelled for any other reason stay cancelled.
+        """
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE outbox SET status = 'pending_review', error = '', updated_at = ? "
+                "WHERE prospect_id = ? AND status = 'cancelled' AND error = ?",
+                (_utcnow().isoformat(), prospect_id, reason),
+            )
+            await db.commit()
+            return cursor.rowcount
+
     async def approve_outbox(self, item_id: str | None = None) -> int:
         """Approve one pending item, or ALL pending when item_id is None."""
         async with self._connect() as db:

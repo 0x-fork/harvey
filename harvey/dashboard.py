@@ -936,6 +936,27 @@ async def outbox_edit(item_id: str, request: Request):
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 
 
+# Remembers what a prospect was before it was marked sent by hand, so undo
+# puts it back exactly (a 'queued' prospect set to 'new' would be redrafted).
+MANUAL_SEND_PREV_KEY = "manual_send_prev:"
+HAND_SENT_REASON = "sent_by_hand"
+
+
+async def _harvey_sent_to(prospect_id: str) -> bool:
+    """Did Harvey itself email this person (native send, or an Instantly campaign)?"""
+    if await query_db("SELECT 1 FROM outbox WHERE prospect_id = ? AND status = 'sent' LIMIT 1",
+                      (prospect_id,)):
+        return True
+    for row in await query_db(
+            "SELECT prospect_ids_json FROM campaigns WHERE COALESCE(instantly_campaign_id, '') != ''"):
+        try:
+            if prospect_id in json.loads(row.get("prospect_ids_json") or "[]"):
+                return True
+        except (json.JSONDecodeError, TypeError):
+            continue
+    return False
+
+
 @app.post("/api/prospects/{prospect_id}/sent")
 async def mark_prospect_sent(prospect_id: str, request: Request):
     """The user sent this email by hand (e.g. from Gmail): record it, or undo it."""
@@ -944,7 +965,12 @@ async def mark_prospect_sent(prospect_id: str, request: Request):
             body = await request.json()
         except ValueError:
             body = {}
-        sent = bool((body or {}).get("sent", True))
+        if body is None:
+            body = {}
+        if not isinstance(body, dict):
+            return JSONResponse({"success": False, "message": "expected {\"sent\": true|false}"},
+                                status_code=400)
+        sent = bool(body.get("sent", True))
         rows = await query_db("SELECT status FROM prospects WHERE id = ?", (prospect_id,))
         if not rows:
             return JSONResponse({"success": False, "message": "unknown prospect"},
@@ -957,11 +983,32 @@ async def mark_prospect_sent(prospect_id: str, request: Request):
             return {"success": True, "sent": True, "status": current}
         state = _state()
         await state.init_db()
-        await state.update_prospect_status(prospect_id, "contacted" if sent else "new")
+        key = MANUAL_SEND_PREV_KEY + prospect_id
+        if sent:
+            if current != "contacted":
+                await state.set_setting(key, current)
+            await state.update_prospect_status(prospect_id, "contacted")
+            # They've had this email from the user's own mailbox: whatever
+            # Harvey had queued for them must not go out as well.
+            cancelled = await state.cancel_pending_outbox_for_prospect(
+                prospect_id, reason=HAND_SENT_REASON)
+        else:
+            if current == "contacted" and await _harvey_sent_to(prospect_id):
+                # Setting them back would make Harvey write and send again.
+                return JSONResponse({"success": False,
+                                     "message": "Harvey already emailed this person, so it "
+                                                "stays marked as sent."},
+                                    status_code=409)
+            previous = await state.get_setting(key) or "new"
+            await state.update_prospect_status(prospect_id, previous)
+            await state.delete_setting(key)
+            # What marking sent cancelled comes back for review, never straight out.
+            cancelled = await state.restore_hand_cancelled_outbox(
+                prospect_id, reason=HAND_SENT_REASON)
         await state.log_action(
             action_type="manual_send" if sent else "manual_send_undone",
             agent="user",
-            details={"prospect_id": prospect_id},
+            details={"prospect_id": prospect_id, "outbox_items": cancelled},
         )
         return {"success": True, "sent": sent}
     except Exception as e:
@@ -1038,6 +1085,15 @@ async def get_campaigns():
             f"WHERE id IN ({','.join('?' * len(ids))}) AND email != ''",
             tuple(ids),
         ) if ids else []
+        # Harvey is sending to them itself (Outbox or Instantly): the UI must
+        # not offer a second copy from the user's own mailbox.
+        harvey = {r["prospect_id"] for r in (await query_db(
+            f"SELECT DISTINCT prospect_id FROM outbox WHERE prospect_id IN "
+            f"({','.join('?' * len(ids))}) AND status IN ('pending_review', 'approved', 'sent')",
+            tuple(ids)) if ids else [])}
+        deployed = bool(row.get("instantly_campaign_id"))
+        for r in row["recipients"]:
+            r["harvey_sending"] = deployed or r["id"] in harvey
     return rows
 
 
@@ -1324,6 +1380,17 @@ async def get_live_status():
         if isinstance(ids, list):
             drafted.update(i for i in ids if isinstance(i, str))
     sent = {p["id"] for p in prospects if p.get("status") in SENT_STATUSES}
+    # People Harvey is emailing itself: never the user's job to send by hand.
+    harvey_sending = {r["prospect_id"] for r in await query_db(
+        "SELECT DISTINCT prospect_id FROM outbox "
+        "WHERE status IN ('pending_review', 'approved', 'sent')")}
+    for row in await query_db(
+            "SELECT prospect_ids_json FROM campaigns WHERE COALESCE(instantly_campaign_id, '') != ''"):
+        try:
+            harvey_sending.update(json.loads(row.get("prospect_ids_json") or "[]"))
+        except (json.JSONDecodeError, TypeError):
+            pass
+    awaiting_review = await _scalar("SELECT COUNT(*) FROM outbox WHERE status = 'pending_review'")
     replies = sum(1 for p in prospects if p.get("status") in REPLY_STATUSES)
     cost = float(await _first(
         "SELECT COALESCE(SUM(cost_usd), 0) AS c FROM runs", key="c") or 0)
@@ -1390,7 +1457,7 @@ async def get_live_status():
              + (f" · {by_status['invalid']} bad" if by_status.get("invalid") else "")),
         step("Write first emails", len(drafted), len(deliverable | drafted), False,
              f"{len(drafted)} written · see Campaigns"),
-        step("Sent by you", len(sent & drafted), len(drafted), False,
+        step("Sent", len(sent & drafted), len(drafted), False,
              f"{len(sent & drafted)} of {len(drafted)} sent"),
         step("Replies", replies, 0, False,
              f"{replies} replies" if replies else "No replies yet", info=True),
@@ -1402,8 +1469,10 @@ async def get_live_status():
         next_up = "Wait — emails are being found."
     elif stopped:
         next_up = "A job stopped before finishing. Run it again."
-    elif drafted - sent:
-        next_up = f"Open Campaigns and send the {len(drafted - sent)} unsent email(s)."
+    elif awaiting_review:
+        next_up = f"Review the {awaiting_review} draft(s) waiting in the Outbox."
+    elif drafted - sent - harvey_sending:
+        next_up = f"Open Campaigns and send the {len(drafted - sent - harvey_sending)} unsent email(s)."
     elif profiled > checked:
         next_up = f"Find emails for the {profiled - checked} businesses not checked yet."
     elif deliverable - drafted:

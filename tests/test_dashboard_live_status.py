@@ -104,7 +104,7 @@ def test_queued_drafts_are_not_counted_as_sent(client, env):
     _prospect(env, "p2", "b@acme.test", status="contacted")
     _campaign(env, "c1", ["p1", "p2"])
     data = client.get("/api/live-status").json()
-    sent = _step(data, "Sent by you")
+    sent = _step(data, "Sent")
     assert (sent["done"], sent["total"]) == (1, 2)
     assert _step(data, "Write first emails")["done"] == 2  # per person, not per campaign
     assert data["next"] == "Open Campaigns and send the 1 unsent email(s)."
@@ -142,3 +142,26 @@ def test_a_killed_run_is_reported_as_stopped_not_running(client, env):
     assert [r["stage"] for r in data["stopped"]] == ["profile"]
     assert _step(data, "Read their websites")["state"] != "running"
     assert "stopped before finishing" in data["next"]
+
+
+def _outbox(env, oid, pid, status):
+    _sql(env, "INSERT INTO outbox (id, prospect_id, campaign_id, step, to_email, subject, body, "
+              "send_at, status) VALUES (?, ?, 'c1', 1, 'a@acme.test', 's', 'b', "
+              "'2026-01-01T00:00:00', ?)", (oid, pid, status))
+
+
+def test_drafts_waiting_in_the_outbox_point_there_not_at_gmail(client, env):
+    # Harvey is sending these itself: telling the user to send them from
+    # Campaigns by hand would email the same person twice.
+    _prospect(env, "p1", "a@acme.test", status="queued")
+    _campaign(env, "c1", ["p1"])
+    _outbox(env, "o1", "p1", "pending_review")
+    assert client.get("/api/live-status").json()["next"] == \
+        "Review the 1 draft(s) waiting in the Outbox."
+
+
+def test_approved_mail_harvey_will_send_is_not_a_job_for_the_user(client, env):
+    _prospect(env, "p1", "a@acme.test", status="queued")
+    _campaign(env, "c1", ["p1"])
+    _outbox(env, "o1", "p1", "approved")
+    assert "Open Campaigns" not in client.get("/api/live-status").json()["next"]

@@ -102,3 +102,76 @@ def test_unknown_prospect_is_refused(client):
 def test_missing_body_means_sent(client, env):
     _prospect(env, "p1", "a@acme.test")
     assert client.post("/api/prospects/p1/sent").json()["sent"] is True
+
+
+# ── Never email someone twice ──
+
+
+def _outbox(env, oid, pid, status, step=1, campaign="c1"):
+    _sql(env, "INSERT INTO outbox (id, prospect_id, campaign_id, step, to_email, subject, body, "
+              "send_at, status) VALUES (?, ?, ?, ?, 'a@acme.test', 's', 'b', "
+              "'2026-01-01T00:00:00', ?)", (oid, pid, campaign, step, status))
+
+
+def _status(env, table, row_id):
+    with sqlite3.connect(env["db"]) as db:
+        return db.execute(f"SELECT status FROM {table} WHERE id = ?", (row_id,)).fetchone()[0]
+
+
+def test_sending_by_hand_cancels_what_harvey_had_queued(client, env):
+    _prospect(env, "p1", "a@acme.test", status="queued")
+    _outbox(env, "o1", "p1", "approved", step=1)
+    _outbox(env, "o2", "p1", "pending_review", step=2)
+    client.post("/api/prospects/p1/sent", json={"sent": True})
+    assert _status(env, "outbox", "o1") == "cancelled"
+    assert _status(env, "outbox", "o2") == "cancelled"
+
+
+def test_undo_puts_the_prospect_and_their_drafts_back_for_review(client, env):
+    _prospect(env, "p1", "a@acme.test", status="queued")
+    _outbox(env, "o1", "p1", "approved")
+    client.post("/api/prospects/p1/sent", json={"sent": True})
+    assert client.post("/api/prospects/p1/sent", json={"sent": False}).json()["sent"] is False
+    assert _status(env, "prospects", "p1") == "queued"   # not 'new': the Writer won't redraft
+    assert _status(env, "outbox", "o1") == "pending_review"  # back to you, never straight out
+
+
+def test_undo_never_cancels_an_unrelated_cancellation(client, env):
+    _prospect(env, "p1", "a@acme.test", status="queued")
+    _outbox(env, "o1", "p1", "cancelled")
+    client.post("/api/prospects/p1/sent", json={"sent": True})
+    client.post("/api/prospects/p1/sent", json={"sent": False})
+    assert _status(env, "outbox", "o1") == "cancelled"
+
+
+def test_unticking_someone_harvey_emailed_is_refused(client, env):
+    _prospect(env, "p1", "a@acme.test", status="contacted")
+    _outbox(env, "o1", "p1", "sent")
+    r = client.post("/api/prospects/p1/sent", json={"sent": False})
+    assert r.status_code == 409
+    assert _status(env, "prospects", "p1") == "contacted"
+
+
+def test_unticking_someone_sent_through_instantly_is_refused(client, env):
+    _prospect(env, "p1", "a@acme.test", status="contacted")
+    _campaign(env, "c1", ["p1"])
+    _sql(env, "UPDATE campaigns SET instantly_campaign_id = 'inst-1', status = 'active'")
+    assert client.post("/api/prospects/p1/sent", json={"sent": False}).status_code == 409
+    assert _status(env, "prospects", "p1") == "contacted"
+
+
+def test_recipients_say_when_harvey_is_sending_to_them(client, env):
+    _prospect(env, "p1", "a@acme.test", status="queued")
+    _prospect(env, "p2", "b@acme.test", status="queued")
+    _campaign(env, "c1", ["p1", "p2"])
+    _outbox(env, "o1", "p1", "pending_review")
+    recips = {r["id"]: r for r in client.get("/api/campaigns").json()[0]["recipients"]}
+    assert recips["p1"]["harvey_sending"] is True
+    assert recips["p2"]["harvey_sending"] is False
+
+
+@pytest.mark.parametrize("payload", [[], "x"])
+def test_a_body_that_is_not_an_object_is_refused(client, env, payload):
+    _prospect(env, "p1", "a@acme.test")
+    assert client.post("/api/prospects/p1/sent", json=payload).status_code == 400
+    assert _status(env, "prospects", "p1") == "new"
