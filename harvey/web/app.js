@@ -892,11 +892,18 @@ async function loadSettings() {
   document.getElementById('smtp-host').value = data.smtp_host || '';
   document.getElementById('smtp-port').value = data.smtp_port || '';
   document.getElementById('smtp-user').value = data.smtp_username || '';
+  document.getElementById('imap-host').value = data.imap_host || '';
+  document.getElementById('imap-port').value = data.imap_port || '';
+  document.getElementById('imap-user').value = data.imap_username || '';
+  document.getElementById('m365-client').value = data.m365_client_id || '';
+  document.getElementById('m365-tenant').value = data.m365_tenant_id || '';
   document.getElementById('linkedin-email').value = data.linkedin_email || '';
   document.getElementById('cf-account-id').value = data.cloudflare_account_id || '';
 
   savedPh('gmail-secret', data.gmail_client_secret_set, 'Enter client secret');
   savedPh('smtp-pass', data.smtp_password_set, 'Enter password / app password');
+  savedPh('imap-pass', data.imap_password_set, 'Same as SMTP password');
+  document.getElementById('imap-same-pass').checked = !data.imap_password_set;
   savedPh('instantly-key', data.instantly_api_key_set, 'Enter your Instantly API key');
   savedPh('reoon-key', data.reoon_api_key_set, '600 free/mo — reoon.com/email-verifier');
   savedPh('zerobounce-key', data.zerobounce_api_key_set, '100 free/mo — best for M365/Workspace catch-alls');
@@ -910,6 +917,12 @@ async function loadSettings() {
     if (data.gmail_authorized) { g.className = 'email-tag verified'; g.textContent = 'authorized'; }
     else if (data.gmail_client_secret_set) { g.className = 'email-tag risky'; g.textContent = 'run: harvey gmail auth'; }
     else { g.className = 'email-tag guess'; g.textContent = 'not set up'; }
+  }
+  const m = document.getElementById('m365-status');
+  if (m) {
+    if (data.m365_authorized) { m.className = 'email-tag verified'; m.textContent = 'authorized'; }
+    else if (data.m365_client_id) { m.className = 'email-tag risky'; m.textContent = 'run: harvey microsoft auth'; }
+    else { m.className = 'email-tag guess'; m.textContent = 'not set up'; }
   }
   tag('reoon-status', data.reoon_api_key_set, 'set');
   tag('zerobounce-status', data.zerobounce_api_key_set, 'set');
@@ -931,7 +944,23 @@ function saveSmtp() {
   };
   const pass = document.getElementById('smtp-pass').value;
   if (pass) payload.SMTP_PASSWORD = pass;
+  // Blank IMAP fields fall back to the SMTP ones. A typed IMAP password wins;
+  // otherwise the checkbox clears it back to the SMTP one, and an unticked
+  // empty box keeps whatever IMAP password is saved.
+  payload.IMAP_HOST = document.getElementById('imap-host').value.trim();
+  payload.IMAP_PORT = document.getElementById('imap-port').value.trim();
+  payload.IMAP_USERNAME = document.getElementById('imap-user').value.trim();
+  const imapPass = document.getElementById('imap-pass').value;
+  if (imapPass) payload.IMAP_PASSWORD = imapPass;
+  else if (document.getElementById('imap-same-pass').checked) payload.IMAP_PASSWORD = '';
   saveEnv(payload, 'SMTP settings saved.').then(loadSettings);
+}
+
+function saveMicrosoft() {
+  const client = document.getElementById('m365-client').value.trim();
+  if (!client) { showToast('Paste the Application (client) ID first.', 'error'); return; }
+  saveEnv({M365_CLIENT_ID: client, M365_TENANT_ID: document.getElementById('m365-tenant').value.trim()},
+          'Saved. Now run "harvey microsoft auth" in your terminal.').then(loadSettings);
 }
 
 function saveVerifiers() {
@@ -1564,18 +1593,20 @@ async function submitFeedback(entityType, entityId, promptText) {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({entity_type: entityType, entity_id: entityId, comment: comment})
   });
-  if (data && data.success) showToast('Feedback saved. Harvey will take it into account.', 'success');
+  if (data && data.success) showToast(entityType === 'campaign'
+    ? 'Saved. Harvey follows it in the emails it writes from now on.'
+    : 'Saved. Harvey uses it if it writes this person\'s first email (Gmail, SMTP or Microsoft 365).', 'success');
   else showToast((data && data.message) || 'Could not save feedback.', 'error');
 }
 
 function fbProspect(i) {
   const p = _prospects[i];
-  if (p) submitFeedback('contact', p.id, 'Feedback on this contact:');
+  if (p) submitFeedback('contact', p.id, 'Anything Harvey should know before writing to this person?');
 }
 
 function fbCampaign(i) {
   const c = _campaigns[i];
-  if (c) submitFeedback('campaign', c.id, 'Leave feedback on this campaign:');
+  if (c) submitFeedback('campaign', c.id, 'What should Harvey do differently in the emails it writes next? (e.g. "shorter; don\'t mention reviews")');
 }
 
 async function loadProspects() {

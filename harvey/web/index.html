@@ -224,7 +224,7 @@
   <div class="section-head"><h2>Settings</h2><p>Credentials are stored locally in <span style="font-family:var(--mono);font-size:12px">.env</span> — never sent anywhere except the services themselves.</p></div>
   <div class="card">
     <h2>Email Provider</h2>
-    <p class="lede">How Harvey sends and reads replies. Active provider: <b id="active-provider">…</b> — change it by setting <span style="font-family:var(--mono);font-size:12px">channels.email.provider</span> in <span style="font-family:var(--mono);font-size:12px">harvey.yaml</span> to <span style="font-family:var(--mono);font-size:12px">gmail</span>, <span style="font-family:var(--mono);font-size:12px">smtp</span>, or <span style="font-family:var(--mono);font-size:12px">instantly</span>.</p>
+    <p class="lede">How Harvey sends and reads replies. Active provider: <b id="active-provider">…</b> — change it by setting <span style="font-family:var(--mono);font-size:12px">channels.email.provider</span> in <span style="font-family:var(--mono);font-size:12px">harvey.yaml</span> to <span style="font-family:var(--mono);font-size:12px">gmail</span>, <span style="font-family:var(--mono);font-size:12px">microsoft</span>, <span style="font-family:var(--mono);font-size:12px">smtp</span>, or <span style="font-family:var(--mono);font-size:12px">instantly</span>.</p>
 
     <div style="border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:12px">
       <div style="font-weight:650;margin-bottom:4px">Gmail / Google Workspace <span class="optional-tag">recommended</span> <span id="gmail-status" class="email-tag"></span></div>
@@ -253,7 +253,36 @@
         <div class="form-row"><div class="form-group" style="margin-bottom:0">
           <input type="password" class="form-input" id="smtp-pass" placeholder="Enter password / app password" autocomplete="off"></div>
           <button class="btn btn-secondary btn-sm" onclick="toggleVisibility('smtp-pass')">Show</button></div></div>
+      <details style="margin-bottom:12px">
+        <summary style="cursor:pointer;font-size:13px;color:var(--text-2)">Reading replies from a different IMAP server or login</summary>
+        <div class="form-row" style="margin-top:10px">
+          <div class="form-group"><label class="form-label" for="imap-host">IMAP host</label>
+            <input type="text" class="form-input" id="imap-host" placeholder="Same as SMTP host" autocomplete="off"></div>
+          <div class="form-group" style="max-width:120px"><label class="form-label" for="imap-port">Port</label>
+            <input type="text" class="form-input" id="imap-port" placeholder="993" autocomplete="off"></div>
+        </div>
+        <div class="form-group"><label class="form-label" for="imap-user">IMAP username</label>
+          <input type="text" class="form-input" id="imap-user" placeholder="Same as SMTP username" autocomplete="off"></div>
+        <div class="form-group"><label class="form-label" for="imap-pass">IMAP password</label>
+          <div class="form-row"><div class="form-group" style="margin-bottom:0">
+            <input type="password" class="form-input" id="imap-pass" placeholder="Same as SMTP password" autocomplete="off" oninput="if (this.value) document.getElementById('imap-same-pass').checked = false"></div>
+            <button class="btn btn-secondary btn-sm" onclick="toggleVisibility('imap-pass')">Show</button></div></div>
+        <label style="display:inline-flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
+          <input type="checkbox" id="imap-same-pass"> Use the SMTP password for IMAP</label>
+      </details>
       <button class="btn btn-primary btn-sm" onclick="saveSmtp()">Save SMTP</button>
+    </div>
+
+    <div style="border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:12px">
+      <div style="font-weight:650;margin-bottom:4px">Microsoft 365 / Outlook <span id="m365-status" class="email-tag"></span></div>
+      <p class="lede" style="margin-top:4px">Microsoft turned off password sign-in for IMAP, so Outlook mailboxes connect with OAuth. In <a href="https://entra.microsoft.com" target="_blank" rel="noopener noreferrer">Entra</a> → App registrations, register an app for your organization only, add the redirect URI <span style="font-family:var(--mono);font-size:12px">http://localhost:8766</span> as "Public client/native", paste both IDs here, save, then run <span style="font-family:var(--mono);font-size:12px">harvey microsoft auth</span> in your terminal. No client secret is needed.</p>
+      <div class="form-row">
+        <div class="form-group"><label class="form-label" for="m365-client">Application (client) ID</label>
+          <input type="text" class="form-input" id="m365-client" placeholder="00000000-0000-0000-0000-000000000000" autocomplete="off"></div>
+        <div class="form-group"><label class="form-label" for="m365-tenant">Directory (tenant) ID</label>
+          <input type="text" class="form-input" id="m365-tenant" placeholder="00000000-0000-0000-0000-000000000000" autocomplete="off"></div>
+      </div>
+      <button class="btn btn-primary btn-sm" onclick="saveMicrosoft()">Save Microsoft 365</button>
     </div>
 
     <div style="border:1px solid var(--border);border-radius:10px;padding:16px">
