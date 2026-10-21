@@ -9,6 +9,14 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- The Sender claims each email right before sending it. A reply, bounce, hand
+  send or rejection that cancels an approved email while the Sender is working
+  through its queue now stops it, instead of the Sender sending its earlier
+  copy and recording it as sent. Two Harvey processes running at once can no
+  longer send the same email twice. An email cut off mid-send (Harvey stopped,
+  or the provider raised an error) is marked failed and never retried, since
+  it may have gone out; it shows under "Didn't send" with a note to check your
+  Sent folder.
 - Keep local website requests out of private networks, including redirects and
   DNS rebinding. Preserve the original hostname for TLS verification. Website
   fetching (search, company sites, profiling, the training crawler) now ignores

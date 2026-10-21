@@ -202,6 +202,15 @@ def test_someone_with_approved_mail_cant_be_marked_sent(client, env):
     assert _status(env, "outbox", "o1") == "approved"
 
 
+def test_someone_whose_mail_is_being_sent_cant_be_marked_sent(client, env):
+    _prospect(env, "p1", "a@acme.test", status="queued")
+    _campaign(env, "c1", ["p1"])
+    _outbox(env, "o1", "p1", "sending")
+    assert client.get("/api/campaigns").json()[0]["recipients"][0]["can_mark_sent"] is False
+    assert client.post("/api/prospects/p1/sent", json={"sent": True}).status_code == 409
+    assert _status(env, "outbox", "o1") == "sending"
+
+
 def test_drafts_awaiting_review_dont_hide_the_gmail_button_when_harvey_cant_send(client, env):
     _prospect(env, "p1", "a@acme.test", status="queued")
     _campaign(env, "c1", ["p1"])

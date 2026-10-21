@@ -982,7 +982,7 @@ async def _harvey_committed_ids() -> set[str]:
     awaits review isn't: marking the person sent cancels it.
     """
     ids = {r["prospect_id"] for r in await query_db(
-        "SELECT DISTINCT prospect_id FROM outbox WHERE status IN ('approved', 'sent')")}
+        "SELECT DISTINCT prospect_id FROM outbox WHERE status IN ('approved', 'sending', 'sent')")}
     for row in await query_db(
             "SELECT prospect_ids_json FROM campaigns WHERE COALESCE(instantly_campaign_id, '') != ''"):
         try:
@@ -1002,7 +1002,7 @@ async def _hand_sent_ids() -> set[str]:
 
 async def _harvey_sent_to(prospect_id: str) -> bool:
     """Did Harvey itself email this person (native send, or an Instantly campaign)?"""
-    if await query_db("SELECT 1 FROM outbox WHERE prospect_id = ? AND status = 'sent' LIMIT 1",
+    if await query_db("SELECT 1 FROM outbox WHERE prospect_id = ? AND status IN ('sending', 'sent') LIMIT 1",
                       (prospect_id,)):
         return True
     for row in await query_db(

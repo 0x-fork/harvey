@@ -38,6 +38,11 @@ WRITABLE_EMAIL_STATUSES = ("verified", "risky")
 MANUAL_SEND_KEY = "manual_send:"
 # Outbox cancel reason for mail the user sent by hand instead; undo restores it.
 HAND_SENT_REASON = "sent_by_hand"
+# Outbox error for an email Harvey stopped in the middle of sending.
+STALE_SENDING_ERROR = (
+    "interrupted while sending; it may have gone out, so check your Sent "
+    "folder before sending it again"
+)
 
 
 def _new_id() -> str:
@@ -925,6 +930,38 @@ class StateManager:
                 (*fields.values(), _utcnow().isoformat(), item_id),
             )
             await db.commit()
+
+    async def claim_outbox_item(self, item_id: str) -> bool:
+        """Take an approved item for sending: approved → sending, atomically.
+
+        False when it is no longer approved (cancelled by a reply, bounce or
+        hand send, rejected, or taken by another sender), so it must not go
+        out. Cancels never touch a claimed item: it is already on its way.
+        """
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE outbox SET status = 'sending', updated_at = ? "
+                "WHERE id = ? AND status = 'approved'",
+                (_utcnow().isoformat(), item_id),
+            )
+            await db.commit()
+            return cursor.rowcount == 1
+
+    async def fail_stale_sending_outbox(self, older_than: timedelta) -> int:
+        """Items claimed long ago and never finished (Harvey stopped mid-send).
+
+        Whether they went out is unknown, so they are never retried: they
+        become failed with a note to check the Sent folder.
+        """
+        cutoff = (_utcnow() - older_than).isoformat()
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE outbox SET status = 'failed', error = ?, updated_at = ? "
+                "WHERE status = 'sending' AND updated_at < ?",
+                (STALE_SENDING_ERROR, _utcnow().isoformat(), cutoff),
+            )
+            await db.commit()
+            return cursor.rowcount
 
     async def edit_outbox_draft(self, item_id: str, subject: str, body: str) -> int:
         """Rewrite a draft's subject and body — only while it awaits review.
