@@ -214,3 +214,12 @@ def test_a_ramp_that_never_grows_says_so():
 @pytest.mark.parametrize("domain", ["xn--mnchen-3ya.de", "shop.xn--p1ai"])
 def test_punycode_domains_are_checked(domain):
     assert d.DOMAIN_RE.match(domain)
+
+
+def test_timestamp_start_date_and_instantly_note():
+    import yaml
+    email = EmailChannelConfig(**yaml.safe_load("warmup:\n  start_date: 2026-10-01 09:00\n"))
+    assert email.warmup.start_date == "2026-10-01"
+    w = WarmupConfig(start_date="2026-10-01", min_days=0, start_sends=0, daily_increase=2)
+    assert d.check_warmup(w, 30, date(2026, 10, 1)).status != d.WARN  # 0 today, grows
+    assert d.check_warmup(w, 30, provider="instantly").status == d.INFO

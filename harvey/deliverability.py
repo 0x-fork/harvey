@@ -216,7 +216,11 @@ def check_ip_blocklists(smtp_host: str) -> list[Check]:
     return _blocklist_checks(reversed_ip, f"IP {ips[0]}", IP_BLOCKLISTS)
 
 
-def check_warmup(warmup, ceiling: int, today: date | None = None) -> Check:
+def check_warmup(warmup, ceiling: int, today: date | None = None,
+                 provider: str = "") -> Check:
+    if provider == "instantly":
+        return Check("Warmup", INFO, "Harvey's ramp doesn't apply to Instantly: use Instantly's "
+                     "own warmup and per-account daily limit.")
     days = warmup.days_in(today)
     if days is None:
         return Check("Warmup", WARN, "No warmup start date set, so sends aren't ramped. Once your warmup "
@@ -227,7 +231,7 @@ def check_warmup(warmup, ceiling: int, today: date | None = None) -> Check:
         return Check("Warmup", FAIL, f"Day {days} of {warmup.min_days} - warming only, no cold email "
                      f"until {warmup.min_days - days} more day(s) pass.")
     cap = warmup.daily_cap(ceiling, today)
-    if cap <= 0:
+    if cap <= 0 and warmup.daily_increase <= 0:
         return Check("Warmup", WARN, "Today's cold cap is 0 and won't grow: raise start_sends "
                      "or daily_increase.")
     if cap >= ceiling:

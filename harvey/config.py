@@ -87,10 +87,16 @@ class WarmupConfig(BaseModel):
 
     @field_validator("start_date", "dkim_selector", mode="before")
     @classmethod
-    def _blank_is_empty(cls, v):
-        # YAML reads an unquoted 2026-10-01 as a date.
+    def _blank_is_empty(cls, v, info):
+        if v is None:
+            return ""
+        if info.field_name != "start_date":
+            return v
+        # YAML reads an unquoted 2026-10-01 as a date (with a time, a datetime).
         if isinstance(v, _date):
-            return v.isoformat()
+            return (v.date() if hasattr(v, "date") and callable(v.date) else v).isoformat()
+        if isinstance(v, str) and len(v.strip()) > 10 and v.strip()[10] in " T":
+            return v.strip()[:10]  # "2026-10-01 09:00": the day is what counts
         return "" if v is None else v
 
     @field_validator("min_days", "start_sends", "daily_increase", mode="before")

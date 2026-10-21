@@ -732,7 +732,8 @@ def cmd_warmup(args):
                             d.check_dmarc(domain)]),
         ("Reputation", [d.check_domain_age(domain), *d.check_domain_blocklists(domain)]
          + (d.check_ip_blocklists(smtp_host) if smtp_host else [])),
-        ("Warmup & sending", [d.check_warmup(email.warmup, email.max_daily_sends),
+        ("Warmup & sending", [d.check_warmup(email.warmup, email.max_daily_sends,
+                                             provider=email.provider),
                               d.check_send_history(*asyncio.run(_history()))]),
     ]
     icons = {d.OK: "OK  ", d.WARN: "WARN", d.FAIL: "FAIL", d.INFO: "info"}
