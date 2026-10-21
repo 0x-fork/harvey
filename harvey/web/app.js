@@ -68,6 +68,8 @@ const STATUS = {
   not_interested: ['Not interested', 'bad'],
   bounced:        ['Bounced', 'bad'],
   write_failed:   ["Couldn't write", 'bad'],
+  queued:         ['Queued', 'active'],
+  opted_out:      ['Opted out', 'bad'],
   // campaigns
   draft:          ['Draft', 'waiting'],
   active:         ['Active', 'good'],
@@ -79,6 +81,12 @@ const STATUS = {
   closed_won:     ['Won', 'good'],
   closed_lost:    ['Lost', 'bad'],
   objection:      ['Objection', 'waiting'],
+  question:       ['Question', 'active'],
+  ooo:            ['Out of office', 'idle'],
+  wrong_person:   ['Wrong person', 'waiting'],
+  unsubscribe:    ['Unsubscribed', 'bad'],
+  escalate:       ['Needs a human', 'bad'],
+  needs_human:    ['Needs you', 'waiting'],
   // outbox
   pending_review: ['Waiting on you', 'waiting'],
   approved:       ['Approved', 'good'],
@@ -207,9 +215,34 @@ function sourceLabel(s) {
 }
 
 const AGENT_ICONS = {scout: 'discover', writer: 'pen', sender: 'campaigns', handler: 'message',
-                     analyst: 'usage', user: 'contacts'};
+                     analyst: 'usage', user: 'contacts', main: 'refresh'};
+// One plain sentence per logged action, from the details each agent records.
 function actionText(a) {
-  return escHtml(String(a.action_type || '').replace(/_/g, ' '));
+  const d = a.details || {};
+  const who = escHtml(d.prospect_email || d.prospect || d.to || '');
+  const camp = escHtml(d.campaign_name || d.campaign || '');
+  const intent = d.intent ? ' · ' + escHtml(String(d.intent).replace(/_/g, ' ')) : '';
+  const n = (v, one, many) => (Number(v) || 0) + ' ' + ((Number(v) || 0) === 1 ? one : many);
+  switch (a.action_type) {
+    case 'prospect': return 'Found ' + n(d.prospects_found, 'new contact', 'new contacts');
+    case 'write_campaign': return 'Wrote “' + camp + '” for ' + n(d.prospect_count, 'contact', 'contacts');
+    case 'write_failed': return 'Couldn’t write for some contacts' + (camp ? ' in “' + camp + '”' : '');
+    case 'stage_campaign': return 'Queued ' + n(d.staged, 'email', 'emails') + ' from “' + camp + '”' +
+      (d.mode ? ' · ' + escHtml(d.mode) : '');
+    case 'send_campaign': return 'Sent “' + camp + '” to Instantly · ' + n(d.leads_added, 'lead', 'leads');
+    case 'email_sent': return d.kind === 'reply' ? 'Sent a reply to ' + who
+      : 'Sent email ' + escHtml(String(d.step || 1)) + ' to ' + who;
+    case 'reply': return 'Answered ' + who + intent;
+    case 'reply_queued': return 'Drafted a reply to ' + who + intent;
+    case 'opt_out': return who + ' opted out';
+    case 'escalation': return 'Flagged ' + who + ' for you' + (d.reason ? ' · ' + escHtml(d.reason) : '');
+    case 'bounce': return 'Email to ' + who + ' bounced';
+    case 'manual_send': return 'You marked a contact as emailed by hand';
+    case 'manual_send_undone': return 'You undid a hand-sent mark';
+    case 'outbox_edited': return 'You edited a draft';
+  }
+  const text = escHtml(String(a.action_type || '').replace(/_/g, ' '));
+  return a.agent === 'main' ? 'Heartbeat: ' + text : text;
 }
 
 function emptyState(glyph, title, copy) {
@@ -449,8 +482,8 @@ function renderFigures(stats) {
   const last7 = a => sum((a || []).slice(-7));
   const card = (label, value, spark, note) =>
     '<div class="kpi"><div class="kpi-label">' + label + '</div>' +
-    '<div class="kpi-value' + (value ? '' : ' zero') + '">' + value + '</div>' +
-    '<div class="kpi-foot"><span class="kpi-note">' + note + '</span>' + spark + '</div></div>';
+    '<div class="kpi-main"><span class="kpi-value' + (value ? '' : ' zero') + '">' + value + '</span>' + spark + '</div>' +
+    '<span class="kpi-note">' + note + '</span></div>';
 
   el.innerHTML = '<div class="kpis">' +
     card('Contacts found', stats.prospects || 0, sparkBars(t.found, 'Contacts found per day, last 14 days'),
@@ -486,7 +519,8 @@ async function loadFunnel() {
     ['To write', n(['new', 'queued']), 'c-accent-soft'],
     ['Contacted', n(['contacted']), 'c-accent'],
     ['Replied', n(['replied']), 'c-active'],
-    ['Interested', n(['interested', 'meeting']), 'c-good'],
+    ['Interested', n(['interested']), 'c-good'],
+    ['Meeting booked', n(['meeting']), 'c-note'],
     ['Closed out', total - n(known), 'c-idle'],
   ];
   if (!total) {
@@ -514,7 +548,7 @@ async function loadTodayActivity() {
       'Nothing yet. Every action Harvey takes shows up here.</p>';
     return;
   }
-  el.innerHTML = '<div class="timeline">' + data.slice(0, 8).map(a =>
+  el.innerHTML = '<div class="timeline">' + data.filter(a => a.agent !== 'main').slice(0, 8).map(a =>
     '<div class="tl-item">' +
       '<span class="tl-time">' + relTime(a.created_at) + '</span>' +
       '<span class="tl-icon">' + icon(AGENT_ICONS[a.agent] || 'activity') + '</span>' +
@@ -1961,34 +1995,84 @@ async function loadCampaigns() {
   el.innerHTML = html;
 }
 
+// The whole exchange in order: Harvey's cold emails (from the Outbox), the
+// replies, Harvey's answers, and any answer still waiting for approval.
+let _convos = [], _convoFilter = 'needs';
+const STAGE_LABELS = {
+  initial_outreach: 'Outreach', engaged: 'Engaged', qualifying: 'Qualifying', presenting: 'Presenting',
+  negotiating: 'Negotiating', closing: 'Closing', closed_won: 'Won', closed_lost: 'Lost',
+};
+const CONVO_FILTERS = [
+  ['needs', 'Needs you', c => !!c.draft || c.status === 'needs_human'],
+  ['open', 'Open', c => c.status !== 'closed'],
+  ['closed', 'Closed', c => c.status === 'closed'],
+  ['all', 'All', () => true],
+];
+
 async function loadConversations() {
   const el = document.getElementById('conversations-list');
   const data = await api('/api/conversations');
   if (!data) { el.innerHTML = offlineState(); return; }
+  _convos = data;
   if (!data.length) {
     el.innerHTML = emptyState(icon('conversations'), 'No conversations yet',
       'No prospects have replied so far. When they do, the Handler agent classifies each reply and responds — every thread shows up here.');
     return;
   }
-  let html = '';
-  for (const c of data) {
-    let threadHtml = '';
-    for (const msg of (c.thread || [])) {
-      const cls = msg.sender === 'harvey' ? 'sent' : 'received';
-      threadHtml += '<div class="thread-msg ' + cls + '"><div class="sender">' +
-        (cls === 'sent' ? 'Harvey' : escHtml(c.first_name || msg.sender)) +
-        ' &middot; ' + relTime(msg.timestamp) + '</div>' + escHtml(msg.content) + '</div>';
-    }
-    const name = [c.first_name, c.last_name].filter(Boolean).join(' ') || 'Unknown';
-    html += '<div class="convo-card"><div class="convo-head">' +
-      '<span class="avatar">' + initials(c.first_name, c.last_name) + '</span>' +
-      '<div><h3>' + escHtml(name) + '</h3><div class="sub">' +
-        escHtml([c.company, c.prospect_email].filter(Boolean).join(' · ')) + ' · ' + relTime(c.updated_at) + '</div></div>' +
-      '<div class="tags">' + (c.intent ? badge(c.intent) : '') + badge(c.status) + '</div></div>' +
-      '<div class="thread">' + (threadHtml || '<p class="muted" style="font-size:13px">No messages in this thread yet.</p>') +
-      '</div></div>';
+  // Open on "Needs you" only when something needs you.
+  if (_convoFilter === 'needs' && !data.some(CONVO_FILTERS[0][2])) _convoFilter = 'open';
+  renderConversations();
+}
+
+function setConvoFilter(f) { _convoFilter = f; renderConversations(); }
+
+function renderConversations() {
+  const el = document.getElementById('conversations-list');
+  const filter = CONVO_FILTERS.find(f => f[0] === _convoFilter) || CONVO_FILTERS[3];
+  const bar = '<div class="toolbar"><div class="segmented" role="group" aria-label="Filter conversations">' +
+    CONVO_FILTERS.map(f => '<button class="' + (f[0] === filter[0] ? 'on' : '') +
+      '" onclick="setConvoFilter(\'' + f[0] + '\')">' + f[1] + ' <span class="n">' +
+      _convos.filter(f[2]).length + '</span></button>').join('') + '</div></div>';
+  const shown = _convos.filter(filter[2]);
+  if (!shown.length) {
+    el.innerHTML = bar + '<div class="card">' + emptyState(icon('check'), 'Nothing here',
+      'No conversation matches this filter.') + '</div>';
+    return;
   }
-  el.innerHTML = html;
+  el.innerHTML = bar + shown.map(convoCard).join('');
+}
+
+function convoCard(c) {
+  const items = (c.emails || []).map(e => ({ts: e.sent_at, email: e}))
+    .concat((c.thread || []).map(m => ({ts: m.timestamp, msg: m})))
+    .sort((a, b) => parseTs(a.ts) - parseTs(b.ts));
+  const first = c.first_name || 'Them';
+  const thread = items.map(it => {
+    if (it.email) {
+      return '<div class="thread-email"><div class="te-head">' + icon('campaigns') +
+        '<b>Email ' + escHtml(String(it.email.step)) + '</b><span>' + escHtml(it.email.subject) + '</span>' +
+        '<span class="te-when">' + relTime(it.email.sent_at) + '</span></div>' +
+        '<div class="te-body">' + escHtml(it.email.body) + '</div></div>';
+    }
+    const m = it.msg, sent = m.sender === 'harvey';
+    return '<div class="thread-msg ' + (sent ? 'sent' : 'received') + '"><div class="sender">' +
+      (sent ? 'Harvey' : escHtml(first)) + ' &middot; ' + relTime(m.timestamp) + '</div>' +
+      escHtml(m.content) + '</div>';
+  }).join('');
+  const draft = c.draft
+    ? '<div class="thread-draft"><div class="sender">' + icon('pen') + 'Harvey drafted a reply · waiting for you</div>' +
+      '<div class="td-body">' + escHtml(c.draft.body) + '</div>' +
+      '<button class="btn btn-primary btn-sm" onclick="goTab(\'outbox\')">Review in Outbox' + icon('arrow') + '</button></div>'
+    : '';
+  const name = [c.first_name, c.last_name].filter(Boolean).join(' ') || 'Unknown';
+  const stage = STAGE_LABELS[c.stage] ? '<span class="tag">' + STAGE_LABELS[c.stage] + '</span>' : '';
+  return '<div class="convo-card"><div class="convo-head">' +
+    '<span class="avatar">' + initials(c.first_name, c.last_name) + '</span>' +
+    '<div><h3>' + escHtml(name) + '</h3><div class="sub">' +
+      escHtml([c.company, c.prospect_email].filter(Boolean).join(' · ')) + ' · ' + relTime(c.updated_at) + '</div></div>' +
+    '<div class="tags">' + (c.intent ? badge(c.intent) : '') + stage + badge(c.status) + '</div></div>' +
+    '<div class="thread">' + (thread || '<p class="muted" style="font-size:13px">No messages in this thread yet.</p>') +
+    draft + '</div></div>';
 }
 
 async function loadActivity() {
@@ -2005,7 +2089,7 @@ async function loadActivity() {
   for (const a of data) {
     const label = dayLabel(a.created_at);
     if (label !== day) { day = label; html += '<div class="tl-day">' + escHtml(label) + '</div>'; }
-    html += '<div class="tl-item"><span class="tl-time">' + timeOfDay(a.created_at) + '</span>' +
+    html += '<div class="tl-item' + (a.agent === 'main' ? ' quiet' : '') + '"><span class="tl-time">' + timeOfDay(a.created_at) + '</span>' +
       '<span class="tl-icon">' + icon(AGENT_ICONS[a.agent] || 'activity') + '</span>' +
       '<span class="tl-text">' + actionText(a) + '</span>' +
       '<span class="tl-agent">' + escHtml(a.agent) + '</span></div>';

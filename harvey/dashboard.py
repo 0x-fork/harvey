@@ -1230,11 +1230,29 @@ async def get_conversations():
         LEFT JOIN prospects p ON c.prospect_id = p.id
         ORDER BY c.updated_at DESC LIMIT 100
     """)
+    # The stored thread holds replies and Harvey's answers; the cold emails
+    # a reply answers live in the Outbox. Attach those (sent ones only) and
+    # any answer still waiting for approval, so the page shows the exchange.
+    pids = sorted({r["prospect_id"] for r in rows if r.get("prospect_id")})
+    emails: dict[str, list] = {}
+    if pids:
+        for e in await query_db(
+                "SELECT prospect_id, step, subject, body, sent_at FROM outbox "
+                f"WHERE kind = 'sequence' AND status = 'sent' AND prospect_id IN ({_in(pids)}) "
+                "ORDER BY sent_at", tuple(pids)):
+            emails.setdefault(e.pop("prospect_id"), []).append(e)
+    cids = [r["id"] for r in rows]
+    drafts = {d.pop("conversation_id"): d for d in (await query_db(
+        "SELECT id, conversation_id, subject, body, send_at FROM outbox "
+        f"WHERE kind = 'reply' AND status = 'pending_review' AND conversation_id IN ({_in(cids)}) "
+        "ORDER BY created_at", tuple(cids)) if cids else [])}
     for row in rows:
         try:
             row["thread"] = json.loads(row.get("thread_json", "[]"))
         except (json.JSONDecodeError, TypeError):
             row["thread"] = []
+        row["emails"] = emails.get(row.get("prospect_id"), [])
+        row["draft"] = drafts.get(row["id"])
     return rows
 
 
