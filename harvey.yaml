@@ -55,7 +55,8 @@ channels:
     # New sending domain? Set start_date to the day your warmup service went
     # on: no cold email for min_days, then the cold cap climbs from
     # start_sends by daily_increase a day up to max_daily_sends. Replies are
-    # never held. Check readiness any time with `harvey warmup`.
+    # never held. Gmail/Microsoft/SMTP only (Instantly has its own warmup).
+    # Check readiness any time with `harvey warmup`.
     warmup:
       start_date: ""            # YYYY-MM-DD; blank = no ramp
       min_days: 14

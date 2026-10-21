@@ -52,15 +52,17 @@ async def _approved(state, pid, kind, step=1, campaign="c1"):
         status="approved", campaign_id=campaign if kind == "sequence" else "", step=step, kind=kind)
 
 
-def _ramped_sender(state, provider, days_in, **ramp):
+def _ramped_sender(state, provider, monkeypatch, days_in, **ramp):
     sender = make_sender(state, provider)
     start = (date.today() - timedelta(days=days_in)).isoformat()
-    sender.config.channels.email.warmup = WarmupConfig(start_date=start, **ramp)
+    # The test config is a shared class: monkeypatch restores it afterwards.
+    monkeypatch.setattr(sender.config.channels.email, "warmup",
+                        WarmupConfig(start_date=start, **ramp), raising=False)
     return sender
 
 
 @pytest.mark.asyncio
-async def test_while_warming_cold_email_waits_but_replies_go(state):
+async def test_while_warming_cold_email_waits_but_replies_go(state, monkeypatch):
     cold = await seed_prospect(state, email="jane@acme.com", status="queued")
     await _approved(state, cold, "sequence")
     warm = await seed_prospect(state, email="bob@acme.com", status="replied")
@@ -68,16 +70,13 @@ async def test_while_warming_cold_email_waits_but_replies_go(state):
         prospect_id=warm, to_email="bob@acme.com", subject="Re: hi",
         body="Sure, Tuesday works.", send_at=_now_iso(), status="approved", kind="reply")
     provider = FakeProvider()
-    try:
-        await _ramped_sender(state, provider, days_in=3, min_days=14)._drain_due()
-    finally:
-        make_sender(state, provider).config.channels.email.warmup = WarmupConfig()
+    await _ramped_sender(state, provider, monkeypatch, days_in=3, min_days=14)._drain_due()
     assert [m["to"] for m in provider.sent] == ["bob@acme.com"]
     assert len(await state.get_outbox(status="approved")) == 1  # the cold one waits
 
 
 @pytest.mark.asyncio
-async def test_after_warming_cold_email_is_capped_at_todays_ramp(state):
+async def test_after_warming_cold_email_is_capped_at_todays_ramp(state, monkeypatch):
     for n in range(4):
         pid = await seed_prospect(state, email=f"p{n}@acme.com", status="queued")
         await state.add_outbox_item(
@@ -85,17 +84,16 @@ async def test_after_warming_cold_email_is_capped_at_todays_ramp(state):
             body="A short, plain note. Question?", send_at=_now_iso(), status="approved",
             campaign_id="c1", step=1)
     provider = FakeProvider()
-    try:
-        # Day 15 of a 14-day warmup: start_sends + one day's increase = 2.
-        await _ramped_sender(state, provider, days_in=15, min_days=14, start_sends=1,
-                             daily_increase=1)._drain_due()
-    finally:
-        make_sender(state, provider).config.channels.email.warmup = WarmupConfig()
+    # Day 15 of a 14-day warmup: start_sends + one day's increase = 2.
+    await _ramped_sender(state, provider, monkeypatch, days_in=15, min_days=14,
+                         start_sends=1, daily_increase=1)._drain_due()
     assert len(provider.sent) == 2
 
 
 @pytest.mark.asyncio
-async def test_instantly_adds_no_more_leads_than_todays_ramp(state, monkeypatch):
+async def test_the_ramp_leaves_instantly_alone(state, monkeypatch):
+    # Instantly runs its own warmup and per-account limits; capping uploads
+    # here would strand the rest of a campaign's prospects.
     from harvey.agents.sender import Sender
     from harvey.config import EnvConfig
     from harvey.models.campaign import Campaign, EmailStep
@@ -112,7 +110,7 @@ async def test_instantly_adds_no_more_leads_than_todays_ramp(state, monkeypatch)
         id="c", name="Draft", instantly_campaign_id="existing", prospect_ids=ids,
         sequence=[EmailStep(step=1, subject="a note", body="Would this help?")]))
     leads = sender.instantly.add_leads.await_args.args[1]
-    assert len(leads) == 3
+    assert len(leads) == 6
 
 
 # ── The checks (DNS stubbed) ──
@@ -176,3 +174,43 @@ def test_warmup_check_reports_progress():
 ])
 def test_only_real_domain_names_are_checked(domain, ok):
     assert bool(d.DOMAIN_RE.match(domain)) is ok
+
+
+def test_an_unquoted_yaml_date_and_blank_values_load():
+    import yaml
+    email = EmailChannelConfig(**yaml.safe_load(
+        "warmup:\n  start_date: 2026-10-01\n  min_days:\n  dkim_selector:\n"))
+    assert email.warmup.start_date == "2026-10-01" and email.warmup.min_days == 14
+    assert EmailChannelConfig(**yaml.safe_load("warmup:\n")).warmup == WarmupConfig()
+
+
+def test_failed_lookups_are_flagged_unknown(monkeypatch):
+    def timeout(*a, **k):
+        raise dns.exception.Timeout()
+    monkeypatch.setattr(d.dns.resolver, "resolve", timeout)
+    assert d.check_spf("a.com").unknown and not d.check_warmup(WarmupConfig(), 30).unknown
+
+
+def test_spf_without_all_and_duplicate_dmarc(monkeypatch):
+    monkeypatch.setattr(d, "_txt", _txt({
+        "a.com": ["v=spf1 include:_spf.google.com"],
+        "_dmarc.a.com": ["v=DMARC1; p=none", "v=DMARC1; p=reject"],
+        "_dmarc.b.com": ["v=DMARC1; rua=mailto:x@b.com"],
+        "c.com": ["v=spf1 a/24 mx/24 " + " ".join(f"include:i{n}.com" for n in range(9)) + " -all"],
+    }))
+    assert d.check_spf("a.com").status == d.WARN
+    assert d.check_dmarc("a.com").status == d.FAIL
+    assert d.check_dmarc("b.com").status == d.WARN
+    assert d.check_spf("c.com").status == d.FAIL  # a/24 and mx/24 are lookups too
+
+
+def test_a_ramp_that_never_grows_says_so():
+    w = WarmupConfig(start_date="2026-10-01", min_days=0, start_sends=5, daily_increase=0)
+    assert "stays at 5/day" in d.check_warmup(w, 30, date(2026, 10, 5)).detail
+    w = WarmupConfig(start_date="2026-10-01", min_days=0, start_sends=0, daily_increase=0)
+    assert d.check_warmup(w, 30, date(2026, 10, 5)).status == d.WARN
+
+
+@pytest.mark.parametrize("domain", ["xn--mnchen-3ya.de", "shop.xn--p1ai"])
+def test_punycode_domains_are_checked(domain):
+    assert d.DOMAIN_RE.match(domain)

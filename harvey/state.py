@@ -891,7 +891,10 @@ class StateManager:
         due_before: str | None = None,
         limit: int = 200,
         exclude_kind: str | None = None,
+        skip_unready_follow_ups: bool = False,
     ) -> list[dict]:
+        """skip_unready_follow_ups: leave out sequence follow-ups whose
+        previous step hasn't gone out yet, so they can't fill the page."""
         where, params = [], []
         if status:
             where.append("status = ?")
@@ -902,7 +905,14 @@ class StateManager:
         if exclude_kind:
             where.append("(kind IS NULL OR kind != ?)")
             params.append(exclude_kind)
-        sql = "SELECT * FROM outbox"
+        if skip_unready_follow_ups:
+            where.append(
+                "NOT (o.kind = 'sequence' AND o.step > 1 AND EXISTS ("
+                "SELECT 1 FROM outbox p WHERE p.prospect_id = o.prospect_id "
+                "AND p.campaign_id = o.campaign_id AND p.kind = 'sequence' "
+                "AND p.step = o.step - 1 "
+                "AND p.status IN ('pending_review', 'approved', 'sending')))")
+        sql = "SELECT * FROM outbox o"
         if where:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY send_at ASC, created_at ASC LIMIT ?"
@@ -1105,16 +1115,39 @@ class StateManager:
             ) as cursor:
                 return (await cursor.fetchone())[0]
 
-    async def count_outbox_sent_today(self, kind: str | None = None) -> int:
-        """Emails sent today; only one kind ("sequence", "reply") if given."""
-        sql = "SELECT COUNT(*) FROM outbox WHERE status = 'sent' AND date(sent_at) = date('now')"
-        params: tuple = ()
+    async def count_outbox_sent_today(self, kind: str | None = None,
+                                      since: str | None = None) -> int:
+        """Emails sent today (the UTC day, or since `since`, a naive UTC
+        ISO time); only one kind ("sequence", "reply") if given."""
+        if since:
+            sql = "SELECT COUNT(*) FROM outbox WHERE status = 'sent' AND sent_at >= ?"
+            params: tuple = (since,)
+        else:
+            sql = ("SELECT COUNT(*) FROM outbox WHERE status = 'sent' "
+                   "AND date(sent_at) = date('now')")
+            params = ()
         if kind:
             sql += " AND kind = ?"
-            params = (kind,)
+            params += (kind,)
         async with self._connect() as db:
             async with db.execute(sql, params) as cursor:
                 return (await cursor.fetchone())[0]
+
+    async def get_step_delay_days(self, campaign_id: str, step: int) -> int | None:
+        """The campaign's planned wait before `step` (days after the step
+        before it), or None when the campaign or step isn't known."""
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT sequence_json FROM campaigns WHERE id = ?", (campaign_id or "",)
+            ) as cursor:
+                row = await cursor.fetchone()
+        try:
+            for s in json.loads((row[0] if row else None) or "[]"):
+                if isinstance(s, dict) and int(s.get("step", 0)) == int(step):
+                    return max(0, int(s.get("delay_days") or 0))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+        return None
 
     async def get_previous_step(self, item: dict) -> dict | None:
         """The email a sequence follow-up follows (same campaign and person,

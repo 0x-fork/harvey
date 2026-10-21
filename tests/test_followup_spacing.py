@@ -52,3 +52,89 @@ async def test_a_follow_up_whose_first_email_never_went_out_waits(state):
     provider = FakeProvider()
     await make_sender(state, provider)._drain_due()
     assert provider.sent == []
+
+
+async def _sequence(state, pid, step, status, send_at, campaign="c1", to="jane@acme.com"):
+    return await state.add_outbox_item(
+        prospect_id=pid, to_email=to, subject=f"s{step}", body=f"Step {step}. Question?",
+        send_at=send_at.isoformat(), status=status, campaign_id=campaign, step=step)
+
+
+async def _sent(state, item_id, at):
+    await state.update_outbox_item(item_id, status="sent", sent_at=at.isoformat())
+
+
+@pytest.mark.asyncio
+async def test_a_follow_up_goes_once_its_gap_has_passed(state):
+    pid = await seed_prospect(state, status="contacted")
+    one = await _sequence(state, pid, 1, "approved", _now() - timedelta(days=5))
+    await _sent(state, one, _now() - timedelta(days=4))
+    await _sequence(state, pid, 2, "approved", _now() - timedelta(days=2))
+    provider = FakeProvider()
+    await make_sender(state, provider)._drain_due()
+    assert [m["subject"] for m in provider.sent] == ["s2"]
+
+
+@pytest.mark.asyncio
+async def test_a_waiting_follow_up_is_rescheduled_for_when_it_can_go(state):
+    pid = await seed_prospect(state, status="contacted")
+    one = await _sequence(state, pid, 1, "approved", _now() - timedelta(days=7))
+    await _sent(state, one, _now() - timedelta(hours=1))
+    two = await _sequence(state, pid, 2, "approved", _now() - timedelta(days=4))
+    await make_sender(state, FakeProvider())._drain_due()
+    send_at = datetime.fromisoformat((await state.get_outbox_item(two))["send_at"])
+    assert send_at > _now() + timedelta(hours=20)  # out of the due queue until then
+
+
+@pytest.mark.asyncio
+async def test_the_campaign_delay_sets_the_gap_not_a_late_staging_time(state):
+    # Step 2 was staged late (sending was paused), so its planned time is far
+    # after step 1's: the campaign's 3 days still decide when it may go.
+    pid = await seed_prospect(state, status="contacted")
+    await seed_campaign(state, [pid])  # step 2 delay_days=3
+    campaign = (await state.get_campaigns_by_status("draft"))[0]
+    one = await _sequence(state, pid, 1, "approved", _now() - timedelta(days=20), campaign=campaign.id)
+    await _sent(state, one, _now() - timedelta(days=4))
+    await _sequence(state, pid, 2, "approved", _now() - timedelta(minutes=5), campaign=campaign.id)
+    provider = FakeProvider()
+    await make_sender(state, provider)._drain_due()
+    assert [m["subject"] for m in provider.sent] == ["s2"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prev_status", ["rejected", "failed", "cancelled"])
+async def test_a_follow_up_to_an_email_that_never_went_out_is_cancelled(state, prev_status):
+    pid = await seed_prospect(state, status="contacted")
+    await _sequence(state, pid, 1, prev_status, _now() - timedelta(days=5))
+    two = await _sequence(state, pid, 2, "approved", _now() - timedelta(days=1))
+    provider = FakeProvider()
+    await make_sender(state, provider)._drain_due()
+    assert provider.sent == []
+    item = await state.get_outbox_item(two)
+    assert item["status"] == "cancelled" and "wasn't sent" in item["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first", ["just sent", "still pending"])
+async def test_a_page_of_waiting_follow_ups_never_holds_up_a_reply_or_new_email(state, first):
+    # 30 follow-ups older than everything else, all waiting on their step 1.
+    for n in range(30):
+        pid = await seed_prospect(state, email=f"p{n}@acme.com", status="contacted")
+        one = await _sequence(state, pid, 1,
+                              "approved" if first == "just sent" else "pending_review",
+                              _now() - timedelta(days=9), to=f"p{n}@acme.com")
+        if first == "just sent":
+            await _sent(state, one, _now() - timedelta(hours=1))
+        await _sequence(state, pid, 2, "approved", _now() - timedelta(days=6), to=f"p{n}@acme.com")
+    warm = await seed_prospect(state, email="bob@beta.com", status="replied")
+    await state.add_outbox_item(
+        prospect_id=warm, to_email="bob@beta.com", subject="Re: hi", body="Tuesday works.",
+        send_at=_now().isoformat(), status="approved", kind="reply")
+    fresh = await seed_prospect(state, email="ann@gamma.com", status="queued")
+    await _sequence(state, fresh, 1, "approved", _now() - timedelta(minutes=1),
+                    campaign="c2", to="ann@gamma.com")
+
+    provider = FakeProvider()
+    for _ in range(2):  # the first cycle may reschedule; nothing waits twice
+        await make_sender(state, provider)._drain_due()
+    assert {m["to"] for m in provider.sent} == {"bob@beta.com", "ann@gamma.com"}

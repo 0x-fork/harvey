@@ -101,7 +101,7 @@ class Sender:
             return
 
         # Enforce daily send limit
-        max_sends = cold_daily_cap(self.config.channels.email)
+        max_sends = self.config.channels.email.max_daily_sends
         sends_today = await self._count_sends_today()
         remaining = max_sends - sends_today
         if remaining <= 0:
@@ -258,7 +258,7 @@ class Sender:
             return
 
         # Check remaining daily send budget
-        max_sends = cold_daily_cap(self.config.channels.email)
+        max_sends = self.config.channels.email.max_daily_sends
         sends_today = await self._count_sends_today()
         remaining = max_sends - sends_today
         if remaining <= 0:
@@ -493,14 +493,21 @@ class Sender:
                 return datetime.fromisoformat(str(value))
             except (TypeError, ValueError):
                 return None
-        planned, prev_planned, sent_at = _at(item["send_at"]), _at(prev["send_at"]), _at(prev["sent_at"])
-        gap = MIN_FOLLOW_UP_GAP
-        if planned and prev_planned:
-            gap = max(gap, planned - prev_planned)
+        sent_at = _at(prev["sent_at"])
         if sent_at is None:
             return None
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
-        return "wait" if now < sent_at + gap else None
+        delay = await self.state.get_step_delay_days(item.get("campaign_id"), item["step"])
+        if delay is None:  # campaign unknown: fall back to the planned spacing
+            planned, prev_planned = _at(item["send_at"]), _at(prev["send_at"])
+            gap = (planned - prev_planned) if planned and prev_planned else MIN_FOLLOW_UP_GAP
+        else:
+            gap = timedelta(days=delay)
+        ready_at = sent_at + max(MIN_FOLLOW_UP_GAP, gap)
+        if datetime.now(timezone.utc).replace(tzinfo=None) >= ready_at:
+            return None
+        # Reschedule it for then, so it leaves the due queue until it's ready.
+        await self.state.update_outbox_item(item["id"], send_at=ready_at.isoformat())
+        return "wait"
 
     async def _blocked(self, item: dict, prospect, allow_risky: bool) -> tuple[str, str] | None:
         """Why this email must not go out, as (status, error), or None."""
@@ -546,29 +553,34 @@ class Sender:
             logger.info(f"Sender: daily send cap reached ({sent_today}/{max_daily}).")
             return
         # Cold email has its own cap under the warmup ramp; replies don't.
+        # Counted from local midnight, the day the ramp counts in.
         cold_cap = cold_daily_cap(self.config.channels.email)
-        cold_left = cold_cap - await self.state.count_outbox_sent_today(kind="sequence")
+        midnight = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+        cold_left = cold_cap - await self.state.count_outbox_sent_today(
+            kind="sequence",
+            since=midnight.astimezone(timezone.utc).replace(tzinfo=None).isoformat())
 
         now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         due = await self.state.get_outbox(
-            status="approved", due_before=now, limit=budget * 3
+            status="approved", due_before=now, limit=budget * 3,
+            skip_unready_follow_ups=True,
         )
-        if self.precleared is not None or cold_left <= 0:
-            # Cold emails held (by an unavailable compliance check, or the
-            # cold cap) stay approved at the front of the queue and could
-            # fill the page above, so fetch replies (and any other kind) on
-            # their own too. Bounded: one extra query of the same size.
-            seen = {item["id"] for item in due}
-            unchecked = await self.state.get_outbox(
-                status="approved", due_before=now, limit=budget * 3,
-                exclude_kind="sequence",
+        # Cold emails held (by an unavailable compliance check, the cold
+        # cap, a follow-up's spacing) stay approved and could fill the
+        # page above, so replies (and any other kind) are fetched on
+        # their own too and never wait behind them. Bounded: one extra
+        # query of the same size.
+        seen = {item["id"] for item in due}
+        unchecked = await self.state.get_outbox(
+            status="approved", due_before=now, limit=budget * 3,
+            exclude_kind="sequence",
+        )
+        extra = [item for item in unchecked if item["id"] not in seen]
+        if extra:
+            due = sorted(
+                due + extra,
+                key=lambda i: (i.get("send_at") or "", i.get("created_at") or ""),
             )
-            extra = [item for item in unchecked if item["id"] not in seen]
-            if extra:
-                due = sorted(
-                    due + extra,
-                    key=lambda i: (i.get("send_at") or "", i.get("created_at") or ""),
-                )
         if not due:
             return
 

@@ -18,9 +18,9 @@ minor versions can still change behaviour.
 - **A cold-email ramp for new domains** (`channels.email.warmup`). From
   `start_date`, no cold email goes out for `min_days`; then the cold cap starts
   at `start_sends` and climbs by `daily_increase` a day up to
-  `max_daily_sends`. It applies to native providers and Instantly lead
-  uploads. Replies are never held. Off unless `start_date` is set. Both
-  based on #18 by Tariz Shahid.
+  `max_daily_sends`, counted per local day. Gmail, Microsoft and SMTP only:
+  Instantly has its own warmup and per-account limits. Replies are never
+  held. Off unless `start_date` is set. Both based on #18 by Tariz Shahid.
 - **A postal address and opt-out line under every cold email** (CAN-SPAM).
   Set `compliance.postal_address` in `harvey.yaml`; `compliance.opt_out_line`
   defaults to *Not interested? Reply "no thanks" and I won't email again.*

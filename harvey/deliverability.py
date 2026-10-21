@@ -56,9 +56,11 @@ class Check:
     name: str
     status: str
     detail: str
+    unknown: bool = False  # the lookup itself failed: no verdict either way
 
 
-DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+DOMAIN_RE = re.compile(
+    r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63}|xn--[a-z0-9-]{1,59})$")
 
 
 class LookupFailed(Exception):
@@ -84,7 +86,8 @@ def _a(name: str) -> list[str]:
 
 
 def _unknown(name: str, e: LookupFailed) -> Check:
-    return Check(name, INFO, f"Couldn't look this up ({e}). Check your connection and run again.")
+    return Check(name, INFO, f"Couldn't look this up ({e}). Check your connection and run again.",
+                 unknown=True)
 
 
 def check_mx(domain: str) -> Check:
@@ -110,13 +113,15 @@ def check_spf(domain: str) -> Check:
     terms = spf.lower().split()
     if "+all" in terms or "all" in terms:
         return Check("SPF", FAIL, f"'+all' lets anyone send as you: {spf}")
-    lookups = sum(t.lstrip("+-~?").split(":")[0].split("=")[0] in
+    lookups = sum(t.lstrip("+-~?").split(":")[0].split("=")[0].split("/")[0] in
                   ("include", "a", "mx", "ptr", "exists", "redirect") for t in terms)
     if lookups > 10:
         # Top-level terms only; includes add their own lookups on top.
         return Check("SPF", FAIL, f"{lookups} DNS lookups (limit is 10) - SPF will permerror.")
     if "?all" in terms:
         return Check("SPF", WARN, f"'?all' is neutral; use '~all' or '-all': {spf}")
+    if not any(t.lstrip("+-~?") == "all" or t.startswith("redirect=") for t in terms):
+        return Check("SPF", WARN, f"No 'all' at the end, so it ends neutral; add '~all': {spf}")
     return Check("SPF", OK, spf)
 
 
@@ -128,10 +133,13 @@ def check_dmarc(domain: str) -> Check:
     if not records:
         return Check("DMARC", FAIL, "No DMARC record. Gmail and Yahoo require one for bulk senders. "
                      f"Start with TXT _dmarc.{domain} = \"v=DMARC1; p=none; rua=mailto:you@{domain}\"")
-    tags = dict(
-        part.strip().split("=", 1) for part in records[0].split(";") if "=" in part
-    )
+    if len(records) > 1:
+        return Check("DMARC", FAIL, f"{len(records)} DMARC records - receivers ignore them all. Keep one.")
+    tags = {k.strip().lower(): v for k, v in (
+        part.strip().split("=", 1) for part in records[0].split(";") if "=" in part)}
     policy = tags.get("p", "").strip().lower()
+    if not policy:
+        return Check("DMARC", WARN, f"No p= policy tag - add p=none to start: {records[0]}")
     if policy == "none":
         return Check("DMARC", WARN, f"p=none (monitoring only) - fine while warming; "
                      f"move to quarantine once reports look clean. {records[0]}")
@@ -219,8 +227,16 @@ def check_warmup(warmup, ceiling: int, today: date | None = None) -> Check:
         return Check("Warmup", FAIL, f"Day {days} of {warmup.min_days} - warming only, no cold email "
                      f"until {warmup.min_days - days} more day(s) pass.")
     cap = warmup.daily_cap(ceiling, today)
-    full_on = warmup.min_days + max(0, -(-(ceiling - warmup.start_sends) // max(warmup.daily_increase, 1)))
-    ramp = "full volume" if cap >= ceiling else f"reaches {ceiling}/day on day {full_on}"
+    if cap <= 0:
+        return Check("Warmup", WARN, "Today's cold cap is 0 and won't grow: raise start_sends "
+                     "or daily_increase.")
+    if cap >= ceiling:
+        ramp = "full volume"
+    elif warmup.daily_increase <= 0:
+        ramp = f"stays at {cap}/day (daily_increase is 0)"
+    else:
+        full_on = warmup.min_days + -(-(ceiling - warmup.start_sends) // warmup.daily_increase)
+        ramp = f"reaches {ceiling}/day on day {full_on}"
     return Check("Warmup", OK, f"Day {days}: today's cap is {cap}/day ({ramp}). "
                  "Keep the warmup service running alongside Harvey.")
 

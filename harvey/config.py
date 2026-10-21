@@ -88,7 +88,15 @@ class WarmupConfig(BaseModel):
     @field_validator("start_date", "dkim_selector", mode="before")
     @classmethod
     def _blank_is_empty(cls, v):
+        # YAML reads an unquoted 2026-10-01 as a date.
+        if isinstance(v, _date):
+            return v.isoformat()
         return "" if v is None else v
+
+    @field_validator("min_days", "start_sends", "daily_increase", mode="before")
+    @classmethod
+    def _blank_is_default(cls, v, info):
+        return cls.model_fields[info.field_name].default if v is None else v
 
     @field_validator("start_date")
     @classmethod
@@ -142,8 +150,14 @@ class EmailChannelConfig(BaseModel):
     # Kill switch: pause all sending when bounces exceed this fraction of
     # sent mail (measured over the trailing sends). 0 disables the switch.
     max_bounce_rate: float = 0.05
-    # New domain? Ramp cold email up slowly (see WarmupConfig).
+    # New domain? Ramp cold email up slowly (see WarmupConfig). Native
+    # providers only: Instantly has its own warmup and per-account limits.
     warmup: WarmupConfig = WarmupConfig()
+
+    @field_validator("warmup", mode="before")
+    @classmethod
+    def _blank_warmup(cls, v):
+        return WarmupConfig() if v is None else v
 
     @field_validator("max_daily_sends")
     @classmethod

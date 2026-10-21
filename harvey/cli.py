@@ -710,8 +710,8 @@ def cmd_warmup(args):
         print(f"\n  {e}\n")
         raise SystemExit(1)
     email = config.channels.email
-    sender = (os.getenv("SMTP_USERNAME", "").strip() if email.provider == "smtp" else "") \
-        or config.persona.email
+    smtp_user = os.getenv("SMTP_USERNAME", "").strip() if email.provider == "smtp" else ""
+    sender = smtp_user if "@" in smtp_user else config.persona.email
     domain = (args.domain or sender.rpartition("@")[2]).strip().lower().rstrip(".")
     if not d.DOMAIN_RE.match(domain):
         print("\n  No valid sending domain found. Pass one: harvey warmup yourdomain.com\n")
@@ -736,17 +736,20 @@ def cmd_warmup(args):
                               d.check_send_history(*asyncio.run(_history()))]),
     ]
     icons = {d.OK: "OK  ", d.WARN: "WARN", d.FAIL: "FAIL", d.INFO: "info"}
-    failed = warned = 0
+    failed = warned = unknown = 0
     for title, checks in sections:
         print(f"\n  {title}")
         for c in checks:
             failed += c.status == d.FAIL
             warned += c.status == d.WARN
+            unknown += c.unknown and title == "Authentication"
             print(f"    [{icons[c.status]}] {c.name:<26} {c.detail}")
 
     print("\n  " + "=" * 56)
     if failed:
         print(f"  NOT READY - fix the {failed} FAIL item(s) before any cold email.")
+    elif unknown:
+        print(f"  NOT CHECKED - {unknown} authentication lookup(s) failed; run again.")
     elif warned:
         print(f"  READY WITH CAVEATS - {warned} warning(s); keep volume low.")
     else:
@@ -757,7 +760,7 @@ def cmd_warmup(args):
     print("    - Inbox placement: send one email to a seed test (mail-tester.com is free)")
     print("      and aim for 9/10+. Your warmup service's dashboard shows its inbox rate;")
     print("      wait for ~95%+ inbox for a week before relying on cold sends.\n")
-    if failed:
+    if failed or unknown:
         raise SystemExit(1)
 
 
