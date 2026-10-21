@@ -34,6 +34,15 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Send by hand from the dashboard, and a live status panel.** With no
+  mailbox connected (or email turned off), each campaign's first email has an
+  **Open in Gmail** button that fills in a compose window in the account
+  Harvey sends as, and a **Mark as sent** box. Harvey never sends to someone
+  marked sent by hand, even if a mailbox is connected later, and only offers
+  it for people it could still email (not opted out, replied, bounced, or
+  already queued by Harvey). The Today tab gains a panel showing each pipeline
+  step, what's running, and what to do next.
+
 - **Outbox review: see what a draft is based on, and edit it.** Each pending
   draft now shows its campaign, the company (name, clickable website,
   description), the contact and how they were found, email status and score,

@@ -26,6 +26,9 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(dash, "PID_FILE", tmp_path / "data" / "harvey.pid")
     monkeypatch.setattr(dash, "LOG_FILE", tmp_path / "data" / "harvey.log")
     dash.token_store.configure(tmp_path / "data" / "dashboard-token")
+    # No mailbox connected: the user sends by hand. Tests that need Harvey
+    # to be able to send set this back.
+    monkeypatch.setattr(dash, "_harvey_can_send", lambda: False)
     asyncio.run(StateManager(db_path=str(db)).init_db())
     return {"db": db, "token": dash.token_store.get()}
 
@@ -160,18 +163,111 @@ def test_unticking_someone_sent_through_instantly_is_refused(client, env):
     assert _status(env, "prospects", "p1") == "contacted"
 
 
-def test_recipients_say_when_harvey_is_sending_to_them(client, env):
+def test_recipients_say_who_can_be_sent_by_hand(client, env):
     _prospect(env, "p1", "a@acme.test", status="queued")
-    _prospect(env, "p2", "b@acme.test", status="queued")
-    _campaign(env, "c1", ["p1", "p2"])
-    _outbox(env, "o1", "p1", "pending_review")
+    _prospect(env, "p2", "b@acme.test", status="queued")              # Harvey queued mail
+    _prospect(env, "p3", "c@acme.test", status="opted_out")           # asked to be removed
+    _prospect(env, "p4", "d@acme.test", email_status="guess")         # undeliverable
+    _prospect(env, "p5", "e@acme.test", email_status="invalid")
+    _prospect(env, "p6", "f@acme.test", email_status="risky")         # catch-all: allowed
+    _campaign(env, "c1", ["p1", "p2", "p3", "p4", "p5", "p6"])
+    _outbox(env, "o1", "p2", "pending_review")
     recips = {r["id"]: r for r in client.get("/api/campaigns").json()[0]["recipients"]}
-    assert recips["p1"]["harvey_sending"] is True
-    assert recips["p2"]["harvey_sending"] is False
+    assert {k for k, r in recips.items() if r["can_send_by_hand"]} == {"p1", "p6"}
 
 
-@pytest.mark.parametrize("payload", [[], "x"])
+def test_nothing_is_sent_by_hand_while_harvey_can_send(client, env, monkeypatch):
+    monkeypatch.setattr(dash, "_harvey_can_send", lambda: True)
+    _prospect(env, "p1", "a@acme.test", status="queued")
+    _campaign(env, "c1", ["p1"])
+    assert client.get("/api/campaigns").json()[0]["recipients"][0]["can_send_by_hand"] is False
+    assert client.post("/api/prospects/p1/sent", json={"sent": True}).status_code == 409
+    assert _status(env, "prospects", "p1") == "queued"
+
+
+def test_a_hand_sent_prospect_is_marked_for_the_sender(client, env):
+    _prospect(env, "p1", "a@acme.test", status="queued")
+    _campaign(env, "c1", ["p1"])
+    client.post("/api/prospects/p1/sent", json={"sent": True})
+    r = client.get("/api/campaigns").json()[0]["recipients"][0]
+    assert r["sent_by_hand"] is True and r["can_send_by_hand"] is False
+    with sqlite3.connect(env["db"]) as db:
+        assert db.execute("SELECT value FROM settings WHERE key = 'manual_send:p1'").fetchone()[0] == "queued"
+    client.post("/api/prospects/p1/sent", json={"sent": False})
+    with sqlite3.connect(env["db"]) as db:
+        assert db.execute("SELECT 1 FROM settings WHERE key = 'manual_send:p1'").fetchone() is None
+
+
+def test_ticking_someone_harvey_emailed_changes_nothing(client, env):
+    _prospect(env, "p1", "a@acme.test", status="contacted")
+    _outbox(env, "o1", "p1", "sent", step=1)
+    _outbox(env, "o2", "p1", "approved", step=2)   # Harvey's follow-up
+    client.post("/api/prospects/p1/sent", json={"sent": True})
+    assert _status(env, "outbox", "o2") == "approved"
+
+
+def test_undo_after_a_reply_keeps_the_reply(client, env):
+    _prospect(env, "p1", "a@acme.test", status="queued")
+    client.post("/api/prospects/p1/sent", json={"sent": True})
+    _sql(env, "UPDATE prospects SET status = 'replied'")
+    client.post("/api/prospects/p1/sent", json={"sent": False})
+    assert _status(env, "prospects", "p1") == "replied"
+
+
+@pytest.mark.parametrize("payload", [[], "x", {"sent": "false"}])
 def test_a_body_that_is_not_an_object_is_refused(client, env, payload):
     _prospect(env, "p1", "a@acme.test")
     assert client.post("/api/prospects/p1/sent", json=payload).status_code == 400
     assert _status(env, "prospects", "p1") == "new"
+
+
+# ── When is sending by hand offered at all? ──
+
+
+class _Email:
+    def __init__(self, enabled=True, provider="smtp"):
+        self.enabled, self.provider = enabled, provider
+
+
+class _Cfg:
+    def __init__(self, **kw):
+        self.channels = type("C", (), {"email": _Email(**kw)})()
+
+
+class _Env:
+    def __init__(self, instantly=""):
+        self.instantly_api_key = instantly
+
+
+class _Provider:
+    def __init__(self, ok):
+        self.ok = ok
+
+    def is_configured(self):
+        return self.ok
+
+
+@pytest.mark.parametrize("cfg, env, provider_ok, expected", [
+    (_Cfg(enabled=False), _Env(), True, False),                 # email off: hand sends only
+    (_Cfg(provider="smtp"), _Env(), False, False),              # mailbox not connected
+    (_Cfg(provider="gmail"), _Env(), True, True),               # connected: Harvey sends
+    (_Cfg(provider="instantly"), _Env(instantly="k"), True, True),
+    (_Cfg(provider="instantly"), _Env(), True, False),
+])
+def test_harvey_can_send(monkeypatch, cfg, env, provider_ok, expected):
+    import harvey.config
+    import harvey.integrations.mail_provider as mp
+    monkeypatch.setattr(harvey.config, "load_config", lambda: cfg)
+    monkeypatch.setattr(harvey.config, "load_env", lambda: env)
+    monkeypatch.setattr(mp, "get_mail_provider", lambda c, e: _Provider(provider_ok))
+    # These tests don't use the env fixture, so this is the real check.
+    assert dash._harvey_can_send() is expected
+
+
+def test_an_unreadable_config_means_harvey_might_send(monkeypatch):
+    import harvey.config
+
+    def boom():
+        raise ValueError("bad yaml")
+    monkeypatch.setattr(harvey.config, "load_config", boom)
+    assert dash._harvey_can_send() is True

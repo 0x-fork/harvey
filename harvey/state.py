@@ -32,6 +32,10 @@ BUSY_TIMEOUT_SECONDS = 30.0
 # Email statuses the Writer drafts for. Shared with the heartbeat so it only
 # chooses write_campaign when there is something the Writer will act on.
 WRITABLE_EMAIL_STATUSES = ("verified", "risky")
+# Settings key, per prospect: the user emailed them by hand from the
+# dashboard. Its value is the status they had before, so undo is exact; its
+# presence tells the Sender never to email them as well.
+MANUAL_SEND_KEY = "manual_send:"
 
 
 def _new_id() -> str:
@@ -730,6 +734,21 @@ class StateManager:
             )
             await db.commit()
 
+    async def queue_prospect_if_unsent(self, prospect_id: str) -> bool:
+        """Mark a prospect 'queued' unless something moved them on meanwhile.
+
+        Conditional, so a status set while a campaign was being staged (the
+        user marking them sent by hand, a reply) is never overwritten.
+        """
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE prospects SET status = 'queued', updated_at = ? "
+                "WHERE id = ? AND status IN ('new', 'queued')",
+                (_utcnow().isoformat(), prospect_id),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
     async def get_prospect_by_email(self, email: str) -> Prospect | None:
         """Look up a prospect by email address (indexed, case-insensitive)."""
         email = _norm(email)
@@ -925,16 +944,37 @@ class StateManager:
         """Undo a cancel made with `reason`: those items go back for review.
 
         Always to pending_review, even if they were approved before: a human
-        decides again. Items cancelled for any other reason stay cancelled.
+        decides again. They're rescheduled from now with their original gaps,
+        so a late undo never releases a whole sequence at once. Items
+        cancelled for any other reason stay cancelled.
         """
         async with self._connect() as db:
-            cursor = await db.execute(
-                "UPDATE outbox SET status = 'pending_review', error = '', updated_at = ? "
-                "WHERE prospect_id = ? AND status = 'cancelled' AND error = ?",
-                (_utcnow().isoformat(), prospect_id, reason),
-            )
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT id, send_at FROM outbox WHERE prospect_id = ? "
+                "AND status = 'cancelled' AND error = ? ORDER BY send_at",
+                (prospect_id, reason),
+            ) as cursor:
+                rows = [dict(r) for r in await cursor.fetchall()]
+            if not rows:
+                return 0
+            now = _utcnow()
+
+            def _at(value):
+                try:
+                    return datetime.fromisoformat(str(value))
+                except (TypeError, ValueError):
+                    return now
+            first = _at(rows[0]["send_at"])
+            for r in rows:
+                send_at = now + max(timedelta(0), _at(r["send_at"]) - first)
+                await db.execute(
+                    "UPDATE outbox SET status = 'pending_review', error = '', send_at = ?, "
+                    "updated_at = ? WHERE id = ?",
+                    (send_at.isoformat(), now.isoformat(), r["id"]),
+                )
             await db.commit()
-            return cursor.rowcount
+            return len(rows)
 
     async def approve_outbox(self, item_id: str | None = None) -> int:
         """Approve one pending item, or ALL pending when item_id is None."""

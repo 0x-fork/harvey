@@ -30,6 +30,9 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(dash, "PID_FILE", tmp_path / "data" / "harvey.pid")
     monkeypatch.setattr(dash, "LOG_FILE", tmp_path / "data" / "harvey.log")
     dash.token_store.configure(tmp_path / "data" / "dashboard-token")
+    # No mailbox connected: the user sends by hand. Tests that need Harvey
+    # to be able to send set this back.
+    monkeypatch.setattr(dash, "_harvey_can_send", lambda: False)
     async def _init():
         state = StateManager(db_path=str(db))
         await state.init_db()
@@ -150,7 +153,8 @@ def _outbox(env, oid, pid, status):
               "'2026-01-01T00:00:00', ?)", (oid, pid, status))
 
 
-def test_drafts_waiting_in_the_outbox_point_there_not_at_gmail(client, env):
+def test_drafts_waiting_in_the_outbox_point_there_not_at_gmail(client, env, monkeypatch):
+    monkeypatch.setattr(dash, "_harvey_can_send", lambda: True)
     # Harvey is sending these itself: telling the user to send them from
     # Campaigns by hand would email the same person twice.
     _prospect(env, "p1", "a@acme.test", status="queued")
@@ -161,7 +165,15 @@ def test_drafts_waiting_in_the_outbox_point_there_not_at_gmail(client, env):
 
 
 def test_approved_mail_harvey_will_send_is_not_a_job_for_the_user(client, env):
+    # Even with no mailbox connected now, mail Harvey queued is not the user's to send.
     _prospect(env, "p1", "a@acme.test", status="queued")
     _campaign(env, "c1", ["p1"])
     _outbox(env, "o1", "p1", "approved")
+    assert "Open Campaigns" not in client.get("/api/live-status").json()["next"]
+
+
+def test_opted_out_and_unreachable_people_are_never_asked_to_be_sent(client, env):
+    _prospect(env, "p1", "a@acme.test", status="opted_out")
+    _prospect(env, "p2", "b@acme.test", email_status="guess", status="queued")
+    _campaign(env, "c1", ["p1", "p2"])
     assert "Open Campaigns" not in client.get("/api/live-status").json()["next"]

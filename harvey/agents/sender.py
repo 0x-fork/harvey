@@ -22,7 +22,7 @@ from harvey.gate import pre_send_check
 from harvey.integrations.instantly import InstantlyClient
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
 from harvey.integrations.precleared import PreclearedClient
-from harvey.state import StateManager
+from harvey.state import MANUAL_SEND_KEY, StateManager
 
 logger = logging.getLogger("harvey.sender")
 
@@ -207,6 +207,8 @@ class Sender:
                     f"Sender: Skipping {email} (status '{prospect.status}' is not sendable)."
                 )
                 continue
+            if await self.state.get_setting(MANUAL_SEND_KEY + prospect.id):
+                continue  # the user emailed them by hand
             # Deliverability gate: never send to unverified/guessed addresses —
             # bounces are the fastest way to torch a sending domain.
             if (prospect.email_status or "guess") not in sendable_email:
@@ -411,7 +413,9 @@ class Sender:
                 )
                 if item_id:
                     staged += 1
-            await self.state.update_prospect_status(prospect.id, "queued")
+            # Conditional: never overwrite a status set while staging
+            # (marked sent by hand, a reply).
+            await self.state.queue_prospect_if_unsent(prospect.id)
 
         await self.state.update_campaign(campaign.id, status="active")
         if skipped:
@@ -495,6 +499,18 @@ class Sender:
                     item["id"], status="cancelled",
                     error=f"prospect status '{prospect.status}'",
                 )
+                continue
+            # The user already emailed them by hand: whatever Harvey staged
+            # (before, during or after that) would be a second email.
+            if item["kind"] == "sequence" and await self.state.get_setting(
+                    MANUAL_SEND_KEY + prospect.id):
+                await self.state.update_outbox_item(
+                    item["id"], status="cancelled", error="sent by hand")
+                continue
+            # A first email to someone already contacted is always a duplicate.
+            if item["kind"] == "sequence" and item["step"] == 1 and prospect.status == "contacted":
+                await self.state.update_outbox_item(
+                    item["id"], status="cancelled", error="already contacted")
                 continue
 
             gate = pre_send_check(

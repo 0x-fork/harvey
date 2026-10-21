@@ -343,13 +343,9 @@ async function loadLiveStatus() {
       (d.stopped || []).map(r => escHtml(jobName(r))).join(', ') +
       ' stopped before finishing.</div>'
     : '';
-  const note = d.note && d.note.value
-    ? '<div style="margin-top:8px;font-size:13px">&#128172; ' + escHtml(d.note.value) +
-      ' <span class="muted">(' + formatDate(d.note.updated_at) + ')</span></div>'
-    : '';
   el.innerHTML = '<div class="rail-block">' +
     '<div class="subhead">Status — live</div>' +
-    '<div style="font-size:13px;margin:6px 0 4px">' + runningHtml + '</div>' + stoppedHtml + note +
+    '<div style="font-size:13px;margin:6px 0 4px">' + runningHtml + '</div>' + stoppedHtml +
     '<div style="margin-top:10px">' + rows + '</div>' +
     '<div style="margin-top:10px;font-size:13px"><strong>Next:</strong> ' + escHtml(d.next || '') + '</div>' +
     '<div class="muted live-flag" style="margin-top:4px;font-size:12px">Cost so far: $' +
@@ -1592,13 +1588,18 @@ async function loadProspects() {
 
 // Opens a filled-in compose window in whatever Gmail account the browser is
 // logged into. Nothing is sent from here — the user reads it and presses Send.
+// Same values as the Sender's _render, so a hand-sent email reads the same.
 function fillMergeVars(text, r) {
+  const inbox = r.source === 'company_inbox';
   const vals = {
-    first_name: r.first_name || 'there', last_name: r.last_name || '',
+    first_name: r.first_name || (inbox ? 'there' : ''), last_name: r.last_name || '',
     company: r.company || '', title: r.title || '',
+    personalization: r.personalization_notes || '',
   };
-  return String(text || '').replace(/\{\{\s*(\w+)\s*\}\}/g,
-    (m, k) => (k.toLowerCase() in vals ? vals[k.toLowerCase()] : m));
+  return String(text || '').replace(/\{\{\s*(\w+)\s*\}\}/g, (m, k) => {
+    k = k.toLowerCase();
+    return Object.prototype.hasOwnProperty.call(vals, k) ? vals[k] : m;
+  });
 }
 
 function openInGmail(ci, si, ri) {
@@ -1606,7 +1607,10 @@ function openInGmail(ci, si, ri) {
   const step = c && (c.sequence || [])[si];
   const r = c && (c.recipients || [])[ri];
   if (!step || !r) return;
+  // authuser picks the Google account Harvey sends as, not just whichever
+  // one the browser happens to be signed into.
   const url = 'https://mail.google.com/mail/?view=cm&fs=1' +
+    (c.send_as ? '&authuser=' + encodeURIComponent(c.send_as) : '') +
     '&to=' + encodeURIComponent(r.email) +
     '&su=' + encodeURIComponent(fillMergeVars(step.subject, r)) +
     '&body=' + encodeURIComponent(fillMergeVars(step.body, r));
@@ -1654,20 +1658,26 @@ async function loadCampaigns() {
     let stepsHtml = '';
     (c.sequence || []).forEach((step, s) => {
       const sendBtns = (c.recipients || []).map((r, ri) => {
-        // Harvey is sending to them itself: a copy from Gmail would be a second email.
-        if (r.harvey_sending) {
-          return '<span class="muted" style="font-size:13px">' + escHtml(r.email) +
-            ' &middot; Harvey is sending this one (see Outbox)</span>';
+        // Only offered when Harvey can't send itself and this person can
+        // still be emailed (the server decides: can_send_by_hand).
+        if (r.sent_by_hand) {
+          const tick = '<label style="display:inline-flex;align-items:center;gap:4px;font-size:13px;cursor:pointer">' +
+            '<input type="checkbox" checked onchange="markSent(' + i + ',' + ri + ',this.checked)"> ' +
+            '&#10003; Sent by you</label>';
+          if (s === 0) return escHtml(r.email) + ' ' + tick;
+          // Follow-ups are the user's too: Harvey never emails someone they emailed.
+          return '<button class="btn btn-secondary btn-sm" onclick="openInGmail(' + i + ',' + s + ',' + ri + ')">' +
+            'Open in Gmail &rarr; ' + escHtml(r.email) + '</button>' +
+            '<span class="muted" style="font-size:12px">Harvey won\'t send follow-ups to people you emailed yourself.</span>';
         }
-        // 'queued' only means Harvey wrote a draft — it is not a send.
-        const sent = ['contacted', 'replied', 'meeting', 'closed', 'lost'].includes(r.status);
+        if (!r.can_send_by_hand || s !== 0) return '';
+        const risky = r.email_status === 'risky'
+          ? ' <span class="muted" style="font-size:12px">(catch-all address, may bounce)</span>' : '';
         return '<button class="btn btn-primary btn-sm" onclick="openInGmail(' + i + ',' + s + ',' + ri + ')">' +
-          'Open in Gmail &rarr; ' + escHtml(r.email) + '</button>' +
+          'Open in Gmail &rarr; ' + escHtml(r.email) + '</button>' + risky +
           '<label style="display:inline-flex;align-items:center;gap:4px;font-size:13px;cursor:pointer">' +
-          '<input type="checkbox"' + (sent ? ' checked' : '') +
-          ' onchange="markSent(' + i + ',' + ri + ',this.checked)"> ' +
-          (sent ? '&#10003; Sent' : 'Mark as sent') + '</label>';
-      }).join(' ');
+          '<input type="checkbox" onchange="markSent(' + i + ',' + ri + ',this.checked)"> Mark as sent</label>'
+      }).filter(Boolean).join(' ');
       stepsHtml += '<div class="email-step"><div class="step-num">Email ' + escHtml(String(step.step || '?')) +
         (step.delay_days ? ' &middot; send after ' + escHtml(String(step.delay_days)) + ' days' : '') + '</div>' +
         '<div class="subject">' + escHtml(step.subject) + '</div>' +
@@ -1743,7 +1753,7 @@ loadLiveStatus();
 // Agent status: quick poll (not while locked: it would only be refused)
 setInterval(() => { if (!_locked) loadHarveyStatus(); }, 8000);
 
-// Live status panel: the cheapest query on the page, so it refreshes fastest.
+// Live status panel: refreshed while the Today tab is open and visible.
 setInterval(() => {
   if (!document.hidden && !_locked && currentTab === 'today') loadLiveStatus();
 }, 10000);

@@ -122,7 +122,7 @@ class Writer:
 
             # Mark prospects so they aren't picked up again
             for p in prospects:
-                await self.state.update_prospect_status(p.id, "queued")
+                await self.state.queue_prospect_if_unsent(p.id)
                 await self.state.delete_setting(WRITE_ATTEMPTS_KEY + p.id)
 
             # Native providers: replace the shared template for email 1 with
