@@ -248,7 +248,7 @@ function showTab(id, btn) {
 
 function loadCurrentTab() {
   switch (currentTab) {
-    case 'today': loadToday(); loadSetupStatus(); loadRuns(); loadTodayActivity(); break;
+    case 'today': loadLiveStatus(); loadToday(); loadSetupStatus(); loadRuns(); loadTodayActivity(); break;
     case 'signals': loadSignals(); break;
     case 'discover': loadDiscoverProviders(); break;
     case 'companies': if (!companyDrill) loadCompanies(); break;
@@ -295,6 +295,66 @@ async function loadToday() {
         escHtml(it.action) + '</button>' +
     '</div>'
   ).join('') + '</div>';
+}
+
+// ── Live status: the "what's happening?" answer, kept on screen ──
+
+async function loadLiveStatus() {
+  const el = document.getElementById('live-status');
+  if (!el) return;
+  const d = await api('/api/live-status');
+  if (!d || !Array.isArray(d.steps)) {
+    // Keep the last good numbers on screen, but never let them pass for live.
+    const flag = el.querySelector('.live-flag');
+    if (flag) flag.textContent = "Can't reach Harvey right now — numbers below may be old.";
+    else el.innerHTML = '<div class="rail-block"><div class="subhead">Status — live</div>' +
+      '<p class="muted live-flag" style="font-size:13px">Can\'t reach Harvey right now. ' +
+      'Is the dashboard window still open?</p></div>';
+    return;
+  }
+  const icon = {done: '&#10003;', running: '&#9203;', partial: '&#9679;', waiting: '&#9675;'};
+  const color = {done: '#2e7d32', running: '#b26a00',
+                 partial: 'var(--text-2, #666)', waiting: 'var(--text-3, #999)'};
+  const rows = d.steps.map(s => {
+    const st = icon[s.state] ? s.state : 'waiting';
+    const pct = s.total ? Math.min(100, Math.round(100 * s.done / s.total)) : 0;
+    const bar = s.total
+      ? '<div style="height:5px;background:var(--border, #e5e5e5);border-radius:3px;margin-top:5px">' +
+        '<div style="height:5px;width:' + pct + '%;background:' + color[st] +
+        ';border-radius:3px;transition:width .4s"></div></div>'
+      : '';
+    return '<div style="display:flex;gap:10px;padding:8px 0;border-bottom:1px solid var(--border, #eee)">' +
+      '<span style="width:20px;text-align:center;color:' + color[st] + '">' + icon[st] + '</span>' +
+      '<div style="flex:1;min-width:0"><div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap">' +
+      '<strong style="font-size:13.5px">' + escHtml(s.label) + '</strong>' +
+      '<span class="muted" style="font-size:12.5px">' + escHtml(s.detail) + '</span></div>' + bar +
+      '</div></div>';
+  }).join('');
+  const jobName = r => r.stage === 'profile' ? 'Reading websites'
+    : r.stage === 'discover' ? 'Searching for businesses (' + (r.provider || '') + ')'
+    : String(r.stage || 'Job');
+  const running = d.running || [];
+  const runningHtml = running.length
+    ? running.map(r => '&#9203; ' + escHtml(jobName(r)) + ' · running ' + r.elapsed_min + ' min' +
+        (r.eta_text ? ' · ' + escHtml(r.eta_text) : '')).join('<br>')
+    : 'Nothing running right now.';
+  const stoppedHtml = (d.stopped || []).length
+    ? '<div style="margin-top:6px;font-size:13px;color:#b3261e">&#9888; ' +
+      (d.stopped || []).map(r => escHtml(jobName(r))).join(', ') +
+      ' stopped before finishing.</div>'
+    : '';
+  const note = d.note && d.note.value
+    ? '<div style="margin-top:8px;font-size:13px">&#128172; ' + escHtml(d.note.value) +
+      ' <span class="muted">(' + formatDate(d.note.updated_at) + ')</span></div>'
+    : '';
+  el.innerHTML = '<div class="rail-block">' +
+    '<div class="subhead">Status — live</div>' +
+    '<div style="font-size:13px;margin:6px 0 4px">' + runningHtml + '</div>' + stoppedHtml + note +
+    '<div style="margin-top:10px">' + rows + '</div>' +
+    '<div style="margin-top:10px;font-size:13px"><strong>Next:</strong> ' + escHtml(d.next || '') + '</div>' +
+    '<div class="muted live-flag" style="margin-top:4px;font-size:12px">Cost so far: $' +
+    Number(d.cost_usd || 0).toFixed(2) + ' · updated ' + new Date().toLocaleTimeString() +
+    ' · refreshes every 10 seconds</div></div>';
 }
 
 function renderFigures(stats) {
@@ -1530,6 +1590,50 @@ async function loadProspects() {
   el.innerHTML = html + '</tbody></table></div>';
 }
 
+// Opens a filled-in compose window in whatever Gmail account the browser is
+// logged into. Nothing is sent from here — the user reads it and presses Send.
+function fillMergeVars(text, r) {
+  const vals = {
+    first_name: r.first_name || 'there', last_name: r.last_name || '',
+    company: r.company || '', title: r.title || '',
+  };
+  return String(text || '').replace(/\{\{\s*(\w+)\s*\}\}/g,
+    (m, k) => (k.toLowerCase() in vals ? vals[k.toLowerCase()] : m));
+}
+
+function openInGmail(ci, si, ri) {
+  const c = _campaigns[ci];
+  const step = c && (c.sequence || [])[si];
+  const r = c && (c.recipients || [])[ri];
+  if (!step || !r) return;
+  const url = 'https://mail.google.com/mail/?view=cm&fs=1' +
+    '&to=' + encodeURIComponent(r.email) +
+    '&su=' + encodeURIComponent(fillMergeVars(step.subject, r)) +
+    '&body=' + encodeURIComponent(fillMergeVars(step.body, r));
+  const left = /\{\{\s*\w+\s*\}\}/.test(fillMergeVars(step.subject, r) + fillMergeVars(step.body, r));
+  // No 'noopener' feature string: with it window.open always returns null,
+  // so a blocked pop-up could not be told apart from a successful one.
+  const w = window.open(url, '_blank');
+  if (!w) {
+    showToast('Your browser blocked the Gmail tab. Allow pop-ups for this page and click again.', 'error');
+    return;
+  }
+  w.opener = null;
+  if (left) showToast('This draft still has a {{placeholder}} in it. Fix it in Gmail before sending.', 'error');
+}
+
+async function markSent(ci, ri, sent) {
+  const r = (_campaigns[ci] && _campaigns[ci].recipients || [])[ri];
+  if (!r) return;
+  const res = await api('/api/prospects/' + encodeURIComponent(r.id) + '/sent', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({sent}),
+  });
+  if (!res || !res.success) showToast('Could not save that. Try again.', 'error');
+  else if (!sent && res.sent) showToast('They already replied, so this stays marked as sent.');
+  loadCampaigns();
+}
+
 async function loadCampaigns() {
   const el = document.getElementById('campaigns-list');
   const data = await api('/api/campaigns');
@@ -1543,12 +1647,24 @@ async function loadCampaigns() {
   let html = '';
   data.forEach((c, i) => {
     let stepsHtml = '';
-    for (const step of (c.sequence || [])) {
+    (c.sequence || []).forEach((step, s) => {
+      const sendBtns = (c.recipients || []).map((r, ri) => {
+        // 'queued' only means Harvey wrote a draft — it is not a send.
+        const sent = ['contacted', 'replied', 'meeting', 'closed', 'lost'].includes(r.status);
+        return '<button class="btn btn-primary btn-sm" onclick="openInGmail(' + i + ',' + s + ',' + ri + ')">' +
+          'Open in Gmail &rarr; ' + escHtml(r.email) + '</button>' +
+          '<label style="display:inline-flex;align-items:center;gap:4px;font-size:13px;cursor:pointer">' +
+          '<input type="checkbox"' + (sent ? ' checked' : '') +
+          ' onchange="markSent(' + i + ',' + ri + ',this.checked)"> ' +
+          (sent ? '&#10003; Sent' : 'Mark as sent') + '</label>';
+      }).join(' ');
       stepsHtml += '<div class="email-step"><div class="step-num">Email ' + escHtml(String(step.step || '?')) +
         (step.delay_days ? ' &middot; send after ' + escHtml(String(step.delay_days)) + ' days' : '') + '</div>' +
         '<div class="subject">' + escHtml(step.subject) + '</div>' +
-        '<div class="body">' + escHtml(step.body) + '</div></div>';
-    }
+        '<div class="body">' + escHtml(step.body) + '</div>' +
+        (sendBtns ? '<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">' + sendBtns + '</div>' : '') +
+        '</div>';
+    });
     const pc = (c.prospect_ids || []).length;
     html += '<div class="campaign-card"><h3>' + escHtml(c.name || 'Untitled Campaign') + '</h3>' +
       '<div class="meta">' + badge(c.status) + '<span>' + escHtml(c.channel || 'email') + '</span>' +
@@ -1612,8 +1728,15 @@ loadRuns();
 loadTodayActivity();
 loadHarveyStatus();
 
+loadLiveStatus();
+
 // Agent status: quick poll (not while locked: it would only be refused)
 setInterval(() => { if (!_locked) loadHarveyStatus(); }, 8000);
+
+// Live status panel: the cheapest query on the page, so it refreshes fastest.
+setInterval(() => {
+  if (!document.hidden && !_locked && currentTab === 'today') loadLiveStatus();
+}, 10000);
 
 // Nav counts stay live wherever you are, so "something needs me" is visible
 // from any tab without polling that tab's contents.
