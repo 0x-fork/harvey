@@ -65,38 +65,82 @@ OPT_OUT_PATTERNS = (
     "delete my info",
     "delete my data",
 )
-# "No thanks" (what cold email's footer asks for) as a phrase on one line,
-# not "yes or no / Thanks," or "no Thanksgiving".
-NO_THANKS_RE = re.compile(r"\bno,?[ \t]+thank(?:s|[ \t]+you)\b")
-# A reply that says only this is an opt-out ("Reply STOP to opt out").
+# "No thanks" (what cold email's footer asks for) as a phrase: not "no
+# Thanksgiving", "Bruno / Thanks," or "yes or no, thanks".
+NO_THANKS_RE = re.compile(r"(?<!\bor )\bno,?[ \t]+thank(?:s|[ \t]+you)\b")
+# A reply that says only this (signature aside) is an opt-out ("Reply STOP").
 BARE_OPT_OUTS = {"stop", "unsubscribe", "remove", "remove me", "opt out",
                  "no thanks", "no thank you"}
-# A line at least this long that repeats what Harvey sent this person is our
-# quoted email, not their words. Shorter lines are always theirs, so a reply
-# of "No thanks" or "STOP" is never mistaken for a quote of our footer.
+_MOBILE_SIGNATURE_RE = re.compile(
+    r"^[ \t]*(?:sent from my \w[^\n]*|get outlook for \w[^\n]*|sent from \w+ mail[^\n]*)$",
+    re.IGNORECASE | re.MULTILINE)
+# A line of their reply at least this long that repeats what Harvey wrote
+# for this person is our text, not theirs. Shorter unmarked lines are always
+# theirs, so a reply of "No thanks" or "STOP" is never taken for a quote.
 OWN_TEXT_MIN_CHARS = 20
+# Outlook's plain-text quotes add "<mailto:...>" / "<https://...>" after links.
+_LINK_ANNOTATION_RE = re.compile(r"<(?:mailto:|https?://)[^>\s]*>", re.IGNORECASE)
+_MERGE_TAG_RE = re.compile(r"\{\{\s*\w+\s*\}\}")
 
 
 def _flat(text: str) -> str:
-    """Lowercase, quote markers, HTML entities, curly quotes and spacing
-    evened out, so text compares however a mail client re-quoted it."""
-    text = re.sub(r"^[ \t>]+", "", html.unescape(text or ""), flags=re.MULTILINE)
+    """Lowercase, with quote markers, HTML entities, link annotations, curly
+    quotes and spacing evened out, so text compares however a mail client
+    re-quoted it."""
+    text = _LINK_ANNOTATION_RE.sub("", html.unescape(text or ""))
+    text = re.sub(r"^[ \t>]+", "", text, flags=re.MULTILINE)
     text = (text.replace("\u201c", '"').replace("\u201d", '"')
             .replace("\u2018", "'").replace("\u2019", "'"))
     return " ".join(text.lower().split())
 
 
-def _drop_our_text(text: str, ours: str) -> str:
-    """The reply without lines that repeat what we sent (`ours`, flattened)."""
-    return "\n".join(
-        line for line in (text or "").split("\n")
-        if not (len(_flat(line)) >= OWN_TEXT_MIN_CHARS and _flat(line) in ours))
+class OurText:
+    """What Harvey wrote for one person, to tell their words from our quote."""
+
+    def __init__(self, texts):
+        self.lines = set()
+        for text in texts:
+            # Merge tags weren't filled in templates: compare the parts around them.
+            for part in _MERGE_TAG_RE.split(text or ""):
+                for line in part.split("\n"):
+                    line = _flat(line)
+                    if len(line) >= OWN_TEXT_MIN_CHARS:
+                        self.lines.add(line)
+        self.joined = "\n".join(sorted(self.lines))
+
+    def _is_ours(self, line: str) -> bool:
+        flat = _flat(line)
+        if not flat or flat not in self.joined:
+            return False
+        # A ">" line is quoted anyway; an unmarked one must be long enough
+        # that it can't be their own short "No thanks".
+        return line.lstrip().startswith(">") or len(flat) >= OWN_TEXT_MIN_CHARS
+
+    def remove(self, text: str) -> str:
+        """Their reply without our text: lines that repeat ours are dropped,
+        and any of our lines inside a longer line (an HTML reply flattened to
+        one line) is cut out of it."""
+        kept = []
+        for line in (text or "").split("\n"):
+            if self._is_ours(line):
+                continue
+            flat = _flat(line)
+            hits = [ours for ours in self.lines if ours in flat]
+            if hits:
+                for ours in sorted(hits, key=len, reverse=True):
+                    flat = flat.replace(ours, " ")
+                line = " ".join(flat.split())
+            kept.append(line)
+        return "\n".join(kept)
 
 
 def _is_opt_out(keyword_text: str, own_words: str) -> bool:
+    """keyword_text: everything they wrote, flattened (phrases can span a
+    line wrap). own_words: their reply without the quote."""
     if any(p in keyword_text for p in OPT_OUT_PATTERNS) or NO_THANKS_RE.search(keyword_text):
         return True
-    return re.sub(r"[^\w\s-]", "", _flat(own_words)).strip() in BARE_OPT_OUTS
+    bare = _flat(_MOBILE_SIGNATURE_RE.sub("", own_words or ""))
+    return re.sub(r"[^\w\s-]", "", bare).strip() in BARE_OPT_OUTS
 
 # Phrases that mean a human must take over. Never auto-reply to these.
 ESCALATION_PATTERNS = (
@@ -232,15 +276,14 @@ class Handler:
                 await self.state.mark_reply_processed(reply_uuid)
         return True
 
-    async def _our_text(self, prospect) -> str:
+    async def _our_text(self, prospect) -> OurText:
         """Everything a reply from this person might quote back from us: what
-        we actually sent them (footer included, whatever it said then) and
-        today's footer (Instantly sends aren't in the outbox)."""
+        Harvey wrote for them (footers as sent) and today's footer."""
         compliance = compliance_of(self.config)
-        sent = await self.state.get_sent_outbox_bodies(prospect.id)
-        return "\n".join(_flat(t) for t in (
-            *sent, compliance.postal_address, compliance.opt_out_line,
-            DEFAULT_OPT_OUT_LINE) if t)
+        return OurText([
+            *await self.state.get_texts_for_prospect(prospect.id),
+            compliance.postal_address, compliance.opt_out_line, DEFAULT_OPT_OUT_LINE,
+        ])
 
     async def _process_reply(
         self,
@@ -263,10 +306,9 @@ class Handler:
         # without the quoted email. Either way, a line repeating what we
         # sent (our footer says "no thanks") is ours, not theirs.
         ours = await self._our_text(prospect)
-        keyword_text = "\n".join(
-            _flat(line) for line in _drop_our_text(reply_text, ours).split("\n"))
+        keyword_text = _flat(ours.remove(reply_text))
         stripped = strip_quoted_reply(reply_text) or reply_text
-        reply_text = _drop_our_text(stripped, ours).strip() or stripped
+        reply_text = ours.remove(stripped).strip() or stripped
 
         # Update prospect status + stop-on-reply: a human answered, so every
         # queued sequence email for them is now wrong to send.

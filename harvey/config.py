@@ -208,9 +208,13 @@ class PreclearedConfig(BaseModel):
 
 
 DEFAULT_OPT_OUT_LINE = 'Not interested? Reply "no thanks" and I won\'t email again.'
-# Opt-out wording the Handler always honours; an opt_out_line must ask for one.
+# The replies the Handler always honours as an opt-out on their own; an
+# opt_out_line must ask for one of them ("Reply STOP", 'reply "no thanks"').
 OPT_OUT_WORDS = ("no thanks", "no thank you", "unsubscribe", "stop", "remove me",
-                 "opt out", "opt-out")
+                 "opt out")
+_ASKS_FOR_OPT_OUT_RE = re.compile(
+    r"\breply(?:\s+with)?\s*[\"'\u201c\u2018]?\s*(?:"
+    + "|".join(re.escape(w) for w in OPT_OUT_WORDS) + r")\b", re.IGNORECASE)
 
 
 class ComplianceConfig(BaseModel):
@@ -235,15 +239,16 @@ class ComplianceConfig(BaseModel):
         lowered = v.lower()
         if not v:
             return v
-        if "http" in lowered or "www." in lowered or "click" in lowered:
+        if any(bit in lowered for bit in ("http", "www.", "click", "@")):
             raise ValueError(
-                "opt_out_line can't contain a link: cold email allows one link, and "
-                "opting out must be as simple as replying."
+                "opt_out_line can't contain a link or an email address: cold email "
+                "allows one link, and opting out must be as simple as replying."
             )
-        if not any(word in lowered for word in OPT_OUT_WORDS):
+        if not _ASKS_FOR_OPT_OUT_RE.search(v):
             raise ValueError(
-                "opt_out_line must ask for a reply Harvey recognises as an opt-out: "
-                + ", ".join(f'"{w}"' for w in OPT_OUT_WORDS[:5]) + "."
+                "opt_out_line must ask for a reply Harvey recognises as an opt-out, "
+                'e.g. Reply "no thanks" / Reply STOP. Recognised: '
+                + ", ".join(f'"{w}"' for w in OPT_OUT_WORDS) + "."
             )
         return v
 

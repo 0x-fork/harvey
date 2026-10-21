@@ -418,3 +418,95 @@ def test_campaigns_carry_the_footer_for_sending_by_hand(client, monkeypatch, env
     _prospect(env, "p1", "a@acme.test", status="queued")
     _campaign(env, "c1", ["p1"])
     assert client.get("/api/campaigns").json()[0]["footer"] == ADDRESS + "\n" + LINE
+
+
+# ── Review round 2 ──
+
+SENT = "A short, plain note. Question?\n\n" + ADDRESS + "\n" + LINE
+
+
+@pytest.mark.asyncio
+async def test_an_html_only_reply_quoting_our_footer_is_not_an_opt_out(state):
+    # Tags become spaces: their words and our quote end up on one line.
+    body = ("Yes, interested. Tuesday works.   On Tue, Oct 14, 2026 Harvey wrote:   "
+            "A short, plain note. Question?   " + ADDRESS + "   "
+            "Not interested? Reply &quot;no thanks&quot; and I won&#39;t email again.")
+    status, prompts = await _reply_after_sending(state, body, sent_bodies=[SENT])
+    assert status != "opted_out"
+    assert prompts and all("no thanks" not in p.lower() for p in prompts)
+
+
+@pytest.mark.asyncio
+async def test_short_wrapped_fragments_of_our_quote_are_ours(state):
+    body = ("Sure, call me.\n\nOn Tue Harvey wrote:\n> A short, plain note. Question?\n"
+            "> Not interested? Reply\n> \"no thanks\"\n> and I won't email again.")
+    status, _ = await _reply_after_sending(state, body, sent_bodies=[SENT])
+    assert status != "opted_out"
+
+
+@pytest.mark.asyncio
+async def test_outlook_mailto_annotations_dont_hide_our_line(state):
+    line = "To opt out, reply STOP to this email."
+    sent = "A short, plain note. Question?\n\n" + ADDRESS + "\n" + line
+    body = ("Yes please, send pricing.\n\nFrom: Harvey <harvey@x.co<mailto:harvey@x.co>>\n"
+            "Sent: Tuesday\n\nA short, plain note. Question?\n" + ADDRESS + "\n"
+            "To opt out, reply STOP to this email<https://x.co/a>.")
+    status, _ = await _reply_after_sending(state, body, sent_bodies=[sent], line=line)
+    assert status != "opted_out"
+
+
+@pytest.mark.asyncio
+async def test_campaign_text_counts_as_ours_without_an_outbox_row(state):
+    # Instantly sends and hand sends never pass through the Outbox.
+    import json
+    import sqlite3
+    old = 'Reply "unsubscribe" to stop hearing from me.'
+    pid = await seed_prospect(state, status="contacted")
+    with sqlite3.connect(state.db_path) as db:
+        db.execute(
+            "INSERT INTO campaigns (id, name, channel, sequence_json, prospect_ids_json, status) "
+            "VALUES ('c9', 'x', 'email', ?, ?, 'active')",
+            (json.dumps([{"step": 1, "subject": "hi", "delay_days": 0,
+                          "body": "Hi {{first_name}}, we help attorney offices grow.\n\n" + old}]),
+             json.dumps([pid])))
+    provider = FakeProvider()
+    provider.inbound = [InboundMessage(
+        provider_id="in1", from_email="jane@acme.com", subject="Re: hi",
+        body="Yes let's talk.\n\nOn Tue Harvey wrote:\n> Hi Jane, we help attorney offices grow.\n> " + old)]
+    handler = make_handler(state, provider, intent="interested")
+    handler.config.compliance = ComplianceConfig(opt_out_line="Reply no thanks to stop.")
+    handler.brain = RecordingBrain("interested")
+    await handler._run_native()
+    assert (await state.get_prospect(pid)).status != "opted_out"
+    assert handler.brain.prompts  # not escalated over our own "attorney"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [
+    "Is it month to month, yes or no, thanks",
+], ids=["yes-or-no-comma"])
+async def test_a_question_ending_in_or_no_thanks_is_not_an_opt_out(state, body):
+    status, _ = await _reply(state, body)
+    assert status != "opted_out"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [
+    "STOP\n\nSent from my iPhone",
+    "Stop\n\nGet Outlook for iOS",
+    "I'd ask that you do not\ncontact me again.",
+    "Appreciate it, but we're set, so no\nthanks.",
+], ids=["stop-iphone", "stop-outlook-ios", "wrapped-do-not-contact", "wrapped-no-thanks"])
+async def test_opt_outs_with_signatures_or_wrapped_lines_are_caught(state, body):
+    status, prompts = await _reply(state, body)
+    assert status == "opted_out" and prompts == []
+
+
+def test_opt_out_line_must_ask_for_a_reply_harvey_catches():
+    import pydantic
+    for bad in ('Reply "pass" and I\'ll stop.', "To opt out email optout@acme.com"):
+        with pytest.raises(pydantic.ValidationError):
+            ComplianceConfig(opt_out_line=bad)
+    for good in (LINE, "Reply STOP to opt out.", "Not a fit? Just reply with unsubscribe.",
+                 "Reply 'remove me' and you won't hear from me again."):
+        assert ComplianceConfig(opt_out_line=good).opt_out_line == good

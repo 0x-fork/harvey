@@ -912,16 +912,34 @@ class StateManager:
             async with db.execute(sql, params) as cursor:
                 return [dict(r) for r in await cursor.fetchall()]
 
-    async def get_sent_outbox_bodies(self, prospect_id: str, limit: int = 10) -> list[str]:
-        """What Harvey actually sent this person (footer included), newest
-        first: the text a reply may quote back."""
+    async def get_texts_for_prospect(self, prospect_id: str, limit: int = 20) -> list[str]:
+        """Everything Harvey wrote for this person, which a reply may quote
+        back: their Outbox emails (a sent one with its footer, whatever it
+        said then) and the templates of campaigns they're in (Instantly and
+        hand sends never pass through the Outbox; merge tags unfilled)."""
+        texts: list[str] = []
         async with self._connect() as db:
             async with db.execute(
-                "SELECT body FROM outbox WHERE prospect_id = ? AND status = 'sent' "
-                "ORDER BY sent_at DESC LIMIT ?",
+                "SELECT body FROM outbox WHERE prospect_id = ? "
+                "ORDER BY created_at DESC LIMIT ?",
                 (prospect_id, int(limit)),
             ) as cursor:
-                return [r[0] or "" for r in await cursor.fetchall()]
+                texts += [r[0] or "" for r in await cursor.fetchall()]
+            async with db.execute(
+                "SELECT sequence_json, prospect_ids_json FROM campaigns "
+                "WHERE prospect_ids_json LIKE ? ORDER BY created_at DESC LIMIT ?",
+                ("%" + prospect_id + "%", int(limit)),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        for sequence_json, ids_json in rows:
+            try:
+                if prospect_id not in json.loads(ids_json or "[]"):
+                    continue
+                texts += [str(step.get("body") or "") for step in json.loads(sequence_json or "[]")
+                          if isinstance(step, dict)]
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                continue
+        return texts
 
     async def get_outbox_item(self, item_id: str) -> dict | None:
         async with self._connect() as db:

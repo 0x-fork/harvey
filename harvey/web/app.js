@@ -1626,7 +1626,8 @@ async function openInGmail(ci, si, ri) {
   const r = c && (c.recipients || [])[ri];
   if (!step || !r) return;
   // Cold email carries the postal address and opt-out line, sent by hand too.
-  const body = fillMergeVars(step.body, r).trimEnd() + (c.footer ? '\n\n' + c.footer : '');
+  const filled = fillMergeVars(step.body, r).trimEnd();
+  const body = filled + (c.footer && !filled.endsWith(c.footer) ? '\n\n' + c.footer : '');
   // authuser picks the Google account Harvey sends as, not just whichever
   // one the browser happens to be signed into.
   const url = 'https://mail.google.com/mail/?view=cm&fs=1' +
