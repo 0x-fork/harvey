@@ -37,6 +37,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import uuid
@@ -77,10 +78,72 @@ class ClaudeRuntimeError(Exception):
     """The Claude CLI can't be used safely until the operator acts."""
 
 
-def find_claude(env: dict | None = None) -> str | None:
-    """Full path of the ``claude`` executable on the PATH Harvey will use."""
+_PLATFORM = sys.platform
+
+
+# npm/yarn/pnpm shims name their target relative to the shim's folder
+#   "%dp0%\node_modules\@anthropic-ai\claude-code\bin\claude.exe"   %*
+# or, on another drive, by absolute path. Only claude.exe counts: older
+# shims also name node.exe.
+_SHIM_TARGET_RE = re.compile(
+    r'"(?:%~?dp0%?\\)?((?:[A-Za-z]:\\)?[^"%]*?\bclaude\.exe)"', re.IGNORECASE)
+# Before its install script runs, the package's bin/claude.exe is a small
+# text placeholder, not the real binary.
+_MIN_NATIVE_BYTES = 4096
+INSTALL_HINT = (
+    "Install Claude Code (https://code.claude.com/docs/en/setup): on Windows run "
+    "'irm https://claude.ai/install.ps1 | iex' in PowerShell or "
+    "'winget install Anthropic.ClaudeCode'; or 'npm install -g "
+    "@anthropic-ai/claude-code@latest' (without --ignore-scripts)."
+)
+
+
+def _shim_target(shim: Path) -> Path:
+    """The native exe a .cmd shim launches (read from the shim, else npm's
+    usual layout next to it)."""
+    try:
+        m = _SHIM_TARGET_RE.search(shim.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        m = None
+    if m:
+        target = m.group(1).replace("\\", "/")
+        return Path(target) if re.match(r"[A-Za-z]:/", target) else shim.parent / target
+    return shim.parent / "node_modules" / "@anthropic-ai" / "claude-code" / "bin" / "claude.exe"
+
+
+def _locate(env: dict | None) -> tuple[str | None, Path | None]:
+    """(what PATH finds, the native exe a Windows shim wraps or None)."""
     path = (env if env is not None else os.environ).get("PATH")
-    return shutil.which("claude", path=path)
+    found = shutil.which("claude", path=path)
+    if not found or _PLATFORM != "win32" or not found.lower().endswith((".cmd", ".bat")):
+        return found, None
+    return found, _shim_target(Path(found))
+
+
+def find_claude(env: dict | None = None) -> str | None:
+    """Full path of the ``claude`` executable on the PATH Harvey will use.
+
+    On Windows an npm install puts a ``claude.cmd`` shim on PATH. Running it
+    goes through cmd.exe, which re-parses every argument, and the isolation
+    flags include empty ones (``--tools ""``) whose meaning changes if one is
+    dropped. So the shim is resolved to the native ``claude.exe`` it wraps,
+    and refused if that isn't there.
+    """
+    found, native = _locate(env)
+    if native is None:
+        return found
+    try:
+        size = native.stat().st_size if native.is_file() else None
+    except OSError:
+        size = None  # removed between the checks: treated as missing
+    if size is not None and size >= _MIN_NATIVE_BYTES:
+        return str(native)
+    problem = ("is only a placeholder: the package's install script didn't run"
+               if size is not None else "isn't there")
+    raise ClaudeRuntimeError(
+        f"Found the claude.cmd shim ({found}), but the claude.exe it launches "
+        f"({native}) {problem}. Harvey never runs Claude through cmd.exe, which "
+        f"re-parses the flags that keep each call isolated. {INSTALL_HINT}")
 
 
 def runtime_env(cwd: str, base: dict | None = None) -> dict:
@@ -147,7 +210,10 @@ def _fingerprint(executable: str) -> tuple:
 
 def fingerprint(env: dict | None = None) -> tuple:
     """Changes when the installed CLI changes (used to re-check a pause)."""
-    exe = find_claude(env)
+    found, native = _locate(env)
+    # A Windows shim is tracked by the exe it wraps, so the fingerprint
+    # changes when that's installed or updated.
+    exe = str(native) if native is not None else found
     return _fingerprint(exe) if exe else ("", None, None)
 
 
@@ -178,7 +244,7 @@ def check_cli(env: dict | None = None) -> str:
     exe = find_claude(env)
     if not exe:
         raise ClaudeRuntimeError(
-            "Claude CLI not found on PATH. Install it (https://claude.com/download) "
+            "Claude CLI not found on PATH. Install it (https://code.claude.com/docs/en/setup) "
             "and run 'claude login'.")
     key = _fingerprint(exe)
     with _capable_lock:

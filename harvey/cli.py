@@ -787,6 +787,8 @@ def cmd_sending(args):
 
 
 def main():
+    from harvey.textio import utf8_stdio
+    utf8_stdio()
     from harvey.paths import PROJECT_ROOT
     project_root = str(PROJECT_ROOT)
 

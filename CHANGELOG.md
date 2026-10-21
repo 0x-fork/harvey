@@ -40,6 +40,18 @@ minor versions can still change behaviour.
   sequence within minutes, or step 2 before step 1. A follow-up whose earlier
   email was rejected or failed is cancelled instead of arriving as a first
   email.
+- **Windows:** text files (harvey.yaml, .env, prompts, skills, trained
+  output, tokens, exports) are read and written as UTF-8 instead of the
+  locale code page, so `harvey train` no longer crashes on characters like
+  "★" and prompts aren't garbled; command output is UTF-8 too, so the
+  dashboard's log of `harvey run` can't crash on "⚠". An npm install's
+  `claude.cmd` shim is resolved to the native `claude.exe` it wraps and is
+  never run through cmd.exe, which would re-parse Harvey's isolation flags;
+  if the executable is missing, Harvey says how to fix it. Files an older
+  Harvey saved in the Windows code page (trained skills, harvey.yaml) still
+  load, with a warning to re-save them as UTF-8. `harvey export` CSVs are now
+  UTF-8 on Windows too, which sequencers expect (Excel needs Data > From
+  Text/CSV to show accents). Based on #18 by Tariz Shahid.
 - Replies are read without the email they quote. The model, the stored thread
   and the answer get the reply without the quoted email, and any line that
   repeats what Harvey sent that person is set aside, so Harvey's own words
