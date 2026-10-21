@@ -90,7 +90,7 @@ def _read_env_file() -> dict[str, str]:
     """Read .env file and return as dict."""
     env_vars = {}
     if ENV_FILE.exists():
-        for line in ENV_FILE.read_text().splitlines():
+        for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 key, _, value = line.partition("=")
@@ -162,7 +162,7 @@ def _check_harvey_pid() -> int | None:
         return _harvey_process.pid
     if PID_FILE.exists():
         try:
-            pid = int(PID_FILE.read_text().strip())
+            pid = int(PID_FILE.read_text(encoding="utf-8").strip())
             os.kill(pid, 0)  # Check if process exists
             return pid
         except (ValueError, ProcessLookupError, PermissionError):
@@ -241,7 +241,7 @@ async def get_setup_status():
     config_path = _resolve_config_file()
     if config_path.exists():
         try:
-            with open(config_path) as f:
+            with open(config_path, encoding="utf-8") as f:
                 cfg = yaml.safe_load(f)
             company = cfg.get("persona", {}).get("company", "")
             product = cfg.get("product", {}).get("name", "")
@@ -301,7 +301,7 @@ async def get_setup_status():
 def _current_provider() -> str:
     """Read channels.email.provider from the active config (best-effort)."""
     try:
-        with open(_resolve_config_file()) as f:
+        with open(_resolve_config_file(), encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
         return ((cfg.get("channels") or {}).get("email") or {}).get("provider", "instantly")
     except Exception:
@@ -515,7 +515,7 @@ async def start_harvey():
     (PROJECT_ROOT / "data").mkdir(parents=True, exist_ok=True)
 
     try:
-        log_handle = open(LOG_FILE, "a")
+        log_handle = open(LOG_FILE, "a", encoding="utf-8")
         try:
             _harvey_process = subprocess.Popen(
                 [sys.executable, "-m", "harvey"],
@@ -534,7 +534,7 @@ async def start_harvey():
 
     # Write PID file
     try:
-        PID_FILE.write_text(str(_harvey_process.pid))
+        PID_FILE.write_text(str(_harvey_process.pid), encoding="utf-8")
     except OSError as e:
         logger.warning("Could not write PID file: %s", e)
 

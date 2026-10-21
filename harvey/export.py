@@ -117,7 +117,7 @@ async def export_prospects_csv(
     )
     text = to_csv(rows)
     if out_path:
-        with open(out_path, "w", newline="") as f:
+        with open(out_path, "w", newline="", encoding="utf-8") as f:
             f.write(text)
         logger.info(f"Exported {len(rows)} prospects to {out_path}")
     return len(rows), text

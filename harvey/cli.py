@@ -712,7 +712,19 @@ def cmd_sending(args):
     asyncio.run(_run())
 
 
+def _utf8_stdio(*streams):
+    """Write output as UTF-8. On Windows, output going to a file or pipe (the
+    dashboard's log of `harvey run`) uses the locale code page, where "⚠" or
+    "→" in a message would crash print()."""
+    for stream in streams or (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass  # not a reconfigurable text stream (tests, embedded use)
+
+
 def main():
+    _utf8_stdio()
     from harvey.paths import PROJECT_ROOT
     project_root = str(PROJECT_ROOT)
 

@@ -37,6 +37,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import uuid
@@ -77,10 +78,38 @@ class ClaudeRuntimeError(Exception):
     """The Claude CLI can't be used safely until the operator acts."""
 
 
-def find_claude(env: dict | None = None) -> str | None:
-    """Full path of the ``claude`` executable on the PATH Harvey will use."""
+_PLATFORM = sys.platform
+
+
+def _locate(env: dict | None) -> tuple[str | None, Path | None]:
+    """(what PATH finds, the native exe an npm shim wraps or None)."""
     path = (env if env is not None else os.environ).get("PATH")
-    return shutil.which("claude", path=path)
+    found = shutil.which("claude", path=path)
+    if not found or _PLATFORM != "win32" or not found.lower().endswith((".cmd", ".bat")):
+        return found, None
+    return found, (Path(found).parent / "node_modules" / "@anthropic-ai" / "claude-code"
+                   / "bin" / "claude.exe")
+
+
+def find_claude(env: dict | None = None) -> str | None:
+    """Full path of the ``claude`` executable on the PATH Harvey will use.
+
+    On Windows an npm install puts a ``claude.cmd`` shim on PATH. Running it
+    goes through cmd.exe, which re-parses every argument, and the isolation
+    flags include empty ones (``--tools ""``) whose meaning changes if one is
+    dropped. So the shim is resolved to the native ``claude.exe`` it wraps,
+    and refused if that isn't there.
+    """
+    found, native = _locate(env)
+    if native is None:
+        return found
+    if native.is_file():
+        return str(native)
+    raise ClaudeRuntimeError(
+        f"Found only npm's claude.cmd shim ({found}), which Harvey won't run: "
+        "cmd.exe would re-parse the flags that keep each call isolated. Install "
+        "the native Claude Code for Windows (https://claude.com/download), or "
+        "update the npm package so it includes claude.exe, then try again.")
 
 
 def runtime_env(cwd: str, base: dict | None = None) -> dict:
@@ -147,7 +176,10 @@ def _fingerprint(executable: str) -> tuple:
 
 def fingerprint(env: dict | None = None) -> tuple:
     """Changes when the installed CLI changes (used to re-check a pause)."""
-    exe = find_claude(env)
+    found, native = _locate(env)
+    # A refused npm shim is tracked by the exe it should wrap: installing it
+    # changes the fingerprint, so a pause is re-checked.
+    exe = str(native) if native is not None else found
     return _fingerprint(exe) if exe else ("", None, None)
 
 

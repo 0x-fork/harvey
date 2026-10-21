@@ -782,7 +782,7 @@ Do NOT pursue prospects who:
 """
 
         skills_path = PROJECT_ROOT / "skills" / "product_knowledge.md"
-        skills_path.write_text(knowledge)
+        skills_path.write_text(knowledge, encoding="utf-8")
         print(f"      Generated: skills/product_knowledge.md")
 
     async def _generate_battle_cards(self, product_info: dict, competitive_intel: dict):
@@ -830,7 +830,7 @@ What prospects do instead of buying a solution like ours:
 """
 
         skills_path = PROJECT_ROOT / "skills" / "competitive_intel.md"
-        skills_path.write_text(cards)
+        skills_path.write_text(cards, encoding="utf-8")
         print(f"      Generated: skills/competitive_intel.md")
 
     def _build_config(
