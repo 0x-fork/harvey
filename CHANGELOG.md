@@ -14,7 +14,7 @@ minor versions can still change behaviour.
   through its queue now stops it, instead of the Sender sending its earlier
   copy and recording it as sent. Two Harvey processes running at once can no
   longer send the same email twice. An email cut off mid-send (Harvey stopped,
-  or the provider raised an error) is marked failed and never retried, since
+  or the mail library crashed mid-call) is marked failed and never retried, since
   it may have gone out; it shows under "Didn't send" with a note to check your
   Sent folder, and the dashboard won't offer to email that person by hand.
   Rejecting an email that is already sending or sent is refused instead of

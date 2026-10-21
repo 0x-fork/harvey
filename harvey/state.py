@@ -941,15 +941,17 @@ class StateManager:
     async def claim_outbox_item(self, item_id: str) -> bool:
         """Take an approved item for sending: approved → sending, atomically.
 
-        False when it is no longer approved (cancelled by a reply, bounce or
-        hand send, rejected, or taken by another sender), so it must not go
-        out. Cancels never touch a claimed item: it is already on its way.
+        False when it is no longer approved and due (cancelled by a reply,
+        bounce or hand send, rejected, rescheduled, or taken by another
+        sender), so it must not go out now. Cancels never touch a claimed item: it is already on its way.
         """
+        now = _utcnow().isoformat()
         async with self._connect() as db:
             cursor = await db.execute(
                 "UPDATE outbox SET status = 'sending', updated_at = ? "
-                "WHERE id = ? AND status = 'approved'",
-                (_utcnow().isoformat(), item_id),
+                "WHERE id = ? AND status = 'approved' "
+                "AND (send_at IS NULL OR send_at <= ?)",
+                (now, item_id, now),
             )
             await db.commit()
             return cursor.rowcount == 1
@@ -966,7 +968,7 @@ class StateManager:
         async with self._connect() as db:
             cursor = await db.execute(
                 "UPDATE outbox SET status = 'failed', error = ?, updated_at = ? "
-                "WHERE status = 'sending' AND updated_at < ?",
+                "WHERE status = 'sending' AND datetime(updated_at) < datetime(?)",
                 (STALE_SENDING_ERROR, _utcnow().isoformat(), cutoff),
             )
             await db.commit()

@@ -247,3 +247,27 @@ async def test_reject_never_touches_mail_already_sending_or_sent(state):
     assert (await state.get_outbox_item(sending))["status"] == "sending"
     assert (await state.get_outbox_item(sent))["status"] == "sent"
     assert (await state.get_outbox_item(pending))["status"] == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_claim_refuses_an_email_not_due_yet(state):
+    # Rescheduled since the queue was read: it waits for its new time.
+    pid = await seed_prospect(state, status="contacted")
+    item_id = await _approved(state, pid)
+    later = (datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=1)).isoformat()
+    await state.update_outbox_item(item_id, send_at=later)
+    assert await state.claim_outbox_item(item_id) is False
+    assert (await state.get_outbox_item(item_id))["status"] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_claim_is_never_swept_whatever_the_timestamp_format(state):
+    pid = await seed_prospect(state, status="contacted")
+    item_id = await _approved(state, pid)
+    await state.claim_outbox_item(item_id)
+    async with state._connect() as db:  # SQLite's own format: space, not 'T'
+        await db.execute(
+            "UPDATE outbox SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (item_id,))
+        await db.commit()
+    assert await state.fail_stale_sending_outbox() == 0
+    assert (await state.get_outbox_item(item_id))["status"] == "sending"

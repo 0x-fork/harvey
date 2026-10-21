@@ -82,6 +82,7 @@ const STATUS = {
   // outbox
   pending_review: ['Waiting on you', 'waiting'],
   approved:       ['Approved', 'good'],
+  sending:        ['Sending now', 'active'],
   scheduled:      ['Scheduled', 'active'],
   sent:           ['Sent', 'good'],
   failed:         ['Failed', 'bad'],
@@ -1297,7 +1298,7 @@ async function loadOutbox() {
   list.innerHTML =
     table('Approved &amp; scheduled', data.approved, [
       ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => r.subject],
-      ['Sends', r => formatDate(r.send_at), true],
+      ['Sends', r => r.status === 'sending' ? badge(r.status) : escHtml(formatDate(r.send_at)), true, true],
     ]) +
     table('Recently sent', data.sent, [
       ['To', r => r.to_email], ['Step', r => r.step], ['Subject', r => r.subject],
