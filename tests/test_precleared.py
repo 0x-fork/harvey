@@ -76,12 +76,20 @@ def with_check(sender, transport, api_key=""):
     return sender
 
 
-async def queue(state, pid, step=1, kind="sequence", to="jane@acme.com"):
+async def queue(state, pid, step=1, kind="sequence", to="jane@acme.com", campaign="c1"):
     return await state.add_outbox_item(
         prospect_id=pid, to_email=to, subject="hello",
         body="Fine body. Question?", send_at=_now_iso(), status="approved",
-        campaign_id="c1" if kind == "sequence" else "", step=step, kind=kind,
+        campaign_id=campaign if kind == "sequence" else "", step=step, kind=kind,
     )
+
+
+async def days_pass(state, days=4):
+    """Move every sent email back in time, so a follow-up's gap has passed."""
+    async with aiosqlite.connect(state.db_path) as db:
+        await db.execute("UPDATE outbox SET sent_at = datetime(sent_at, ?) "
+                         "WHERE status = 'sent'", (f"-{days} days",))
+        await db.commit()
 
 
 async def logged_receipts(state):
@@ -292,6 +300,7 @@ async def test_one_check_per_address(state):
 
     await queue(state, pid, step=1)
     await sender._drain_due()
+    await days_pass(state)
     await queue(state, pid, step=2)
     await sender._drain_due()
 
@@ -309,7 +318,8 @@ async def test_blocked_verdict_is_remembered_for_later_steps(state):
 
     await queue(state, pid, step=1)
     await sender._drain_due()
-    await queue(state, pid, step=2)
+    # Another campaign's first email to the same address: no second check.
+    await queue(state, pid, step=1, campaign="c2")
     await sender._drain_due()
 
     assert provider.sent == []

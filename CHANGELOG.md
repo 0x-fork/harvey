@@ -9,6 +9,18 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **`harvey warmup [domain]`**: checks whether a sending domain is ready for
+  cold email. It covers MX, SPF (`+all`, duplicates, top-level lookups), DKIM,
+  DMARC, domain age, domain and SMTP-IP blocklists (a list that refuses the
+  query is reported as such, not as a listing), warmup progress and bounce
+  rate, then gives a READY / NOT READY verdict. It's read-only, and a DNS
+  timeout is reported as unknown, never as a missing record.
+- **A cold-email ramp for new domains** (`channels.email.warmup`). From
+  `start_date`, no cold email goes out for `min_days`; then the cold cap starts
+  at `start_sends` and climbs by `daily_increase` a day up to
+  `max_daily_sends`, counted per local day. Gmail, Microsoft and SMTP only:
+  Instantly has its own warmup and per-account limits. Replies are never
+  held. Off unless `start_date` is set. Both based on #18 by Tariz Shahid.
 - **A postal address and opt-out line under every cold email** (CAN-SPAM).
   Set `compliance.postal_address` in `harvey.yaml`; `compliance.opt_out_line`
   defaults to *Not interested? Reply "no thanks" and I won't email again.*
@@ -21,6 +33,13 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- A follow-up no longer goes out before, or right after, the email it
+  follows. Each step now waits until the previous one has actually been sent
+  and its gap (at least a day) has passed. Before, approving a batch of drafts
+  late, or resuming after a pause or a compliance hold, could send a whole
+  sequence within minutes, or step 2 before step 1. A follow-up whose earlier
+  email was rejected or failed is cancelled instead of arriving as a first
+  email.
 - **Windows:** text files (harvey.yaml, .env, prompts, skills, trained
   output, tokens, exports) are read and written as UTF-8 instead of the
   locale code page, so `harvey train` no longer crashes on characters like
