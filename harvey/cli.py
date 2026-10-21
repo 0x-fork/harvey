@@ -234,6 +234,14 @@ def cmd_status(args):
             print("  Sending:              HELD")
             print(textwrap.fill(notice, width=72, initial_indent="                        ",
                                 subsequent_indent="                        "))
+        from harvey.integrations.precleared import current_hold, hold_message
+        precleared_hold = await current_hold(state)
+        if precleared_hold:
+            message = hold_message(precleared_hold)
+            print(f"  Precleared:           HOLDING COLD EMAIL since {precleared_hold.get('since', '?')}")
+            print(textwrap.fill(f"{message['title']}. {message['detail']}", width=72,
+                                initial_indent="                        ",
+                                subsequent_indent="                        "))
         if address_notice:
             print("  Postal address:       MISSING")
             print(textwrap.fill(address_notice, width=72, initial_indent="                        ",
