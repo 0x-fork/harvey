@@ -189,5 +189,44 @@ def test_a_cp1252_config_loads(tmp_path):
     config = tmp_path / "harvey.yaml"
     config.write_bytes(yaml.safe_dump(data, allow_unicode=True).encode("cp1252"))
     company = load_config(str(config)).persona.company
-    # Exact under a cp1252 locale (Windows CI); readable, not a crash, elsewhere.
-    assert company.startswith("Caf") and company.endswith("Studio")
+    import locale
+    if locale.getencoding().lower() in ("cp1252", "windows-1252"):
+        assert company == "Caf\u00e9 \u2014 Studio"  # Windows CI, even in UTF-8 mode
+    else:
+        assert company.startswith("Caf") and company.endswith("Studio")  # readable, no crash
+
+
+# Shim texts as npm's cmd-shim 9 and pnpm's @zkochan/cmd-shim write them.
+SHIMS = {
+    "npm": ('@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\n'
+            'SETLOCAL\r\nCALL :find_dp0\r\n"%dp0%\\node_modules\\@anthropic-ai\\claude-code'
+            '\\bin\\claude.exe"   %*\r\n',
+            "node_modules/@anthropic-ai/claude-code/bin/claude.exe"),
+    "pnpm": ('@SETLOCAL\r\n@"%~dp0\\global\\5\\node_modules\\@anthropic-ai\\claude-code'
+             '\\bin\\claude.exe"   %*\r\n',
+             "global/5/node_modules/@anthropic-ai/claude-code/bin/claude.exe"),
+    "yarn": ('@"%~dp0\\..\\Data\\global\\node_modules\\@anthropic-ai\\claude-code\\bin'
+             '\\claude.exe"   %*\r\n',
+             "../Data/global/node_modules/@anthropic-ai/claude-code/bin/claude.exe"),
+    # An older JS-era shim also names node.exe first: never picked.
+    "node-first": ('@IF EXIST "%~dp0\\node.exe" (\r\n  "%~dp0\\node.exe"  '
+                   '"%~dp0\\node_modules\\x\\claude.exe" %*\r\n)\r\n',
+                   "node_modules/x/claude.exe"),
+}
+
+
+@pytest.mark.parametrize("kind", sorted(SHIMS))
+def test_shim_targets(kind, tmp_path):
+    text, expected = SHIMS[kind]
+    shim = tmp_path / "bin" / "claude.cmd"
+    shim.parent.mkdir()
+    shim.write_text(text, encoding="utf-8")
+    assert claude_runtime._shim_target(shim) == shim.parent / expected
+
+
+def test_a_shim_pointing_to_another_drive(tmp_path):
+    shim = tmp_path / "claude.cmd"
+    shim.write_text('@"D:\\pnpm\\global\\5\\node_modules\\@anthropic-ai\\claude-code\\bin'
+                    '\\claude.exe"   %*\r\n', encoding="utf-8")
+    assert str(claude_runtime._shim_target(shim)).replace("\\", "/") == \
+        "D:/pnpm/global/5/node_modules/@anthropic-ai/claude-code/bin/claude.exe"

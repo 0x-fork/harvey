@@ -21,7 +21,9 @@ def read_user_text(path) -> str:
     try:
         return data.decode("utf-8-sig")
     except UnicodeDecodeError:
-        encoding = locale.getpreferredencoding(False)
+        # The system code page (cp1252 on most Windows), even in Python's
+        # UTF-8 mode, where getpreferredencoding() would say utf-8.
+        encoding = locale.getencoding()
         logger.warning(
             f"{path} isn't saved as UTF-8; read it as {encoding}. Re-save it as "
             "UTF-8 to keep characters like ★ or — intact.")

@@ -81,9 +81,12 @@ class ClaudeRuntimeError(Exception):
 _PLATFORM = sys.platform
 
 
-# npm/yarn/pnpm shims name their target relative to the shim's folder:
+# npm/yarn/pnpm shims name their target relative to the shim's folder
 #   "%dp0%\node_modules\@anthropic-ai\claude-code\bin\claude.exe"   %*
-_SHIM_TARGET_RE = re.compile(r'"%~?dp0%?\\([^"%]+?\.exe)"', re.IGNORECASE)
+# or, on another drive, by absolute path. Only claude.exe counts: older
+# shims also name node.exe.
+_SHIM_TARGET_RE = re.compile(
+    r'"(?:%~?dp0%?\\)?((?:[A-Za-z]:\\)?[^"%]*?\bclaude\.exe)"', re.IGNORECASE)
 # Before its install script runs, the package's bin/claude.exe is a small
 # text placeholder, not the real binary.
 _MIN_NATIVE_BYTES = 4096
@@ -103,7 +106,8 @@ def _shim_target(shim: Path) -> Path:
     except OSError:
         m = None
     if m:
-        return shim.parent / Path(m.group(1).replace("\\", "/"))
+        target = m.group(1).replace("\\", "/")
+        return Path(target) if re.match(r"[A-Za-z]:/", target) else shim.parent / target
     return shim.parent / "node_modules" / "@anthropic-ai" / "claude-code" / "bin" / "claude.exe"
 
 
@@ -128,10 +132,14 @@ def find_claude(env: dict | None = None) -> str | None:
     found, native = _locate(env)
     if native is None:
         return found
-    if native.is_file() and native.stat().st_size >= _MIN_NATIVE_BYTES:
+    try:
+        size = native.stat().st_size if native.is_file() else None
+    except OSError:
+        size = None  # removed between the checks: treated as missing
+    if size is not None and size >= _MIN_NATIVE_BYTES:
         return str(native)
     problem = ("is only a placeholder: the package's install script didn't run"
-               if native.is_file() else "isn't there")
+               if size is not None else "isn't there")
     raise ClaudeRuntimeError(
         f"Found the claude.cmd shim ({found}), but the claude.exe it launches "
         f"({native}) {problem}. Harvey never runs Claude through cmd.exe, which "
