@@ -17,6 +17,7 @@ from harvey.state import StateManager
 logger = logging.getLogger("harvey.setup")
 
 from harvey.paths import PROJECT_ROOT
+from harvey.textio import read_user_text
 ENV_FILE = PROJECT_ROOT / ".env"
 ENV_EXAMPLE = PROJECT_ROOT / ".env.example"
 CONFIG_FILE = PROJECT_ROOT / "harvey.yaml"
@@ -596,7 +597,7 @@ class SetupWizard:
         """Write the .env file, preserving any existing variables we didn't touch."""
         existing: dict[str, str] = {}
         if ENV_FILE.exists():
-            for line in ENV_FILE.read_text().splitlines():
+            for line in read_user_text(ENV_FILE).splitlines():
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
                     key, _, value = line.partition("=")
@@ -610,7 +611,7 @@ class SetupWizard:
                 merged[key] = value
 
         lines = [f"{key}={value}" for key, value in merged.items()]
-        ENV_FILE.write_text("\n".join(lines) + "\n")
+        ENV_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
         try:
             ENV_FILE.chmod(0o600)  # credentials — owner read/write only
         except OSError:
@@ -624,14 +625,13 @@ class SetupWizard:
         if self.config:
             self.config["brain"] = brain_section(self.brain_config)
         if self.config and not CONFIG_FILE.exists():
-            with open(CONFIG_FILE, "w") as f:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 yaml.dump(self.config, f, default_flow_style=False, sort_keys=False)
             logger.info(f"Wrote {CONFIG_FILE}")
         elif self.config:
             # Config already exists (from trainer), update behavior settings only
             try:
-                with open(CONFIG_FILE) as f:
-                    existing = yaml.safe_load(f) or {}
+                existing = yaml.safe_load(read_user_text(CONFIG_FILE)) or {}
                 existing["usage"] = self.config.get("usage", existing.get("usage", {}))
                 existing["brain"] = self.config["brain"]
                 if "LINKEDIN_EMAIL" in self.env_vars:
@@ -645,7 +645,7 @@ class SetupWizard:
                         existing["channels"]["email"]["max_daily_sends"] = (
                             self.config["channels"]["email"].get("max_daily_sends", 50)
                         )
-                with open(CONFIG_FILE, "w") as f:
+                with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                     yaml.dump(existing, f, default_flow_style=False, sort_keys=False)
             except Exception:
                 pass
@@ -711,4 +711,6 @@ def main():
 
 
 if __name__ == "__main__":
+    from harvey.textio import utf8_stdio
+    utf8_stdio()
     main()

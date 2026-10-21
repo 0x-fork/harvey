@@ -7,6 +7,8 @@ from datetime import time as _time
 from pathlib import Path
 
 import yaml
+
+from harvey.textio import read_user_text
 from dotenv import load_dotenv
 from pydantic import BaseModel, ValidationError, field_validator, model_validator
 
@@ -455,8 +457,7 @@ def load_config(config_path: str | None = None) -> HarveyConfig:
         config_path = _find_config_file()
 
     try:
-        with open(config_path) as f:
-            data = yaml.safe_load(f)
+        data = yaml.safe_load(read_user_text(config_path))
     except FileNotFoundError:
         raise ConfigFileNotFoundError(
             f"Config file not found: {config_path}. "
@@ -502,8 +503,7 @@ def load_brain_config(config_path: str | None = None) -> BrainConfig:
         except ConfigFileNotFoundError:
             return BrainConfig()
     try:
-        with open(config_path) as f:
-            data = yaml.safe_load(f)
+        data = yaml.safe_load(read_user_text(config_path))
     except FileNotFoundError:
         return BrainConfig()
     except (yaml.YAMLError, OSError) as e:
