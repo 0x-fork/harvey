@@ -355,6 +355,25 @@ def test_authorised_settings_round_trip(authed):
     assert "NOT_ALLOWED" not in dash.ENV_FILE.read_text()
 
 
+def test_imap_and_microsoft_settings_round_trip(authed):
+    r = authed.post("/api/settings/env", json={
+        "IMAP_HOST": "imap.example.test", "IMAP_USERNAME": "reader@example.test",
+        "IMAP_PASSWORD": "imap-pw-9", "M365_CLIENT_ID": "client-1", "M365_TENANT_ID": "tenant-2"})
+    assert r.json()["success"]
+    data = authed.get("/api/settings").json()
+    assert data["imap_host"] == "imap.example.test" and data["imap_username"] == "reader@example.test"
+    assert data["imap_password_set"] is True and "imap-pw-9" not in json.dumps(data)
+    assert (data["m365_client_id"], data["m365_tenant_id"]) == ("client-1", "tenant-2")
+    assert data["m365_authorized"] in (True, False)
+
+
+def test_a_port_harvey_cannot_parse_is_refused(authed):
+    r = authed.post("/api/settings/env", json={"IMAP_PORT": "993 SSL"})
+    assert r.status_code == 400 and not dash.ENV_FILE.exists()
+    assert authed.post("/api/settings/env", json={"IMAP_PORT": ""}).json()["success"]   # blank = default
+    assert authed.post("/api/settings/env", json={"SMTP_PORT": " 587 "}).json()["success"]
+
+
 @pytest.mark.parametrize("value", [{"a": 1}, ["x"], True, "x" * 5000, "a\x00b"])
 def test_settings_values_are_validated(authed, value):
     r = authed.post("/api/settings/env", json={"SMTP_HOST": value})
