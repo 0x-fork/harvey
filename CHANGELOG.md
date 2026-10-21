@@ -7,7 +7,24 @@ minor versions can still change behaviour.
 
 ## [Unreleased]
 
+### Added
+
+- **A postal address and opt-out line under every cold email** (CAN-SPAM).
+  Set `compliance.postal_address` in `harvey.yaml`; `compliance.opt_out_line`
+  defaults to *Not interested? Reply "no thanks" and I won't email again.*
+  Both are added when the email sends (native providers and Instantly), never
+  to replies, and the Outbox shows them under each draft. Without an address,
+  cold email still sends, with the opt-out line, and `harvey run`,
+  `harvey status` and the Outbox tab warn until it's set. Based on #13 by
+  Camilo Cruz.
+
 ### Fixed
+
+- Replies are read without the email they quote. The model, the stored thread
+  and the answer see only what the person wrote, so quoted text from Harvey's
+  own email can't skew how a reply is understood. Opt-out and escalation words
+  are still found anywhere they wrote them, including between or under
+  quoted lines; "no thanks" and "no thank you" now count as opt-outs.
 
 - The Sender claims each email right before sending it. A reply, bounce, hand
   send or rejection that cancels an approved email while the Sender is working

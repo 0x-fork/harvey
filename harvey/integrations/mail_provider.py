@@ -16,6 +16,7 @@ it isn't a MailProvider because Instantly owns sequencing/sending itself.
 """
 
 import logging
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
@@ -52,6 +53,42 @@ BOUNCE_SUBJECTS = (
     "delivery failure", "failure notice", "could not be delivered",
     "delivery incomplete", "address not found",
 )
+
+
+# Where a reply starts quoting the email it answers. Clients wrap the
+# "On ... wrote:" line, so one line break is allowed inside it.
+_QUOTE_HEADERS = (
+    # Gmail / Apple Mail, and the Spanish, German and French equivalents
+    re.compile(r"^[ \t]*On\b[^\n]{0,300}(?:\n[^\n]{0,300})?\bwrote:[ \t]*$", re.MULTILINE),
+    re.compile(r"^[ \t]*El\b[^\n]{0,300}(?:\n[^\n]{0,300})?\bescribi[oó]:[ \t]*$", re.MULTILINE),
+    re.compile(r"^[ \t]*Am\b[^\n]{0,300}(?:\n[^\n]{0,300})?\bschrieb[^\n]{0,100}:[ \t]*$", re.MULTILINE),
+    re.compile(r"^[ \t]*Le\b[^\n]{0,300}(?:\n[^\n]{0,300})?\ba [ée]crit[ \t]*:[ \t]*$", re.MULTILINE),
+    # Outlook
+    re.compile(r"^[ \t]*-{2,}[ \t]*Original Message[ \t]*-{2,}", re.MULTILINE | re.IGNORECASE),
+    re.compile(r"^[ \t]*From:[^\n]*\n[ \t]*(?:Sent|Date):", re.MULTILINE),
+    re.compile(r"^[ \t]*_{10,}[ \t]*$", re.MULTILINE),
+)
+
+
+def strip_quoted_reply(body: str) -> str:
+    """What the sender wrote, without the email they're answering.
+
+    ">" lines are dropped wherever they are, so answers written between
+    quoted lines are kept; everything from the first quote header ("On ...
+    wrote:", Outlook's From:/Sent: block) is cut. When that would leave
+    nothing (they answered under the header), their unquoted lines are kept.
+    Used for reading a reply; opt-out detection looks wider (see handler).
+    """
+    text = (body or "").replace("\r\n", "\n")
+    text = "\n".join(
+        line for line in text.split("\n") if not line.lstrip().startswith(">"))
+    cut = len(text)
+    for pattern in _QUOTE_HEADERS:
+        m = pattern.search(text)
+        if m and m.start() < cut:
+            cut = m.start()
+    kept = text[:cut].strip() or text.strip()
+    return re.sub(r"\n{3,}", "\n\n", kept)
 
 
 def looks_like_bounce(from_email: str, subject: str) -> bool:

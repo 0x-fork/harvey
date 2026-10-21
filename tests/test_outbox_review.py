@@ -15,6 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import harvey.dashboard as dash
+from harvey.config import DEFAULT_OPT_OUT_LINE as LINE
 from harvey.models import Company
 from harvey.models.campaign import Campaign
 from harvey.models.prospect import Prospect
@@ -212,5 +213,6 @@ def test_an_approved_edit_is_what_gets_sent(client):
         await make_sender(state, provider)._drain_due()
         return provider.sent
     sent = asyncio.run(send())
-    assert [(m["subject"], m["body"]) for m in sent] == [
+    # The edit as saved, with the compliance footer the Sender adds underneath.
+    assert [(m["subject"], m["body"].split("\n\n" + LINE)[0]) for m in sent] == [
         ("your portal", "Hello Proven Resource team,\n\nHaris")]

@@ -850,6 +850,7 @@ async def get_outbox_api():
         # isn't running.
         await state.fail_stale_sending_outbox()
         return {
+            **_compliance_view(),
             "paused": await state.get_setting("sending_paused"),
             "pending": await _with_context(
                 await state.get_outbox(status="pending_review", limit=100)),
@@ -977,6 +978,18 @@ def _send_as() -> str:
         return load_config().persona.email or ""
     except Exception:
         return ""
+
+
+def _compliance_view() -> dict:
+    """What the Sender adds under each cold email, so a reviewer sees the
+    email as it will leave, and the warning when the address is missing."""
+    try:
+        from harvey.config import compliance_footer_lines, compliance_notice, load_config
+        config = load_config()
+        return {"footer": "\n".join(compliance_footer_lines(config)),
+                "compliance_notice": compliance_notice(config)}
+    except Exception:
+        return {"footer": "", "compliance_notice": ""}
 
 
 async def _harvey_committed_ids() -> set[str]:

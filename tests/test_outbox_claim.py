@@ -195,7 +195,7 @@ async def test_the_send_uses_the_text_as_it_is_when_claimed(state, monkeypatch):
 
     provider = FakeProvider()
     await make_sender(state, provider)._drain_due()
-    assert [(m["subject"], m["body"]) for m in provider.sent] == [
+    assert [(m["subject"], m["body"].split("\n\n")[0]) for m in provider.sent] == [
         ("edited subject", "Edited, plain note. Question?")]
 
 

@@ -1250,6 +1250,7 @@ async function loadOutbox() {
 
   const pending = data.pending || [];
   _desk.items = pending;
+  _desk.footer = data.footer || '';
   // Keep the desk on the draft being edited even if the list shifted.
   const editingAt = _desk.editing ? pending.findIndex(p => p.id === _desk.editing) : -1;
   if (editingAt >= 0) _desk.i = editingAt;
@@ -1278,6 +1279,12 @@ async function loadOutbox() {
         '<p style="color:var(--text-2);font-size:13px">' + escHtml(data.paused) +
         '. Approved mail stays queued until you resume.</p></div>'
     : '';
+  if (data.compliance_notice) {
+    banner.innerHTML +=
+      '<div class="card" style="border-color:var(--s-wait-line);background:var(--s-wait-bg);margin-bottom:16px">' +
+        '<h2 style="color:var(--s-wait)">Add your postal address</h2>' +
+        '<p style="color:var(--text-2);font-size:13px">' + escHtml(data.compliance_notice) + '</p></div>';
+  }
 
   desk.innerHTML = pending.length ? renderDesk(pending, _desk.i) :
     '<div class="card">' + emptyState('&#10003;', 'Nothing to review',
@@ -1369,6 +1376,13 @@ function renderDesk(items, i) {
         escHtml(unsaved.body) + '</textarea>'
     : '<div class="subject">' + escHtml(cur.subject || '(no subject)') + '</div>' +
       '<div class="body">' + escHtml(cur.body) + '</div>';
+  // Cold email leaves with the footer underneath; show it as it will go out.
+  // Lines already in the body aren't added again, as in the Sender.
+  const added = cur.kind === 'sequence'
+    ? _desk.footer.split('\n').filter(l => l && !(cur.body || '').includes(l)).join('\n') : '';
+  const footer = added
+    ? '<div class="desk-footer" title="Added when it sends (compliance in harvey.yaml)">' +
+        escHtml(added) + '</div>' : '';
   const actions = editing
     ? '<button class="btn btn-primary" onclick="deskSave(\'' + cur.id + '\')">Save</button>' +
       '<button class="btn btn-secondary" onclick="deskEdit(null)">Cancel</button>'
@@ -1386,7 +1400,7 @@ function renderDesk(items, i) {
         cur.step + ' (' + escHtml(cur.kind) + ') &middot; sends ' +
         formatDate(cur.send_at) + '</div>' +
       renderDeskContext(cur.context) +
-      draft +
+      draft + footer +
       '<div class="desk-actions">' + actions +
         '<span class="muted" style="font-size:12px;margin-left:auto">' +
           (i + 1) + ' of ' + items.length + '</span>' +

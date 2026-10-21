@@ -7,14 +7,20 @@ threshold — flips the global kill switch so a bad list can't torch the
 sending domain while nobody's watching.
 """
 
+import html
 import logging
+import re
 from datetime import datetime, timezone
 
 from harvey.brain import Brain, BrainUnavailable
-from harvey.config import HarveyConfig, EnvConfig, legacy_sending_held
+from harvey.config import (
+    DEFAULT_OPT_OUT_LINE, HarveyConfig, EnvConfig, compliance_of, legacy_sending_held,
+)
 from harvey.humanize import humanize, humanizer_enabled
 from harvey.integrations.instantly import InstantlyClient
-from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
+from harvey.integrations.mail_provider import (
+    NATIVE_PROVIDERS, get_mail_provider, strip_quoted_reply,
+)
 from harvey.models.conversation import Conversation, Message
 from harvey.state import StateManager
 
@@ -58,6 +64,9 @@ OPT_OUT_PATTERNS = (
     "never contact",
     "delete my info",
     "delete my data",
+    # The wording cold email's footer asks for (compliance.opt_out_line)
+    "no thanks",
+    "no thank you",
 )
 
 # Phrases that mean a human must take over. Never auto-reply to these.
@@ -194,6 +203,29 @@ class Handler:
                 await self.state.mark_reply_processed(reply_uuid)
         return True
 
+    def _keyword_text(self, reply_text: str) -> str:
+        """The whole reply, flattened for the opt-out and escalation checks.
+
+        Quote markers are dropped rather than the quoted lines, so an opt-out
+        written anywhere is found. What we sent ourselves (the postal address
+        and opt-out line, which say "no thanks") is removed, however the
+        client re-wrapped or re-quoted it, so quoting it isn't an opt-out.
+        """
+        def flat(text: str) -> str:
+            text = re.sub(r"^[ \t>]+", "", html.unescape(text or ""), flags=re.MULTILINE)
+            text = (text.replace("\u201c", '"').replace("\u201d", '"')
+                    .replace("\u2018", "'").replace("\u2019", "'"))
+            return " ".join(text.lower().split())
+
+        text = flat(reply_text)
+        compliance = compliance_of(self.config)
+        for ours in (compliance.opt_out_line, DEFAULT_OPT_OUT_LINE,
+                     compliance.postal_address):
+            ours = flat(ours)
+            if ours:
+                text = text.replace(ours, " ")
+        return text
+
     async def _process_reply(
         self,
         lead_email: str,
@@ -203,6 +235,13 @@ class Handler:
         reply_meta: dict | None = None,
     ):
         """Classify, record, and respond to a single reply."""
+        # The keyword checks below look at everything they wrote, even under
+        # or between quoted lines, minus our own footer. Everything else (the
+        # model, the stored thread, the answer) reads only their reply, not
+        # the quoted email it answers.
+        keyword_text = self._keyword_text(reply_text)
+        reply_text = strip_quoted_reply(reply_text) or reply_text
+
         # Find the prospect by email (indexed lookup)
         prospect = await self.state.get_prospect_by_email(lead_email)
         if not prospect:
@@ -224,10 +263,9 @@ class Handler:
 
         # 1. Classify intent. Hard keyword checks run FIRST and override
         # the LLM — opt-outs and legal threats must never be missed.
-        text_lower = reply_text.lower()
-        if any(p in text_lower for p in OPT_OUT_PATTERNS):
+        if any(p in keyword_text for p in OPT_OUT_PATTERNS):
             intent = "unsubscribe"
-        elif any(p in text_lower for p in ESCALATION_PATTERNS):
+        elif any(p in keyword_text for p in ESCALATION_PATTERNS):
             intent = "escalate"
         else:
             intent = await self._classify_intent(reply_text, prospect)

@@ -74,6 +74,12 @@ usage:
 # are in one country, set prospect_country: Precleared uses it only when it can't
 # tell the country from the address, company records or the company's website.
 compliance:
+  # Added under every cold email (never replies). US law (CAN-SPAM) requires a
+  # postal address you receive mail at: a street address, PO box or virtual
+  # mailbox. Until it's set, cold email still sends, with a warning.
+  postal_address: ""
+  # Keep wording Harvey recognises as an opt-out ("no thanks", "unsubscribe").
+  opt_out_line: 'Not interested? Reply "no thanks" and I won''t email again.'
   precleared:
     enabled: false
     sender_country: ""          # GB or US: where your business is based

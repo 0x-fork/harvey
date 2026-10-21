@@ -207,8 +207,47 @@ class PreclearedConfig(BaseModel):
         return self
 
 
+DEFAULT_OPT_OUT_LINE = 'Not interested? Reply "no thanks" and I won\'t email again.'
+
+
 class ComplianceConfig(BaseModel):
     precleared: PreclearedConfig = PreclearedConfig()
+    # Added under every cold (sequence) email at send time; never to replies.
+    # CAN-SPAM requires a postal address you receive mail at (a street
+    # address, PO box or virtual mailbox) and a working way to opt out.
+    postal_address: str = ""
+    # Keep wording Harvey recognises as an opt-out ("no thanks",
+    # "unsubscribe", "remove me"). "" leaves it off.
+    opt_out_line: str = DEFAULT_OPT_OUT_LINE
+
+
+def compliance_of(config) -> ComplianceConfig:
+    """The compliance section, or the defaults when a config has none."""
+    found = getattr(config, "compliance", None)
+    return found if isinstance(found, ComplianceConfig) else ComplianceConfig()
+
+
+def compliance_footer_lines(config) -> list[str]:
+    """The lines added under every cold email: address, then opt-out line."""
+    compliance = compliance_of(config)
+    return [line for line in (compliance.postal_address.strip(),
+                              compliance.opt_out_line.strip()) if line]
+
+
+def compliance_notice(config) -> str:
+    """A plain-language warning when cold email goes out without a postal
+    address, or "". Sending isn't held for it: this is the nudge."""
+    email = getattr(getattr(config, "channels", None), "email", None)
+    if not getattr(email, "enabled", False):
+        return ""
+    if compliance_of(config).postal_address.strip():
+        return ""
+    return (
+        "Cold emails are going out without a postal address. US law (CAN-SPAM) "
+        "requires one in every cold email. Set compliance.postal_address in "
+        "harvey.yaml (or harvey.local.yaml if you trained Harvey) to a street "
+        "address, PO box or virtual mailbox."
+    )
 
 
 class QuietHoursConfig(BaseModel):
