@@ -22,7 +22,9 @@ from harvey.gate import pre_send_check
 from harvey.integrations.instantly import InstantlyClient
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
 from harvey.integrations.precleared import PreclearedClient
-from harvey.state import HAND_SENT_REASON, MANUAL_SEND_KEY, StateManager
+from harvey.state import (
+    HAND_SENT_REASON, MANUAL_SEND_KEY, MAYBE_SENT_PREFIX, StateManager,
+)
 
 logger = logging.getLogger("harvey.sender")
 
@@ -30,10 +32,6 @@ logger = logging.getLogger("harvey.sender")
 # instead of bursting the daily cap in one minute.
 MAX_SENDS_PER_CYCLE = 8
 SEND_JITTER_SECONDS = (4, 15)
-# A claimed email still not finished after this long was cut off mid-send (a
-# send itself takes seconds). Long enough never to catch another sender's
-# email in flight.
-STALE_SENDING_AFTER = timedelta(minutes=15)
 
 # Prospect pipeline statuses that mean "stop emailing this person".
 STOP_STATUSES = {"replied", "opted_out", "lost", "meeting", "closed"}
@@ -334,6 +332,14 @@ class Sender:
 
     async def _run_native(self):
         """Stage new campaigns into the outbox, then drain what's due."""
+        # Before any early return: a send cut off mid-way must show up as
+        # failed even while sending is paused or no mailbox is connected.
+        stale = await self.state.fail_stale_sending_outbox()
+        if stale:
+            logger.warning(
+                f"Sender: {stale} email(s) were interrupted mid-send and won't be "
+                "retried. Check your Sent folder; they're under Didn't send."
+            )
         paused = await self.state.get_setting(KILL_SWITCH_KEY)
         if paused:
             logger.warning(
@@ -475,13 +481,6 @@ class Sender:
             )
             return
 
-        stale = await self.state.fail_stale_sending_outbox(STALE_SENDING_AFTER)
-        if stale:
-            logger.warning(
-                f"Sender: {stale} email(s) were interrupted mid-send and won't be "
-                "retried. Check your Sent folder; they're under Didn't send."
-            )
-
         max_daily = self.config.channels.email.max_daily_sends
         sent_today = await self.state.count_outbox_sent_today()
         budget = min(MAX_SENDS_PER_CYCLE, max_daily - sent_today)
@@ -559,6 +558,9 @@ class Sender:
             # cancelled it since the queue was read; then it stays cancelled.
             if not await self.state.claim_outbox_item(item["id"]):
                 continue
+            # Send the email as it is now, not as the queue read it: it may
+            # have been edited and approved again since.
+            item = await self.state.get_outbox_item(item["id"]) or item
             # Whatever landed between the checks above and the claim (a reply
             # sets the status before it cancels) is caught here, with fresh
             # data. From now on nothing else can cancel this email.
@@ -579,7 +581,7 @@ class Sender:
                 # It may have gone out before the error: never retry it.
                 await self.state.update_outbox_item(
                     item["id"], status="failed",
-                    error=f"send error, may have gone out: {e}"[:300],
+                    error=f"{MAYBE_SENT_PREFIX}send error: {e}"[:300],
                 )
                 logger.warning(f"Sender: send to {item['to_email']} raised: {e}")
                 continue

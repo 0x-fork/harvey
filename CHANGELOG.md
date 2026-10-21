@@ -16,7 +16,9 @@ minor versions can still change behaviour.
   longer send the same email twice. An email cut off mid-send (Harvey stopped,
   or the provider raised an error) is marked failed and never retried, since
   it may have gone out; it shows under "Didn't send" with a note to check your
-  Sent folder.
+  Sent folder, and the dashboard won't offer to email that person by hand.
+  Rejecting an email that is already sending or sent is refused instead of
+  relabelling it.
 - Keep local website requests out of private networks, including redirects and
   DNS rebinding. Preserve the original hostname for TLS verification. Website
   fetching (search, company sites, profiling, the training crawler) now ignores

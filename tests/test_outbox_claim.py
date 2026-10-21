@@ -170,10 +170,80 @@ async def test_an_email_stuck_sending_is_failed_after_a_while_never_resent(state
         await db.commit()
 
     provider = FakeProvider()
-    await make_sender(state, provider)._drain_due()
+    await make_sender(state, provider)._run_native()
     assert provider.sent == []
     stuck_item = await state.get_outbox_item(stuck)
     assert stuck_item["status"] == "failed"
     assert "Sent folder" in stuck_item["error"]
     # A claim this recent may be another sender's email in flight.
     assert (await state.get_outbox_item(fresh))["status"] == "sending"
+
+
+@pytest.mark.asyncio
+async def test_the_send_uses_the_text_as_it_is_when_claimed(state, monkeypatch):
+    # The queue is read once per cycle; the draft can be edited and
+    # re-approved during the pacing pauses before its turn comes.
+    pid = await seed_prospect(state, status="contacted")
+    item_id = await _approved(state, pid)
+    real_claim = state.claim_outbox_item
+
+    async def edited_before_its_turn(item_id):
+        await state.update_outbox_item(
+            item_id, subject="edited subject", body="Edited, plain note. Question?")
+        return await real_claim(item_id)
+    monkeypatch.setattr(state, "claim_outbox_item", edited_before_its_turn)
+
+    provider = FakeProvider()
+    await make_sender(state, provider)._drain_due()
+    assert [(m["subject"], m["body"]) for m in provider.sent] == [
+        ("edited subject", "Edited, plain note. Question?")]
+
+
+async def _stuck_since(state, item_id, hours=1):
+    await state.claim_outbox_item(item_id)
+    long_ago = (datetime.now(timezone.utc).replace(tzinfo=None)
+                - timedelta(hours=hours)).isoformat()
+    async with state._connect() as db:
+        await db.execute("UPDATE outbox SET updated_at = ? WHERE id = ?", (long_ago, item_id))
+        await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_a_stuck_email_is_surfaced_even_while_sending_is_paused(state):
+    pid = await seed_prospect(state, status="contacted")
+    stuck = await _approved(state, pid)
+    await _stuck_since(state, stuck)
+    await state.set_setting("sending_paused", "bounce rate")
+    await make_sender(state, FakeProvider())._run_native()
+    assert (await state.get_outbox_item(stuck))["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_a_stuck_email_is_surfaced_even_with_no_mailbox_connected(state):
+    pid = await seed_prospect(state, status="contacted")
+    stuck = await _approved(state, pid)
+    await _stuck_since(state, stuck)
+
+    class Unconfigured(FakeProvider):
+        def is_configured(self):
+            return False
+    await make_sender(state, Unconfigured())._run_native()
+    assert (await state.get_outbox_item(stuck))["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_reject_never_touches_mail_already_sending_or_sent(state):
+    pid = await seed_prospect(state, status="contacted")
+    sending = await _approved(state, pid)
+    await state.claim_outbox_item(sending)
+    sent = await _approved(state, pid, step=3)
+    await state.update_outbox_item(sent, status="sent")
+    pending = await state.add_outbox_item(
+        prospect_id=pid, to_email="jane@acme.com", subject="s", body="b",
+        send_at=_now_iso(), campaign_id="c1", step=4)
+    assert await state.reject_outbox_item(sending) == 0
+    assert await state.reject_outbox_item(sent) == 0
+    assert await state.reject_outbox_item(pending) == 1
+    assert (await state.get_outbox_item(sending))["status"] == "sending"
+    assert (await state.get_outbox_item(sent))["status"] == "sent"
+    assert (await state.get_outbox_item(pending))["status"] == "rejected"
