@@ -3,7 +3,7 @@
 import logging
 import os
 import re
-from datetime import time as _time
+from datetime import date as _date, time as _time
 from pathlib import Path
 
 import yaml
@@ -68,6 +68,62 @@ class ICPConfig(BaseModel):
     geo_coordinates: dict[str, str] = {}
 
 
+class WarmupConfig(BaseModel):
+    """Cold-email ramp for a new domain or mailbox.
+
+    Harvey doesn't run a warmup network itself; that needs a pool of real
+    inboxes (Instantly, Lemwarm, Mailreach...). This is the other half: no
+    cold email goes out for ``min_days`` after ``start_date``, then the cold
+    cap climbs from ``start_sends`` by ``daily_increase`` a day until it
+    reaches ``max_daily_sends``. Replies are never held. Empty
+    ``start_date`` means no ramp.
+    """
+
+    start_date: str = ""      # YYYY-MM-DD the warmup service was switched on
+    min_days: int = 14        # warmup-only days before any cold email
+    start_sends: int = 5      # cold-email cap on the first sending day
+    daily_increase: int = 3   # added to the cap each day after that
+    dkim_selector: str = ""   # for `harvey warmup`, if not a common one
+
+    @field_validator("start_date", "dkim_selector", mode="before")
+    @classmethod
+    def _blank_is_empty(cls, v):
+        return "" if v is None else v
+
+    @field_validator("start_date")
+    @classmethod
+    def _valid_date(cls, v: str) -> str:
+        v = (v or "").strip()
+        if v:
+            try:
+                _date.fromisoformat(v)
+            except ValueError:
+                raise ValueError(f"warmup.start_date '{v}' must be YYYY-MM-DD.")
+        return v
+
+    @field_validator("min_days", "start_sends", "daily_increase")
+    @classmethod
+    def _non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("warmup values must be >= 0")
+        return v
+
+    def days_in(self, today: _date | None = None) -> int | None:
+        """Days since warmup started, or None when no ramp is configured."""
+        if not self.start_date:
+            return None
+        return ((today or _date.today()) - _date.fromisoformat(self.start_date)).days
+
+    def daily_cap(self, ceiling: int, today: _date | None = None) -> int:
+        """Today's cold-email cap under the ramp (never above ``ceiling``)."""
+        days = self.days_in(today)
+        if days is None:
+            return ceiling
+        if days < self.min_days:
+            return 0
+        return min(ceiling, self.start_sends + (days - self.min_days) * self.daily_increase)
+
+
 class EmailChannelConfig(BaseModel):
     enabled: bool = True
     # "instantly" (legacy), "gmail" (Gmail/Workspace via API — recommended),
@@ -86,6 +142,8 @@ class EmailChannelConfig(BaseModel):
     # Kill switch: pause all sending when bounces exceed this fraction of
     # sent mail (measured over the trailing sends). 0 disables the switch.
     max_bounce_rate: float = 0.05
+    # New domain? Ramp cold email up slowly (see WarmupConfig).
+    warmup: WarmupConfig = WarmupConfig()
 
     @field_validator("max_daily_sends")
     @classmethod
@@ -93,6 +151,19 @@ class EmailChannelConfig(BaseModel):
         if v < 0:
             raise ValueError("max_daily_sends must be >= 0")
         return v
+
+    def cold_daily_cap(self, today: _date | None = None) -> int:
+        """Today's cap on cold (sequence) email: max_daily_sends, throttled
+        by the warmup ramp. Replies count only toward max_daily_sends."""
+        return self.warmup.daily_cap(self.max_daily_sends, today)
+
+
+def cold_daily_cap(email_config, today: _date | None = None) -> int:
+    """cold_daily_cap for any email config, including ones without a ramp."""
+    warmup = getattr(email_config, "warmup", None)
+    if isinstance(warmup, WarmupConfig):
+        return warmup.daily_cap(email_config.max_daily_sends, today)
+    return email_config.max_daily_sends
 
 
 def legacy_sending_held(config) -> bool:

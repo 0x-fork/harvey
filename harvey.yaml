@@ -52,6 +52,16 @@ channels:
     require_approval: true      # native: review in Outbox; Instantly: sending held
     send_to_risky: false        # also send to catch-all domains (off = safest)
     max_bounce_rate: 0.05       # pause all sending if bounces exceed this
+    # New sending domain? Set start_date to the day your warmup service went
+    # on: no cold email for min_days, then the cold cap climbs from
+    # start_sends by daily_increase a day up to max_daily_sends. Replies are
+    # never held. Check readiness any time with `harvey warmup`.
+    warmup:
+      start_date: ""            # YYYY-MM-DD; blank = no ramp
+      min_days: 14
+      start_sends: 5
+      daily_increase: 3
+      dkim_selector: ""         # only if your provider uses an unusual one
   linkedin:
     enabled: false             # explicit opt-in; credentials alone do not enable it
     max_daily_connections: 20

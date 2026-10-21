@@ -1105,13 +1105,29 @@ class StateManager:
             ) as cursor:
                 return (await cursor.fetchone())[0]
 
-    async def count_outbox_sent_today(self) -> int:
+    async def count_outbox_sent_today(self, kind: str | None = None) -> int:
+        """Emails sent today; only one kind ("sequence", "reply") if given."""
+        sql = "SELECT COUNT(*) FROM outbox WHERE status = 'sent' AND date(sent_at) = date('now')"
+        params: tuple = ()
+        if kind:
+            sql += " AND kind = ?"
+            params = (kind,)
         async with self._connect() as db:
-            async with db.execute(
-                "SELECT COUNT(*) FROM outbox WHERE status = 'sent' "
-                "AND date(sent_at) = date('now')"
-            ) as cursor:
+            async with db.execute(sql, params) as cursor:
                 return (await cursor.fetchone())[0]
+
+    async def get_previous_step(self, item: dict) -> dict | None:
+        """The email a sequence follow-up follows (same campaign and person,
+        one step earlier), or None."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM outbox WHERE prospect_id = ? AND campaign_id = ? "
+                "AND kind = 'sequence' AND step = ? ORDER BY created_at DESC LIMIT 1",
+                (item["prospect_id"], item.get("campaign_id") or "", int(item["step"]) - 1),
+            ) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
 
     async def find_outbox_by_message_id(self, message_id: str) -> dict | None:
         if not message_id:

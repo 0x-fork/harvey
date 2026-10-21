@@ -18,7 +18,8 @@ from datetime import date, datetime, timedelta, timezone
 
 from harvey.brain import Brain
 from harvey.config import (
-    HarveyConfig, EnvConfig, compliance_footer_lines, compliance_notice, compliance_of,
+    HarveyConfig, EnvConfig, cold_daily_cap, compliance_footer_lines, compliance_notice,
+    compliance_of,
 )
 from harvey.gate import pre_send_check
 from harvey.integrations.instantly import InstantlyClient
@@ -27,6 +28,10 @@ from harvey.integrations.precleared import PreclearedClient
 from harvey.state import (
     HAND_SENT_REASON, MANUAL_SEND_KEY, MAYBE_SENT_PREFIX, StateManager,
 )
+
+# A follow-up waits at least this long after the email it follows went out,
+# whatever its schedule says.
+MIN_FOLLOW_UP_GAP = timedelta(days=1)
 
 logger = logging.getLogger("harvey.sender")
 
@@ -96,7 +101,7 @@ class Sender:
             return
 
         # Enforce daily send limit
-        max_sends = self.config.channels.email.max_daily_sends
+        max_sends = cold_daily_cap(self.config.channels.email)
         sends_today = await self._count_sends_today()
         remaining = max_sends - sends_today
         if remaining <= 0:
@@ -253,7 +258,7 @@ class Sender:
             return
 
         # Check remaining daily send budget
-        max_sends = self.config.channels.email.max_daily_sends
+        max_sends = cold_daily_cap(self.config.channels.email)
         sends_today = await self._count_sends_today()
         remaining = max_sends - sends_today
         if remaining <= 0:
@@ -464,6 +469,39 @@ class Sender:
             return self._with_footer(item["body"])
         return item["body"]
 
+    async def _follow_up_order(self, item: dict) -> str | tuple[str, str] | None:
+        """For a follow-up: "wait" until the email before it went out and its
+        gap has passed, (status, error) when that email never will, else None.
+
+        Without this, a step held for any reason (approval, a pause, a
+        compliance hold, the warmup ramp) lets its follow-ups' scheduled
+        times arrive first: a late "Approve all" sent the whole sequence in
+        one go, or step 2 before step 1.
+        """
+        if item["kind"] != "sequence" or int(item["step"]) <= 1:
+            return None
+        prev = await self.state.get_previous_step(item)
+        if prev is None:
+            return None
+        if prev["status"] in ("pending_review", "approved", "sending"):
+            return "wait"
+        if prev["status"] != "sent":
+            return "cancelled", f"step {prev['step']} wasn't sent ({prev['status']})"
+
+        def _at(value):
+            try:
+                return datetime.fromisoformat(str(value))
+            except (TypeError, ValueError):
+                return None
+        planned, prev_planned, sent_at = _at(item["send_at"]), _at(prev["send_at"]), _at(prev["sent_at"])
+        gap = MIN_FOLLOW_UP_GAP
+        if planned and prev_planned:
+            gap = max(gap, planned - prev_planned)
+        if sent_at is None:
+            return None
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        return "wait" if now < sent_at + gap else None
+
     async def _blocked(self, item: dict, prospect, allow_risky: bool) -> tuple[str, str] | None:
         """Why this email must not go out, as (status, error), or None."""
         if prospect is None:
@@ -507,16 +545,19 @@ class Sender:
         if budget <= 0:
             logger.info(f"Sender: daily send cap reached ({sent_today}/{max_daily}).")
             return
+        # Cold email has its own cap under the warmup ramp; replies don't.
+        cold_cap = cold_daily_cap(self.config.channels.email)
+        cold_left = cold_cap - await self.state.count_outbox_sent_today(kind="sequence")
 
         now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         due = await self.state.get_outbox(
             status="approved", due_before=now, limit=budget * 3
         )
-        if self.precleared is not None:
-            # Cold emails held by an unavailable compliance check stay
-            # approved at the front of the queue and could fill the page
-            # above, so fetch replies (and any other unchecked kind) on their
-            # own too. Bounded: one extra query of the same size.
+        if self.precleared is not None or cold_left <= 0:
+            # Cold emails held (by an unavailable compliance check, or the
+            # cold cap) stay approved at the front of the queue and could
+            # fill the page above, so fetch replies (and any other kind) on
+            # their own too. Bounded: one extra query of the same size.
             seen = {item["id"] for item in due}
             unchecked = await self.state.get_outbox(
                 status="approved", due_before=now, limit=budget * 3,
@@ -537,9 +578,13 @@ class Sender:
         # Set when Precleared can't be asked (allowance used up, network):
         # cold emails wait for a later cycle, replies still go out.
         compliance_paused = False
+        held_cold = 0
         for item in due:
             if sent >= budget:
                 break
+            if item["kind"] == "sequence" and sent_cold >= cold_left:
+                held_cold += 1
+                continue
             needs_check = self.precleared is not None and item["kind"] == "sequence"
             if needs_check and compliance_paused:
                 continue
@@ -549,6 +594,12 @@ class Sender:
             if blocked:
                 await self.state.update_outbox_item(
                     item["id"], status=blocked[0], error=blocked[1])
+                continue
+            order = await self._follow_up_order(item)
+            if order == "wait":
+                continue
+            if order:
+                await self.state.update_outbox_item(item["id"], status=order[0], error=order[1])
                 continue
 
             # Optional compliance check (compliance.precleared): one per
@@ -658,6 +709,15 @@ class Sender:
             if self.send_pacing and sent < budget:
                 await asyncio.sleep(random.uniform(*SEND_JITTER_SECONDS))
 
+        if held_cold:
+            warmup = getattr(self.config.channels.email, "warmup", None)
+            days = warmup.days_in() if warmup is not None else None
+            if days is not None and cold_cap < max_daily:
+                logger.info(
+                    f"Sender: warmup day {days}: {held_cold} cold email(s) wait; today's "
+                    f"cold cap is {cold_cap}. Replies still go out. See `harvey warmup`.")
+            else:
+                logger.info(f"Sender: cold email cap reached for today ({cold_cap}).")
         if sent_cold:
             await self.state.remember_footer_lines(compliance_footer_lines(self.config))
             notice = compliance_notice(self.config)
