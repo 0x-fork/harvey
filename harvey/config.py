@@ -208,6 +208,9 @@ class PreclearedConfig(BaseModel):
 
 
 DEFAULT_OPT_OUT_LINE = 'Not interested? Reply "no thanks" and I won\'t email again.'
+# Opt-out wording the Handler always honours; an opt_out_line must ask for one.
+OPT_OUT_WORDS = ("no thanks", "no thank you", "unsubscribe", "stop", "remove me",
+                 "opt out", "opt-out")
 
 
 class ComplianceConfig(BaseModel):
@@ -216,9 +219,33 @@ class ComplianceConfig(BaseModel):
     # CAN-SPAM requires a postal address you receive mail at (a street
     # address, PO box or virtual mailbox) and a working way to opt out.
     postal_address: str = ""
-    # Keep wording Harvey recognises as an opt-out ("no thanks",
-    # "unsubscribe", "remove me"). "" leaves it off.
+    # Must ask for wording Harvey recognises as an opt-out (OPT_OUT_WORDS).
+    # "" leaves it off (and harvey warns).
     opt_out_line: str = DEFAULT_OPT_OUT_LINE
+
+    @field_validator("postal_address", "opt_out_line", mode="before")
+    @classmethod
+    def _blank_is_empty(cls, v):
+        return "" if v is None else v
+
+    @field_validator("opt_out_line")
+    @classmethod
+    def _recognisable_opt_out(cls, v: str) -> str:
+        v = v.strip()
+        lowered = v.lower()
+        if not v:
+            return v
+        if "http" in lowered or "www." in lowered or "click" in lowered:
+            raise ValueError(
+                "opt_out_line can't contain a link: cold email allows one link, and "
+                "opting out must be as simple as replying."
+            )
+        if not any(word in lowered for word in OPT_OUT_WORDS):
+            raise ValueError(
+                "opt_out_line must ask for a reply Harvey recognises as an opt-out: "
+                + ", ".join(f'"{w}"' for w in OPT_OUT_WORDS[:5]) + "."
+            )
+        return v
 
 
 def compliance_of(config) -> ComplianceConfig:
@@ -240,13 +267,19 @@ def compliance_notice(config) -> str:
     email = getattr(getattr(config, "channels", None), "email", None)
     if not getattr(email, "enabled", False):
         return ""
-    if compliance_of(config).postal_address.strip():
+    compliance = compliance_of(config)
+    missing = []
+    if not compliance.postal_address.strip():
+        missing.append("a postal address (compliance.postal_address: a street "
+                       "address, PO box or virtual mailbox)")
+    if not compliance.opt_out_line.strip():
+        missing.append("a way to opt out (compliance.opt_out_line)")
+    if not missing:
         return ""
     return (
-        "Cold emails are going out without a postal address. US law (CAN-SPAM) "
-        "requires one in every cold email. Set compliance.postal_address in "
-        "harvey.yaml (or harvey.local.yaml if you trained Harvey) to a street "
-        "address, PO box or virtual mailbox."
+        "Cold emails are going out without " + " or ".join(missing) + ". US law "
+        "(CAN-SPAM) requires both in every cold email. Set them in harvey.yaml "
+        "(or harvey.local.yaml if you trained Harvey)."
     )
 
 

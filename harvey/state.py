@@ -912,6 +912,17 @@ class StateManager:
             async with db.execute(sql, params) as cursor:
                 return [dict(r) for r in await cursor.fetchall()]
 
+    async def get_sent_outbox_bodies(self, prospect_id: str, limit: int = 10) -> list[str]:
+        """What Harvey actually sent this person (footer included), newest
+        first: the text a reply may quote back."""
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT body FROM outbox WHERE prospect_id = ? AND status = 'sent' "
+                "ORDER BY sent_at DESC LIMIT ?",
+                (prospect_id, int(limit)),
+            ) as cursor:
+                return [r[0] or "" for r in await cursor.fetchall()]
+
     async def get_outbox_item(self, item_id: str) -> dict | None:
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row

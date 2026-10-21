@@ -1377,9 +1377,9 @@ function renderDesk(items, i) {
     : '<div class="subject">' + escHtml(cur.subject || '(no subject)') + '</div>' +
       '<div class="body">' + escHtml(cur.body) + '</div>';
   // Cold email leaves with the footer underneath; show it as it will go out.
-  // Lines already in the body aren't added again, as in the Sender.
-  const added = cur.kind === 'sequence'
-    ? _desk.footer.split('\n').filter(l => l && !(cur.body || '').includes(l)).join('\n') : '';
+  // Not added again when the body already ends with it, as in the Sender.
+  const added = cur.kind === 'sequence' && !(cur.body || '').trimEnd().endsWith(_desk.footer)
+    ? _desk.footer : '';
   const footer = added
     ? '<div class="desk-footer" title="Added when it sends (compliance in harvey.yaml)">' +
         escHtml(added) + '</div>' : '';
@@ -1625,13 +1625,15 @@ async function openInGmail(ci, si, ri) {
   const step = c && (c.sequence || [])[si];
   const r = c && (c.recipients || [])[ri];
   if (!step || !r) return;
+  // Cold email carries the postal address and opt-out line, sent by hand too.
+  const body = fillMergeVars(step.body, r).trimEnd() + (c.footer ? '\n\n' + c.footer : '');
   // authuser picks the Google account Harvey sends as, not just whichever
   // one the browser happens to be signed into.
   const url = 'https://mail.google.com/mail/?view=cm&fs=1' +
     (c.send_as ? '&authuser=' + encodeURIComponent(c.send_as) : '') +
     '&to=' + encodeURIComponent(r.email) +
     '&su=' + encodeURIComponent(fillMergeVars(step.subject, r)) +
-    '&body=' + encodeURIComponent(fillMergeVars(step.body, r));
+    '&body=' + encodeURIComponent(body);
   const left = /\{\{\s*\w+\s*\}\}/.test(fillMergeVars(step.subject, r) + fillMergeVars(step.body, r));
   // No 'noopener' feature string: with it window.open always returns null,
   // so a blocked pop-up could not be told apart from a successful one. The

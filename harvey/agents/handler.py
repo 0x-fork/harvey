@@ -64,10 +64,39 @@ OPT_OUT_PATTERNS = (
     "never contact",
     "delete my info",
     "delete my data",
-    # The wording cold email's footer asks for (compliance.opt_out_line)
-    "no thanks",
-    "no thank you",
 )
+# "No thanks" (what cold email's footer asks for) as a phrase on one line,
+# not "yes or no / Thanks," or "no Thanksgiving".
+NO_THANKS_RE = re.compile(r"\bno,?[ \t]+thank(?:s|[ \t]+you)\b")
+# A reply that says only this is an opt-out ("Reply STOP to opt out").
+BARE_OPT_OUTS = {"stop", "unsubscribe", "remove", "remove me", "opt out",
+                 "no thanks", "no thank you"}
+# A line at least this long that repeats what Harvey sent this person is our
+# quoted email, not their words. Shorter lines are always theirs, so a reply
+# of "No thanks" or "STOP" is never mistaken for a quote of our footer.
+OWN_TEXT_MIN_CHARS = 20
+
+
+def _flat(text: str) -> str:
+    """Lowercase, quote markers, HTML entities, curly quotes and spacing
+    evened out, so text compares however a mail client re-quoted it."""
+    text = re.sub(r"^[ \t>]+", "", html.unescape(text or ""), flags=re.MULTILINE)
+    text = (text.replace("\u201c", '"').replace("\u201d", '"')
+            .replace("\u2018", "'").replace("\u2019", "'"))
+    return " ".join(text.lower().split())
+
+
+def _drop_our_text(text: str, ours: str) -> str:
+    """The reply without lines that repeat what we sent (`ours`, flattened)."""
+    return "\n".join(
+        line for line in (text or "").split("\n")
+        if not (len(_flat(line)) >= OWN_TEXT_MIN_CHARS and _flat(line) in ours))
+
+
+def _is_opt_out(keyword_text: str, own_words: str) -> bool:
+    if any(p in keyword_text for p in OPT_OUT_PATTERNS) or NO_THANKS_RE.search(keyword_text):
+        return True
+    return re.sub(r"[^\w\s-]", "", _flat(own_words)).strip() in BARE_OPT_OUTS
 
 # Phrases that mean a human must take over. Never auto-reply to these.
 ESCALATION_PATTERNS = (
@@ -203,28 +232,15 @@ class Handler:
                 await self.state.mark_reply_processed(reply_uuid)
         return True
 
-    def _keyword_text(self, reply_text: str) -> str:
-        """The whole reply, flattened for the opt-out and escalation checks.
-
-        Quote markers are dropped rather than the quoted lines, so an opt-out
-        written anywhere is found. What we sent ourselves (the postal address
-        and opt-out line, which say "no thanks") is removed, however the
-        client re-wrapped or re-quoted it, so quoting it isn't an opt-out.
-        """
-        def flat(text: str) -> str:
-            text = re.sub(r"^[ \t>]+", "", html.unescape(text or ""), flags=re.MULTILINE)
-            text = (text.replace("\u201c", '"').replace("\u201d", '"')
-                    .replace("\u2018", "'").replace("\u2019", "'"))
-            return " ".join(text.lower().split())
-
-        text = flat(reply_text)
+    async def _our_text(self, prospect) -> str:
+        """Everything a reply from this person might quote back from us: what
+        we actually sent them (footer included, whatever it said then) and
+        today's footer (Instantly sends aren't in the outbox)."""
         compliance = compliance_of(self.config)
-        for ours in (compliance.opt_out_line, DEFAULT_OPT_OUT_LINE,
-                     compliance.postal_address):
-            ours = flat(ours)
-            if ours:
-                text = text.replace(ours, " ")
-        return text
+        sent = await self.state.get_sent_outbox_bodies(prospect.id)
+        return "\n".join(_flat(t) for t in (
+            *sent, compliance.postal_address, compliance.opt_out_line,
+            DEFAULT_OPT_OUT_LINE) if t)
 
     async def _process_reply(
         self,
@@ -235,18 +251,22 @@ class Handler:
         reply_meta: dict | None = None,
     ):
         """Classify, record, and respond to a single reply."""
-        # The keyword checks below look at everything they wrote, even under
-        # or between quoted lines, minus our own footer. Everything else (the
-        # model, the stored thread, the answer) reads only their reply, not
-        # the quoted email it answers.
-        keyword_text = self._keyword_text(reply_text)
-        reply_text = strip_quoted_reply(reply_text) or reply_text
-
         # Find the prospect by email (indexed lookup)
         prospect = await self.state.get_prospect_by_email(lead_email)
         if not prospect:
             logger.warning(f"Handler: No prospect found for {lead_email}")
             return
+
+        # Their words, without what we sent them. The keyword checks below
+        # read every line they wrote, even under or between quoted lines;
+        # the model, the stored thread and the answer read their reply
+        # without the quoted email. Either way, a line repeating what we
+        # sent (our footer says "no thanks") is ours, not theirs.
+        ours = await self._our_text(prospect)
+        keyword_text = "\n".join(
+            _flat(line) for line in _drop_our_text(reply_text, ours).split("\n"))
+        stripped = strip_quoted_reply(reply_text) or reply_text
+        reply_text = _drop_our_text(stripped, ours).strip() or stripped
 
         # Update prospect status + stop-on-reply: a human answered, so every
         # queued sequence email for them is now wrong to send.
@@ -263,7 +283,7 @@ class Handler:
 
         # 1. Classify intent. Hard keyword checks run FIRST and override
         # the LLM — opt-outs and legal threats must never be missed.
-        if any(p in keyword_text for p in OPT_OUT_PATTERNS):
+        if _is_opt_out(keyword_text, reply_text):
             intent = "unsubscribe"
         elif any(p in keyword_text for p in ESCALATION_PATTERNS):
             intent = "escalate"

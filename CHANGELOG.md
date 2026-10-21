@@ -13,18 +13,21 @@ minor versions can still change behaviour.
   Set `compliance.postal_address` in `harvey.yaml`; `compliance.opt_out_line`
   defaults to *Not interested? Reply "no thanks" and I won't email again.*
   Both are added when the email sends (native providers and Instantly), never
-  to replies, and the Outbox shows them under each draft. Without an address,
-  cold email still sends, with the opt-out line, and `harvey run`,
-  `harvey status` and the Outbox tab warn until it's set. Based on #13 by
-  Camilo Cruz.
+  to replies, and the Outbox shows them under each draft; "Open in Gmail"
+  includes them too. Without an address (or with the opt-out line turned
+  off), cold email still sends, and `harvey run`, `harvey status` and the
+  Outbox tab warn until it's set. The opt-out line must ask for a reply
+  Harvey recognises and can't contain a link. Based on #13 by Camilo Cruz.
 
 ### Fixed
 
 - Replies are read without the email they quote. The model, the stored thread
-  and the answer see only what the person wrote, so quoted text from Harvey's
-  own email can't skew how a reply is understood. Opt-out and escalation words
-  are still found anywhere they wrote them, including between or under
-  quoted lines; "no thanks" and "no thank you" now count as opt-outs.
+  and the answer get the reply without the quoted email, and any line that
+  repeats what Harvey sent that person is set aside, so Harvey's own words
+  (its footer, or an escalation word like "attorney" in its pitch) don't count
+  as theirs. Opt-out and escalation words the person wrote are still found
+  anywhere, including between or under quoted lines. "No thanks" / "no thank
+  you" as a phrase, and a reply of just "STOP", now count as opt-outs.
 
 - The Sender claims each email right before sending it. A reply, bounce, hand
   send or rejection that cancels an approved email while the Sender is working

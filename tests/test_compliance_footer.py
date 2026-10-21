@@ -268,3 +268,153 @@ def test_an_unreadable_config_still_shows_the_outbox(client, monkeypatch):
     monkeypatch.setattr(harvey.config, "load_config", broken)
     data = client.get("/api/outbox").json()
     assert data["footer"] == "" and "pending" in data
+
+
+# ── Review round 1: false opt-outs, missed opt-outs ──
+
+async def _reply_after_sending(state, body, sent_bodies=(), intent="interested",
+                               line=LINE):
+    """A reply from someone Harvey already emailed `sent_bodies`."""
+    pid = await seed_prospect(state, status="contacted")
+    for n, sent in enumerate(sent_bodies, start=1):
+        oid = await state.add_outbox_item(
+            prospect_id=pid, to_email="jane@acme.com", subject="hello there",
+            body=sent, send_at=_now_iso(), status="approved", campaign_id="c1", step=n)
+        await state.update_outbox_item(oid, status="sent", sent_at=_now_iso())
+    provider = FakeProvider()
+    provider.inbound = [InboundMessage(
+        provider_id="in1", from_email="jane@acme.com", subject="Re: hello there", body=body)]
+    handler = make_handler(state, provider, intent=intent)
+    handler.config.compliance = ComplianceConfig(postal_address=ADDRESS, opt_out_line=line)
+    handler.brain = RecordingBrain(intent)
+    await handler._run_native()
+    return (await state.get_prospect(pid)).status, handler.brain.prompts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [
+    "Do you offer a monthly plan, yes or no\nThanks,\nBob",
+    "Sounds good, call me.\n\nMario Bruno\nThanks for reaching out",
+    "Interested! Can we talk next month? No Thanksgiving week though.",
+], ids=["yes-or-no", "signature", "thanksgiving"])
+async def test_no_thanks_only_counts_as_the_phrase_itself(state, body):
+    status, _ = await _reply(state, body)
+    assert status != "opted_out"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", ["No, thanks.", "STOP", "Stop.", "  unsubscribe  "],
+                         ids=["comma", "stop", "stop-dot", "bare-unsubscribe"])
+async def test_short_opt_out_replies_are_caught_without_the_model(state, body):
+    status, prompts = await _reply(state, body)
+    assert status == "opted_out" and prompts == []
+
+
+@pytest.mark.asyncio
+async def test_quoting_an_old_opt_out_line_is_not_an_opt_out(state):
+    # Emails went out with a custom line; the line was changed afterwards.
+    old = 'Reply "unsubscribe" to stop hearing from me.'
+    sent = "A short, plain note. Question?\n\n" + ADDRESS + "\n" + old
+    status, _ = await _reply_after_sending(
+        state, "Yes, let's talk Tuesday.\n\nOn Tue Harvey wrote:\n> " + sent.replace("\n", "\n> "),
+        sent_bodies=[sent], line="Not for you? Reply no thanks.")
+    assert status != "opted_out"
+
+
+# Dutch Outlook: a header strip_quoted_reply doesn't know.
+DUTCH_OUTLOOK = (
+    "Klinkt goed, stuur me de prijzen.\n\n"
+    "Van: Harvey <harvey@x.co>\nVerzonden: dinsdag 14 oktober 2026 15:02\n\n"
+    "A short, plain note. Question?\n\n" + ADDRESS + "\n" + LINE
+)
+
+
+@pytest.mark.asyncio
+async def test_our_quoted_email_never_reaches_the_model_even_unrecognised(state):
+    sent = "A short, plain note. Question?\n\n" + ADDRESS + "\n" + LINE
+    status, prompts = await _reply_after_sending(state, DUTCH_OUTLOOK, sent_bodies=[sent])
+    assert status != "opted_out"
+    assert prompts and all("no thanks" not in p.lower() for p in prompts)
+    assert any("Klinkt goed" in p for p in prompts)
+
+
+@pytest.mark.asyncio
+async def test_a_footer_cut_off_by_the_length_limit_is_not_an_opt_out(state):
+    sent = "A short, plain note. Question?\n\n" + ADDRESS + "\n" + LINE
+    body = ("Interested, tell me more.\n\nOn Tue Harvey wrote:\n> A short, plain note. Question?\n> "
+            + ADDRESS + '\n> Not interested? Reply "no thanks"')  # truncated here
+    status, _ = await _reply_after_sending(state, body, sent_bodies=[sent])
+    assert status != "opted_out"
+
+
+@pytest.mark.asyncio
+async def test_escalation_words_in_our_own_quoted_email_dont_escalate(state):
+    sent = "We help attorney offices fill their calendar. Worth a chat?"
+    status, prompts = await _reply_after_sending(
+        state, "Yes please.\n\nOn Tue Harvey wrote:\n> " + sent, sent_bodies=[sent])
+    assert prompts  # classified by the model, not escalated by keyword
+
+
+def test_inline_answers_under_a_quote_header_are_kept():
+    text = strip_quoted_reply(
+        "Answers inline below.\n\nOn Tue, Oct 14 Harvey wrote:\n"
+        "> Would a call work?\nYes, Thursday 2pm.\n> CRM?\nHubSpot.")
+    assert "Thursday 2pm" in text and "HubSpot" in text and "Would a call" not in text
+
+
+def test_an_underscore_line_of_their_own_is_not_a_quote():
+    assert "pricing" in strip_quoted_reply("Hi Ethan,\n____________\nSend pricing please.")
+
+
+# ── Review round 1: the footer itself ──
+
+@pytest.mark.asyncio
+async def test_a_short_address_mentioned_in_the_body_still_gets_the_footer(state):
+    pid = await seed_prospect(state, status="contacted")
+    await _approved(state, pid, body="Saw you're in Austin, TX. Question?")
+    provider = FakeProvider()
+    await _sender(state, provider, address="Austin, TX")._drain_due()
+    assert provider.sent[0]["body"].endswith("\n\nAustin, TX\n" + LINE)
+
+
+def test_opt_out_line_must_be_recognisable_and_link_free():
+    import pydantic
+    for bad in ("To unsubscribe, visit https://acme.com/u", "Click here to leave",
+                "Thanks for reading!"):
+        with pytest.raises(pydantic.ValidationError):
+            ComplianceConfig(opt_out_line=bad)
+    assert ComplianceConfig(opt_out_line="Reply STOP to opt out.").opt_out_line
+    assert ComplianceConfig(opt_out_line="").opt_out_line == ""
+    # Left blank in YAML (null) means empty, not a crash.
+    assert ComplianceConfig(postal_address=None, opt_out_line=None).opt_out_line == ""
+
+
+def test_no_opt_out_line_is_warned_about_too():
+    cfg = SimpleNamespace(
+        channels=SimpleNamespace(email=SimpleNamespace(enabled=True)),
+        compliance=ComplianceConfig(postal_address=ADDRESS, opt_out_line=""))
+    assert "opt_out_line" in compliance_notice(cfg)
+
+
+def test_an_edit_the_footer_would_push_over_the_limit_is_refused(client, monkeypatch, env):
+    import sqlite3
+    import harvey.config
+    monkeypatch.setattr(harvey.config, "load_config", lambda: SimpleNamespace(
+        channels=SimpleNamespace(email=SimpleNamespace(enabled=True)),
+        compliance=ComplianceConfig(postal_address=ADDRESS)))
+    with sqlite3.connect(env["db"]) as db:
+        db.execute("INSERT INTO outbox (id, prospect_id, campaign_id, step, kind, to_email, "
+                   "subject, body, send_at, status) VALUES ('o1', 'p1', 'c1', 1, 'sequence', "
+                   "'a@acme.test', 's', 'b', '2026-01-01T00:00:00', 'pending_review')")
+    body = " ".join(["word"] * 215)  # fits alone, not with the footer
+    r = client.post("/api/outbox/o1/edit", json={"subject": "s", "body": body})
+    assert r.status_code == 400 and "too long" in r.json()["message"]
+
+
+def test_campaigns_carry_the_footer_for_sending_by_hand(client, monkeypatch, env):
+    import harvey.config
+    monkeypatch.setattr(harvey.config, "load_config", lambda: _config(ADDRESS))
+    from tests.test_dashboard_manual_send import _campaign, _prospect
+    _prospect(env, "p1", "a@acme.test", status="queued")
+    _campaign(env, "c1", ["p1"])
+    assert client.get("/api/campaigns").json()[0]["footer"] == ADDRESS + "\n" + LINE

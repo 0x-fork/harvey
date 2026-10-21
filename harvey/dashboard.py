@@ -923,7 +923,11 @@ async def outbox_edit(item_id: str, request: Request):
         # instead of failing quietly at send time. Content rules only: the
         # recipient isn't something an edit can change.
         from harvey.gate import pre_send_check
-        gate = pre_send_check("reviewer@example.com", subject, text)
+        checked = text
+        footer = _compliance_view()["footer"]
+        if item.get("kind") == "sequence" and footer and not text.rstrip().endswith(footer):
+            checked = text.rstrip() + "\n\n" + footer  # as the Sender will send it
+        gate = pre_send_check("reviewer@example.com", subject, checked)
         if not gate:
             return JSONResponse({"success": False,
                                  "message": "The sender would have blocked this: "
@@ -1177,6 +1181,7 @@ async def get_campaigns():
     rows = await query_db("SELECT * FROM campaigns ORDER BY created_at DESC LIMIT 100")
     harvey_sends = _harvey_can_send()
     send_as = "" if harvey_sends else _send_as()
+    footer = _compliance_view()["footer"]
     committed = await _harvey_committed_ids()
     hand_sent = await _hand_sent_ids()
     for row in rows:
@@ -1197,6 +1202,8 @@ async def get_campaigns():
             tuple(ids),
         ) if ids else []
         row["send_as"] = send_as
+        # A cold email sent by hand needs the same footer Harvey adds.
+        row["footer"] = footer
         for r in row["recipients"]:
             r["sent_by_hand"] = r["id"] in hand_sent
             # "I already emailed them": always recordable before Harvey commits.

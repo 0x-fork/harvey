@@ -450,10 +450,12 @@ class Sender:
     def _with_footer(self, body: str) -> str:
         """A cold email as it leaves: the postal address and opt-out line
         underneath (CAN-SPAM). Added at send time, so a changed address
-        applies to mail already queued; never added twice."""
-        footer = "\n".join(
-            line for line in compliance_footer_lines(self.config) if line not in body)
-        return body.rstrip() + "\n\n" + footer if footer else body
+        applies to mail already queued; not added again when the body already
+        ends with it."""
+        footer = "\n".join(compliance_footer_lines(self.config))
+        if not footer or body.rstrip().endswith(footer):
+            return body
+        return body.rstrip() + "\n\n" + footer
 
     def _outgoing_body(self, item: dict) -> str:
         """The exact body that goes out: cold email gets the footer, replies don't."""
