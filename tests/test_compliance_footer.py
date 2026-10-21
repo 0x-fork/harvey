@@ -4,6 +4,7 @@ replies are read without the quoted email they answer.
 Based on community PR #13 by Camilo Cruz.
 """
 
+from contextlib import closing
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -402,7 +403,7 @@ def test_an_edit_the_footer_would_push_over_the_limit_is_refused(client, monkeyp
     monkeypatch.setattr(harvey.config, "load_config", lambda: SimpleNamespace(
         channels=SimpleNamespace(email=SimpleNamespace(enabled=True)),
         compliance=ComplianceConfig(postal_address=ADDRESS)))
-    with sqlite3.connect(env["db"]) as db:
+    with closing(sqlite3.connect(env["db"])) as db, db:
         db.execute("INSERT INTO outbox (id, prospect_id, campaign_id, step, kind, to_email, "
                    "subject, body, send_at, status) VALUES ('o1', 'p1', 'c1', 1, 'sequence', "
                    "'a@acme.test', 's', 'b', '2026-01-01T00:00:00', 'pending_review')")
@@ -462,7 +463,7 @@ async def test_campaign_text_counts_as_ours_without_an_outbox_row(state):
     import sqlite3
     old = 'Reply "unsubscribe" to stop hearing from me.'
     pid = await seed_prospect(state, status="contacted")
-    with sqlite3.connect(state.db_path) as db:
+    with closing(sqlite3.connect(state.db_path)) as db, db:
         db.execute(
             "INSERT INTO campaigns (id, name, channel, sequence_json, prospect_ids_json, status) "
             "VALUES ('c9', 'x', 'email', ?, ?, 'active')",
@@ -543,7 +544,7 @@ async def test_template_lines_with_merge_tags_are_recognised_when_quoted(state):
     import json
     import sqlite3
     pid = await seed_prospect(state, status="contacted")
-    with sqlite3.connect(state.db_path) as db:
+    with closing(sqlite3.connect(state.db_path)) as db, db:
         db.execute(
             "INSERT INTO campaigns (id, name, channel, sequence_json, prospect_ids_json, status) "
             "VALUES ('c9', 'x', 'email', ?, ?, 'active')",
