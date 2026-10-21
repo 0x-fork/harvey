@@ -67,7 +67,9 @@ OPT_OUT_PATTERNS = (
 )
 # "No thanks" (what cold email's footer asks for) as a phrase: not "no
 # Thanksgiving", "Bruno / Thanks," or "yes or no, thanks".
-NO_THANKS_RE = re.compile(r"(?<!\bor )\bno,?[ \t]+thank(?:s|[ \t]+you)\b")
+# Checked one line at a time: "...the answer is no / Thanks!" is a sign-off.
+NO_THANKS_RE = re.compile(
+    r"(?<!\bor )\bno,?[ \t]+thank(?:s|[ \t]+you)\b(?![ \t]+(?:needed|necessary|required))")
 # A reply that says only this (signature aside) is an opt-out ("Reply STOP").
 BARE_OPT_OUTS = {"stop", "unsubscribe", "remove", "remove me", "opt out",
                  "no thanks", "no thank you"}
@@ -134,10 +136,13 @@ class OurText:
         return "\n".join(kept)
 
 
-def _is_opt_out(keyword_text: str, own_words: str) -> bool:
-    """keyword_text: everything they wrote, flattened (phrases can span a
-    line wrap). own_words: their reply without the quote."""
-    if any(p in keyword_text for p in OPT_OUT_PATTERNS) or NO_THANKS_RE.search(keyword_text):
+def _is_opt_out(their_text: str, own_words: str) -> bool:
+    """their_text: everything they wrote, our text removed. own_words: their
+    reply without the quote. Longer phrases match across a line wrap; "no
+    thanks" only within a line."""
+    if any(p in _flat(their_text) for p in OPT_OUT_PATTERNS):
+        return True
+    if any(NO_THANKS_RE.search(_flat(line)) for line in their_text.split("\n")):
         return True
     bare = _flat(_MOBILE_SIGNATURE_RE.sub("", own_words or ""))
     return re.sub(r"[^\w\s-]", "", bare).strip() in BARE_OPT_OUTS
@@ -282,6 +287,7 @@ class Handler:
         compliance = compliance_of(self.config)
         return OurText([
             *await self.state.get_texts_for_prospect(prospect.id),
+            *await self.state.get_footer_history(),
             compliance.postal_address, compliance.opt_out_line, DEFAULT_OPT_OUT_LINE,
         ])
 
@@ -306,7 +312,8 @@ class Handler:
         # without the quoted email. Either way, a line repeating what we
         # sent (our footer says "no thanks") is ours, not theirs.
         ours = await self._our_text(prospect)
-        keyword_text = _flat(ours.remove(reply_text))
+        their_text = ours.remove(reply_text)
+        keyword_text = _flat(their_text)
         stripped = strip_quoted_reply(reply_text) or reply_text
         reply_text = ours.remove(stripped).strip() or stripped
 
@@ -325,7 +332,7 @@ class Handler:
 
         # 1. Classify intent. Hard keyword checks run FIRST and override
         # the LLM — opt-outs and legal threats must never be missed.
-        if _is_opt_out(keyword_text, reply_text):
+        if _is_opt_out(their_text, reply_text):
             intent = "unsubscribe"
         elif any(p in keyword_text for p in ESCALATION_PATTERNS):
             intent = "escalate"

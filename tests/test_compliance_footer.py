@@ -484,7 +484,12 @@ async def test_campaign_text_counts_as_ours_without_an_outbox_row(state):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("body", [
     "Is it month to month, yes or no, thanks",
-], ids=["yes-or-no-comma"])
+    # "no" ending a line, then a "Thanks" sign-off: never joined into a phrase.
+    "Do you require a long contract? Hoping the answer is no\nThanks!\nBob",
+    "Monday works, Tuesday no\nThanks, Jim",
+    "Is it month to month? yes/no\nThanks,\nBob",
+    "Happy to chat Tuesday, no thanks needed for the note!",
+], ids=["yes-or-no-comma", "answer-is-no", "tuesday-no", "yes-slash-no", "no-thanks-needed"])
 async def test_a_question_ending_in_or_no_thanks_is_not_an_opt_out(state, body):
     status, _ = await _reply(state, body)
     assert status != "opted_out"
@@ -495,8 +500,7 @@ async def test_a_question_ending_in_or_no_thanks_is_not_an_opt_out(state, body):
     "STOP\n\nSent from my iPhone",
     "Stop\n\nGet Outlook for iOS",
     "I'd ask that you do not\ncontact me again.",
-    "Appreciate it, but we're set, so no\nthanks.",
-], ids=["stop-iphone", "stop-outlook-ios", "wrapped-do-not-contact", "wrapped-no-thanks"])
+], ids=["stop-iphone", "stop-outlook-ios", "wrapped-do-not-contact"])
 async def test_opt_outs_with_signatures_or_wrapped_lines_are_caught(state, body):
     status, prompts = await _reply(state, body)
     assert status == "opted_out" and prompts == []
@@ -510,3 +514,47 @@ def test_opt_out_line_must_ask_for_a_reply_harvey_catches():
     for good in (LINE, "Reply STOP to opt out.", "Not a fit? Just reply with unsubscribe.",
                  "Reply 'remove me' and you won't hear from me again."):
         assert ComplianceConfig(opt_out_line=good).opt_out_line == good
+
+
+# ── Review round 3 ──
+
+@pytest.mark.asyncio
+async def test_every_footer_harvey_used_stays_ours_after_the_line_changes(state):
+    # Instantly keeps the footer in its own copy; Harvey remembers what it used.
+    old = 'Reply "unsubscribe" to stop hearing from me.'
+    config = SimpleNamespace(
+        channels=SimpleNamespace(email=SimpleNamespace(
+            enabled=True, provider="instantly", require_approval=False,
+            max_daily_sends=50, send_to_risky=False)),
+        compliance=ComplianceConfig(postal_address=ADDRESS, opt_out_line=old))
+    sender = Sender(None, state, config, EnvConfig())
+    sender.instantly = AsyncMock()
+    sender.instantly.set_campaign_emails.return_value = None
+    await sender._deploy_campaign(Campaign(
+        id="c", name="Draft", instantly_campaign_id="existing",
+        sequence=[EmailStep(step=1, subject="a note", body="Would this help?")]))
+    # The line is changed afterwards; a reply quotes the old one.
+    status, _ = await _reply(state, "Yes let's talk.\n\nOn Tue Harvey wrote:\n> Would this help?\n> " + old)
+    assert status != "opted_out"
+
+
+@pytest.mark.asyncio
+async def test_template_lines_with_merge_tags_are_recognised_when_quoted(state):
+    import json
+    import sqlite3
+    pid = await seed_prospect(state, status="contacted")
+    with sqlite3.connect(state.db_path) as db:
+        db.execute(
+            "INSERT INTO campaigns (id, name, channel, sequence_json, prospect_ids_json, status) "
+            "VALUES ('c9', 'x', 'email', ?, ?, 'active')",
+            (json.dumps([{"step": 1, "subject": "hi", "delay_days": 0,
+                          "body": "We help {{company}} attorney offices grow."}]),
+             json.dumps([pid])))
+    provider = FakeProvider()
+    provider.inbound = [InboundMessage(
+        provider_id="in1", from_email="jane@acme.com", subject="Re: hi",
+        body="Yes please.\n\nOn Tue Harvey wrote:\n> We help Acme attorney offices grow.")]
+    handler = make_handler(state, provider, intent="interested")
+    handler.brain = RecordingBrain("interested")
+    await handler._run_native()
+    assert handler.brain.prompts  # our pitch's "attorney" didn't escalate

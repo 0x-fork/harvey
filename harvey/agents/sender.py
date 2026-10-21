@@ -181,6 +181,7 @@ class Sender:
             for step in campaign.sequence
         ]
 
+        await self.state.remember_footer_lines(compliance_footer_lines(self.config))
         result = await self.instantly.set_campaign_emails(campaign_id, sequences)
         if result is None:
             logger.error(f"Sender: Failed to set emails for campaign {campaign_id}")
@@ -658,6 +659,7 @@ class Sender:
                 await asyncio.sleep(random.uniform(*SEND_JITTER_SECONDS))
 
         if sent_cold:
+            await self.state.remember_footer_lines(compliance_footer_lines(self.config))
             notice = compliance_notice(self.config)
             if notice:
                 logger.warning(f"Sender: {notice}")

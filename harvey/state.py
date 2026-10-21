@@ -912,7 +912,7 @@ class StateManager:
             async with db.execute(sql, params) as cursor:
                 return [dict(r) for r in await cursor.fetchall()]
 
-    async def get_texts_for_prospect(self, prospect_id: str, limit: int = 20) -> list[str]:
+    async def get_texts_for_prospect(self, prospect_id: str, limit: int = 50) -> list[str]:
         """Everything Harvey wrote for this person, which a reply may quote
         back: their Outbox emails (a sent one with its footer, whatever it
         said then) and the templates of campaigns they're in (Instantly and
@@ -1563,6 +1563,32 @@ class StateManager:
                 return [dict(r) for r in await cursor.fetchall()]
 
     # ── Settings (operational flags: kill switch, counters) ──
+
+    FOOTER_HISTORY_KEY = "compliance_footer_history"
+
+    async def remember_footer_lines(self, lines) -> None:
+        """Keep every footer line Harvey has sent under a cold email, so a
+        reply quoting an old one (since reworded) is still known as ours."""
+        lines = [l.strip() for l in lines if l and l.strip()]
+        if not lines:
+            return
+        try:
+            known = json.loads(await self.get_setting(self.FOOTER_HISTORY_KEY) or "[]")
+        except (json.JSONDecodeError, TypeError):
+            known = []
+        if not isinstance(known, list):
+            known = []
+        merged = [l for l in known if isinstance(l, str)]
+        merged += [l for l in lines if l not in merged]
+        if merged != known:
+            await self.set_setting(self.FOOTER_HISTORY_KEY, json.dumps(merged[-50:]))
+
+    async def get_footer_history(self) -> list[str]:
+        try:
+            known = json.loads(await self.get_setting(self.FOOTER_HISTORY_KEY) or "[]")
+        except (json.JSONDecodeError, TypeError):
+            return []
+        return [l for l in known if isinstance(l, str)] if isinstance(known, list) else []
 
     async def get_setting(self, key: str, default: str = "") -> str:
         async with self._connect() as db:

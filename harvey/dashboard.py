@@ -1114,6 +1114,10 @@ async def mark_prospect_sent(prospect_id: str, request: Request):
             # What marking sent cancelled comes back for review, never straight out.
             changed = await state.restore_hand_cancelled_outbox(
                 prospect_id, reason=HAND_SENT_REASON)
+        if sent:
+            # Open in Gmail adds today's footer; remember it as Harvey's text.
+            footer = _compliance_view()["footer"]
+            await state.remember_footer_lines(footer.split("\n"))
         await state.log_action(
             action_type="manual_send" if sent else "manual_send_undone",
             agent="user",
