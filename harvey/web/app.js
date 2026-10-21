@@ -42,6 +42,22 @@ function escHtml(s) {
   ));
 }
 
+// A value placed inside an onclick handler as a JS string: JSON-quote it,
+// then escape for the attribute (escHtml alone is undone before the JS runs).
+function jsq(v) {
+  return escHtml(JSON.stringify(String(v ?? '')));
+}
+
+// The reason a failed action gave, or a fallback when it gave none.
+function failMsg(data, fallback) {
+  return (data && (data.message || data.error || data.detail)) || fallback;
+}
+
+// Lookup tables keyed by stored strings: "constructor" must not hit Object's.
+function own(table, key) {
+  return Object.prototype.hasOwnProperty.call(table, key) ? table[key] : undefined;
+}
+
 // Links built from collected data (websites, profiles) open only as http(s):
 // a javascript: URL from a scraped page must never run in the dashboard.
 function safeHref(u) {
@@ -107,11 +123,12 @@ const STATUS = {
   // runs
   running:        ['Running', 'active'],
   stale:          ['Stale', 'bad'],
+  stalled:        ['Stopped', 'bad'],
 };
 
 function statusMeta(status) {
   const key = String(status || '').toLowerCase().replace(/[^a-z0-9]+/g, '_');
-  const hit = STATUS[key];
+  const hit = own(STATUS, key);
   if (hit) return { label: hit[0], tone: hit[1] };
   const label = String(status || 'unknown').replace(/_/g, ' ');
   return { label: label.charAt(0).toUpperCase() + label.slice(1), tone: 'idle' };
@@ -125,7 +142,9 @@ function badge(status) {
 function formatDate(d) {
   if (!d) return '';
   try {
-    const dt = new Date(d);
+    let t = String(d).trim().replace(' ', 'T');
+    if (/^\d{4}-\d\d-\d\dT/.test(t) && !/[zZ]$|[+-]\d\d:?\d\d$/.test(t)) t += 'Z';  // stored UTC
+    const dt = new Date(t);
     if (isNaN(dt)) return escHtml(d);
     return dt.toLocaleString('en-US', {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
   } catch { return escHtml(d); }
@@ -140,7 +159,8 @@ function icon(name, cls) {
 
 function initials(first, last) {
   const a = String(first || '').trim(), b = String(last || '').trim();
-  const s = (a.charAt(0) + b.charAt(0)) || a.slice(0, 2) || '?';
+  const ch = x => Array.from(x)[0] || '';  // whole characters, not UTF-16 halves
+  const s = (ch(a) + ch(b)) || '?';
   return escHtml(s.toUpperCase());
 }
 
@@ -157,11 +177,15 @@ function relTime(d) {
   const dt = parseTs(d);
   if (isNaN(dt)) return escHtml(d);
   const mins = Math.round((Date.now() - dt) / 60000);
-  if (mins < 1) return 'just now';
-  if (mins < 60) return mins + 'm ago';
-  if (mins < 60 * 24) return Math.round(mins / 60) + 'h ago';
-  if (mins < 60 * 48) return 'Yesterday';
-  return dt.toLocaleDateString('en-US', {month: 'short', day: 'numeric'});
+  if (mins < -1 && mins > -60) return 'in ' + -mins + 'm';
+  if (mins < -1 && mins > -60 * 24) return 'in ' + Math.round(-mins / 60) + 'h';
+  if (mins >= -1 && mins < 1) return 'just now';
+  if (mins >= 1 && mins < 60) return mins + 'm ago';
+  if (mins >= 60 && mins < 60 * 24) return Math.round(mins / 60) + 'h ago';
+  if (mins >= 60 * 24 && mins < 60 * 48) return 'Yesterday';
+  const opts = {month: 'short', day: 'numeric'};
+  if (dt.getFullYear() !== new Date().getFullYear()) opts.year = 'numeric';
+  return dt.toLocaleDateString('en-US', opts);
 }
 
 function dayLabel(d) {
@@ -240,6 +264,9 @@ function actionText(a) {
     case 'manual_send': return 'You marked a contact as emailed by hand';
     case 'manual_send_undone': return 'You undid a hand-sent mark';
     case 'outbox_edited': return 'You edited a draft';
+    case 'conversation_status':
+      return d.to === 'closed' ? 'You closed a conversation'
+        : d.from === 'needs_human' ? 'You handed a conversation back to Harvey' : 'You reopened a conversation';
   }
   const text = escHtml(String(a.action_type || '').replace(/_/g, ' '));
   return a.agent === 'main' ? 'Heartbeat: ' + text : text;
@@ -260,7 +287,13 @@ async function api(path, opts) {
   try {
     const r = await authFetch(path, opts);
     if (await lockIfRefused(r)) return null;
-    if (!r.ok) return null;
+    if (!r.ok) {
+      // An action the server refused says why ("a run is already going");
+      // pass that body on so the toast can show it. Reads stay null.
+      if (!opts || !opts.method || opts.method === 'GET') return null;
+      const body = await r.json().catch(() => null);
+      return body && typeof body === 'object' ? {success: false, ...body} : null;
+    }
     return await r.json();
   } catch {
     return null;
@@ -392,9 +425,17 @@ async function loadToday() {
   const data = await api('/api/today');
   const el = document.getElementById('today-queue');
   if (!data) { el.innerHTML = offlineState(); return; }
+  if (data.error) {
+    // A failed check must never read as "Nothing needs you".
+    el.innerHTML = emptyState(icon('alert'), 'Couldn\'t check what needs you',
+      'The dashboard hit an error reading Harvey\'s data: ' + escHtml(data.error));
+    return;
+  }
 
   navCount('nav-today', (data.items || []).filter(i => i.tone !== 'good').length);
   navCount('nav-outbox', (data.stats || {}).outbox_pending || 0);
+  navCount('nav-signals', (data.stats || {}).signals_proposed || 0);
+  navCount('nav-conversations', (data.stats || {}).needs_human || 0);
   _todayStats = data.stats || {};
   renderFigures(_todayStats);
 
@@ -418,7 +459,7 @@ async function loadToday() {
         '<div class="qtitle">' + escHtml(it.title) + '</div>' +
         '<div class="qdetail">' + escHtml(it.detail) + '</div>' +
       '</div>' +
-      '<button class="btn btn-secondary btn-sm" onclick="goTab(\'' + escHtml(it.tab) + '\')">' +
+      '<button class="btn btn-secondary btn-sm" onclick="goTab(' + jsq(it.tab) + ')">' +
         escHtml(it.action) + icon('arrow') + '</button>' +
     '</div>';
   }).join('') + '</div>';
@@ -469,7 +510,9 @@ async function loadLiveStatus() {
       '<span class="setup-pct">Cost so far $' + Number(d.cost_usd || 0).toFixed(2) + '</span></div>' +
     stoppedHtml +
     '<div class="steps">' + rows + '</div>' +
-    (d.next ? '<div class="live-next">' + icon('arrow') + '<span><b>Next</b> · ' + escHtml(d.next) + '</span></div>' : '') +
+    (d.next ? '<div class="live-next">' + icon('arrow') + '<span><b>Next</b> · ' + escHtml(d.next) + '</span>' +
+      (d.next_tab ? '<button class="btn btn-secondary btn-sm" onclick="goTab(' + jsq(d.next_tab) + ')">Go</button>' : '') +
+      '</div>' : '') +
     '<div class="live-flag">Updated ' + new Date().toLocaleTimeString() + ' · refreshes every 10 seconds</div>';
 }
 
@@ -485,15 +528,29 @@ function renderFigures(stats) {
     '<div class="kpi-main"><span class="kpi-value' + (value ? '' : ' zero') + '">' + value + '</span>' + spark + '</div>' +
     '<span class="kpi-note">' + note + '</span></div>';
 
+  // Instantly sends from its own servers, so the Outbox never sees them.
+  const sent = stats.email_provider === 'instantly'
+    ? card('Emails sent', '&mdash;', '', 'Instantly tracks sends')
+    : card('Emails sent', sum(t.sent), sparkBars(t.sent, 'Emails sent per day, last 14 days'),
+           'last 14 days · <b>' + (stats.outbox_approved || 0) + '</b> scheduled');
+  const waiting = (stats.outbox_pending || 0) + (stats.needs_human || 0);
+  const waitNote = [
+    stats.outbox_pending ? stats.outbox_pending + ' to approve' : '',
+    stats.needs_human ? stats.needs_human + ' handed to you' : '',
+  ].filter(Boolean).join(' · ') || 'nothing to approve';
+  const facts = document.getElementById('today-facts');
+  if (facts) facts.innerHTML =
+    '<span><b>' + (stats.companies || 0) + '</b> companies</span>' +
+    '<span><b>' + (stats.unprofiled || 0) + '</b> sites not read yet</span>' +
+    '<span><b>' + (stats.signals_confirmed || 0) + '</b> signals on</span>';
+
   el.innerHTML = '<div class="kpis">' +
     card('Contacts found', stats.prospects || 0, sparkBars(t.found, 'Contacts found per day, last 14 days'),
          '<b>+' + last7(t.found) + '</b> this week') +
-    card('Emails sent', sum(t.sent), sparkBars(t.sent, 'Emails sent per day, last 14 days'),
-         'last 14 days · <b>' + (stats.outbox_approved || 0) + '</b> scheduled') +
+    sent +
     card('Conversations', stats.open_conversations || 0, sparkBars(t.replies, 'New replies per day, last 14 days'),
          '<b>' + sum(t.replies) + '</b> new in 14 days') +
-    card('Waiting on you', stats.outbox_pending || 0, '',
-         stats.outbox_pending ? 'drafts in the Outbox' : 'nothing to approve') +
+    card('Waiting on you', waiting, '', waitNote) +
   '</div>';
 }
 
@@ -501,7 +558,7 @@ let _todayStats = {};
 let _trend = null;
 
 async function loadTrend() {
-  const t = await api('/api/trend?days=14');
+  const t = await api('/api/trend?days=14&tz=' + -new Date().getTimezoneOffset());
   if (t && Array.isArray(t.days)) { _trend = t; renderFigures(_todayStats); }
 }
 
@@ -510,18 +567,17 @@ async function loadFunnel() {
   const el = document.getElementById('today-figures');
   if (!el) return;
   const data = await api('/api/stats');
-  if (!data || data.error) { el.innerHTML = '<p class="muted" style="font-size:13px">No contacts yet.</p>'; return; }
-  const by = (data.prospects || {}).by_status || {};
+  if (!data) return;  // offline: keep the last numbers; Today's queue says so
+  if (data.error) { el.innerHTML = '<p class="muted" style="font-size:13px">Couldn\'t read the pipeline.</p>'; return; }
   const total = (data.prospects || {}).total || 0;
-  const n = keys => keys.reduce((x, k) => x + (by[k] || 0), 0);
-  const known = ['new', 'queued', 'contacted', 'replied', 'interested', 'meeting'];
+  const pipe = data.pipeline || {};
   const stages = [
-    ['To write', n(['new', 'queued']), 'c-accent-soft'],
-    ['Contacted', n(['contacted']), 'c-accent'],
-    ['Replied', n(['replied']), 'c-active'],
-    ['Interested', n(['interested']), 'c-good'],
-    ['Meeting booked', n(['meeting']), 'c-note'],
-    ['Closed out', total - n(known), 'c-idle'],
+    ['To write', pipe.to_write || 0, 'c-accent-soft'],
+    ['Contacted', pipe.contacted || 0, 'c-accent'],
+    ['Replied', pipe.replied || 0, 'c-active'],
+    ['Interested', pipe.interested || 0, 'c-good'],
+    ['Ready to meet', pipe.ready_to_meet || 0, 'c-note'],
+    ['Closed out', pipe.closed_out || 0, 'c-idle'],
   ];
   if (!total) {
     el.innerHTML = '<p class="muted" style="font-size:13px">No contacts yet. Scout adds them as it finds people.</p>';
@@ -543,15 +599,18 @@ async function loadTodayActivity() {
   const el = document.getElementById('today-activity');
   if (!el) return;
   const data = await api('/api/activity');
-  if (!Array.isArray(data) || !data.length) {
+  if (!Array.isArray(data)) return;  // offline: Today's queue says so
+  // Heartbeats are noise here; the Activity tab keeps them.
+  const shown = data.filter(a => a.agent !== 'main').slice(0, 8);
+  if (!shown.length) {
     el.innerHTML = '<p class="muted" style="font-size:13px">' +
       'Nothing yet. Every action Harvey takes shows up here.</p>';
     return;
   }
-  el.innerHTML = '<div class="timeline">' + data.filter(a => a.agent !== 'main').slice(0, 8).map(a =>
+  el.innerHTML = '<div class="timeline">' + shown.map(a =>
     '<div class="tl-item">' +
       '<span class="tl-time">' + relTime(a.created_at) + '</span>' +
-      '<span class="tl-icon">' + icon(AGENT_ICONS[a.agent] || 'activity') + '</span>' +
+      '<span class="tl-icon">' + icon(own(AGENT_ICONS, a.agent) || 'activity') + '</span>' +
       '<span class="tl-text">' + actionText(a) + '</span>' +
       '<span class="tl-agent">' + escHtml(a.agent) + '</span>' +
     '</div>').join('') + '</div>';
@@ -653,7 +712,9 @@ async function loadSignals() {
     ).join('') + '</div></div>';
 
   grpEl.innerHTML = (data.groups || []).map(g => {
-    const codes = g.signals.map(x => x.code);
+    // Only the undecided ones: "Confirm all" must never re-enable a signal
+    // you turned off (or "Skip all" turn off one you confirmed).
+    const pending = escHtml(JSON.stringify(g.signals.filter(x => x.status === 'proposed').map(x => x.code)));
     const undecided = g.signals.filter(x => x.status === 'proposed').length;
     return '<div class="sig-group">' +
       '<div class="sig-group-head"><div>' +
@@ -661,10 +722,10 @@ async function loadSignals() {
       '</div>' +
       (undecided
         ? '<div style="display:flex;gap:6px;flex-shrink:0">' +
-            '<button class="btn btn-primary btn-sm" onclick=\'setSignals(' +
-              JSON.stringify(codes) + ", \"confirmed\")'>Confirm all " + undecided + '</button>' +
-            '<button class="btn btn-secondary btn-sm" onclick=\'setSignals(' +
-              JSON.stringify(codes) + ", \"rejected\")'>Skip all</button>" +
+            '<button class="btn btn-primary btn-sm" onclick="setSignals(' + pending +
+              ', \'confirmed\')">Confirm all ' + undecided + '</button>' +
+            '<button class="btn btn-secondary btn-sm" onclick="setSignals(' + pending +
+              ', \'rejected\')">Skip all ' + undecided + '</button>' +
           '</div>'
         : '') +
       '</div>' +
@@ -686,15 +747,15 @@ function sigRow(sig) {
       Math.round(sig.confidence_floor * 100) + '% confidence</span>' : '';
 
   const decide = sig.status === 'confirmed'
-    ? '<button class="btn btn-secondary btn-sm" onclick="setSignals([\'' + sig.code +
-        '\'],\'rejected\')">Turn off</button>'
+    ? '<button class="btn btn-secondary btn-sm" onclick="setSignals([' + jsq(sig.code) +
+        '],\'rejected\')">Turn off</button>'
     : sig.status === 'rejected'
-      ? '<button class="btn btn-secondary btn-sm" onclick="setSignals([\'' + sig.code +
-          '\'],\'confirmed\')">Turn on</button>'
-      : '<button class="btn btn-primary btn-sm" onclick="setSignals([\'' + sig.code +
-          '\'],\'confirmed\')">Confirm</button>' +
-        '<button class="btn btn-secondary btn-sm" onclick="setSignals([\'' + sig.code +
-          '\'],\'rejected\')">Skip</button>';
+      ? '<button class="btn btn-secondary btn-sm" onclick="setSignals([' + jsq(sig.code) +
+          '],\'confirmed\')">Turn on</button>'
+      : '<button class="btn btn-primary btn-sm" onclick="setSignals([' + jsq(sig.code) +
+          '],\'confirmed\')">Confirm</button>' +
+        '<button class="btn btn-secondary btn-sm" onclick="setSignals([' + jsq(sig.code) +
+          '],\'rejected\')">Skip</button>';
 
   return '<div class="sig-row ' + (sig.status === 'rejected' ? 'rejected' : '') + '">' +
     '<div class="sig-main">' +
@@ -724,7 +785,7 @@ async function setSignals(codes, status) {
         : data.changed + ' signal' + (data.changed === 1 ? '' : 's') + ' turned off.',
       'success');
   } else {
-    showToast('Could not update that signal.', 'error');
+    showToast(failMsg(data, 'Could not update that signal.'), 'error');
   }
   loadSignals();
 }
@@ -745,7 +806,7 @@ async function loadDiscoverProviders() {
       ? '<span class="badge t-good">ready</span>'
       : '<span class="badge t-waiting">needs a key</span>';
     return '<div class="prov-card ' + (p.key === _provider ? 'selected' : '') +
-      '" onclick="pickProvider(\'' + p.key + '\')">' +
+      '" onclick="pickProvider(' + jsq(p.key) + ')">' +
       '<div class="prov-head"><h3>' + escHtml(p.label) + '</h3>' + ready + '</div>' +
       '<div class="blurb">' + escHtml(p.blurb) + '</div>' +
       '<div class="row"><span class="k">Cost</span><span class="v">' +
@@ -763,7 +824,9 @@ async function loadDiscoverProviders() {
   }).join('') + '</div>';
 
   const running = data.running;
-  document.getElementById('disc-stop').style.display = running ? '' : 'none';
+  // Reading sites can't be stopped part-way; only a discovery run can.
+  document.getElementById('disc-stop').style.display = running && data.running_kind !== 'profile' ? '' : 'none';
+  renderProfileCard(data.unprofiled || 0, running);
   if (running && !_discoverPoll) {
     _discoverPoll = setInterval(loadDiscoverProviders, 4000);
   } else if (!running && _discoverPoll) {
@@ -773,7 +836,7 @@ async function loadDiscoverProviders() {
     const btn = document.getElementById('disc-run');
     btn.disabled = true;
     btn.textContent = 'Estimate first';
-    showToast('Discovery finished.', 'success');
+    showToast(data.running_kind === 'profile' ? 'Finished reading websites.' : 'Discovery finished.', 'success');
   }
   renderDiscoverResult(data.last_report, running);
 }
@@ -852,7 +915,34 @@ async function runDiscovery() {
 async function stopDiscovery() {
   const data = await api('/api/discover/stop', {method: 'POST'});
   showToast(data && data.success ? 'Stopping after the current query.'
-                                 : 'Could not stop.', data ? 'success' : 'error');
+                                 : failMsg(data, 'Could not stop.'), data && data.success ? 'success' : 'error');
+  loadDiscoverProviders();
+}
+
+// Companies found but not looked at: reading their sites is free and
+// model-free, and it is what makes an email specific.
+function renderProfileCard(pending, running) {
+  const el = document.getElementById('discover-profile');
+  if (!el) return;
+  if (!pending) { el.innerHTML = ''; return; }
+  el.innerHTML = '<div class="subhead">Read websites</div><div class="card"><div class="queue-item good" style="padding:0;border:0;box-shadow:none">' +
+    '<div class="qtext"><div class="qtitle">' + pending + ' compan' + (pending === 1 ? 'y' : 'ies') +
+    ' not looked at yet</div><div class="qdetail">Free, no account needed. Harvey reads each site for ' +
+    'who their agency is, what they are missing, and whether they run ads. Up to 200 per run.</div></div>' +
+    '<button class="btn btn-primary btn-sm" onclick="runProfile(this)"' + (running ? ' disabled' : '') + '>' +
+    (running ? 'Busy…' : 'Read their sites') + '</button></div></div>';
+}
+
+async function runProfile(btn) {
+  btn.disabled = true;
+  btn.textContent = 'Starting…';
+  const data = await api('/api/profile/run', {method: 'POST'});
+  if (data && data.success) {
+    showToast(data.pending ? 'Reading ' + Math.min(data.pending, 200) + ' websites.' : 'Every site is already read.', 'success');
+    if (data.pending && !_discoverPoll) _discoverPoll = setInterval(loadDiscoverProviders, 4000);
+  } else {
+    showToast(failMsg(data, 'Could not start.'), 'error');
+  }
   loadDiscoverProviders();
 }
 
@@ -871,12 +961,21 @@ function renderDiscoverResult(report, running) {
     '<div class="value"' + (tone ? ' style="color:var(--' + tone + ')"' : '') + '>' +
     value + '</div></div>';
 
+  if (report.profiled_companies !== undefined && report.new_companies === undefined) {
+    el.innerHTML = '<div class="subhead">Last run</div><div class="stats-grid">' +
+      stat('Websites read', report.profiled_companies || 0, 'accent') +
+      stat('Facts recorded', report.profile_observations || 0) +
+      stat('Cost', 'free') + '</div>' +
+      (report.stopped ? '<div class="test-result error" style="margin-top:14px">Stopped early: ' + escHtml(report.stopped) + '</div>' : '');
+    return;
+  }
   el.innerHTML = '<div class="subhead">Last run</div>' +
     '<div class="stats-grid">' +
       stat('New companies', report.new_companies || 0, 'accent') +
       stat('Already known', report.known_companies || 0) +
       stat('Observations', report.observations || 0) +
       stat('Filtered as junk', report.junk || 0) +
+      (report.profiled_companies ? stat('Websites read', report.profiled_companies) : '') +
       stat('Actual cost', report.actual_cost ? '$' + report.actual_cost.toFixed(4) : 'free') +
     '</div>' +
     (report.stopped ? '<div class="test-result error" style="margin-top:14px">' +
@@ -917,7 +1016,7 @@ function renderCohortBuilder() {
     confirmed.map(s =>
       '<label class="cohort-pick"><input type="checkbox" ' +
         (_cohort[key].has(s.code) ? 'checked ' : '') +
-        'onchange="toggleCohort(\'' + key + '\',\'' + s.code + '\',this.checked)">' +
+        'onchange="toggleCohort(\'' + key + '\',' + jsq(s.code) + ',this.checked)">' +
         '<span>' + escHtml(s.label || s.code) + '</span>' +
         '<span class="n">' + (s.companies || 0) + '</span></label>'
     ).join('') + '</div></div>';
@@ -954,7 +1053,10 @@ async function runCohort() {
                           offset: offset, limit: COHORT_PAGE}),
   });
   if (generation !== _cohortGeneration) return;
-  if (!data) { el.innerHTML = ''; return; }
+  if (!data || data.error) {
+    el.innerHTML = data ? '<div class="test-result error">' + escHtml(data.error) + '</div>' : '';
+    return;
+  }
 
   let html = '<div style="border-top:1px solid var(--border);margin-top:20px;padding-top:20px">' +
     '<div class="cohort-size">' + data.size + '</div>' +
@@ -1121,8 +1223,11 @@ async function saveEnv(payload, okMsg) {
   else showToast((data && data.message) || 'Save failed — is the dashboard still running?', 'error');
 }
 
+// Secrets are only sent when typed: an empty box means "keep the saved one".
 function saveInstantly() {
-  saveEnv({INSTANTLY_API_KEY: document.getElementById('instantly-key').value.trim()}, 'Instantly API key saved.');
+  const key = document.getElementById('instantly-key').value.trim();
+  if (!key) { showToast('Enter a new key first. The saved one is kept.', 'error'); return; }
+  saveEnv({INSTANTLY_API_KEY: key}, 'Instantly API key saved.');
 }
 
 function saveLinkedIn() {
@@ -1133,10 +1238,10 @@ function saveLinkedIn() {
 }
 
 function saveCloudflare() {
-  saveEnv({
-    CLOUDFLARE_ACCOUNT_ID: document.getElementById('cf-account-id').value.trim(),
-    CLOUDFLARE_API_TOKEN: document.getElementById('cf-api-token').value.trim()
-  }, 'Cloudflare credentials saved.');
+  const payload = {CLOUDFLARE_ACCOUNT_ID: document.getElementById('cf-account-id').value.trim()};
+  const token = document.getElementById('cf-api-token').value.trim();
+  if (token) payload.CLOUDFLARE_API_TOKEN = token;
+  saveEnv(payload, 'Cloudflare credentials saved.');
 }
 
 async function testInstantly() {
@@ -1151,7 +1256,7 @@ async function testInstantly() {
     el.innerHTML = '<div class="test-result error">Could not reach the dashboard server.</div>';
     return;
   }
-  el.innerHTML = '<div class="test-result ' + (data.success ? 'success' : 'error') + '">' + escHtml(data.message) + '</div>';
+  el.innerHTML = '<div class="test-result ' + (data.success ? 'success' : 'error') + '">' + escHtml(failMsg(data, '')) + '</div>';
 }
 
 // ── Controls ──
@@ -1223,35 +1328,6 @@ async function loadLogs() {
 
 // ── Pipeline data ──
 
-async function loadStats() {
-  const grid = document.getElementById('stats-grid');
-  const data = await api('/api/stats');
-  if (!data) { grid.innerHTML = offlineState(); return; }
-  if (data.error) {
-    grid.innerHTML = emptyState('&#9670;', 'No pipeline data yet',
-      'Start Harvey from the <b>Controls</b> tab and it will begin prospecting, writing, and sending on its own.');
-    return;
-  }
-  const p = data.prospects || {}, c = data.campaigns || {}, v = data.conversations || {};
-  const chips = (map) => {
-    const entries = Object.entries(map || {});
-    if (!entries.length) return '<span class="chip muted">none yet</span>';
-    return entries.map(([k, n]) =>
-      '<span class="chip">' + escHtml(k) + ' <b>' + escHtml(String(n)) + '</b></span>'
-    ).join('');
-  };
-  const card = (label, value, breakdown) =>
-    '<div class="stat-card"><div class="label">' + label + '</div>' +
-    '<div class="value">' + value + '</div>' +
-    '<div class="breakdown">' + breakdown + '</div></div>';
-
-  grid.innerHTML =
-    card('Prospects', p.total || 0, chips(p.by_status)) +
-    card('Campaigns', c.total || 0, chips(c.by_status)) +
-    card('Conversations', v.total || 0, chips(v.by_status)) +
-    card('Actions Logged', data.actions_total || 0, brainCallChips(data));
-}
-
 // Calls today per subscription — each labelled with the provider it ran on.
 function brainCallChips(data) {
   const chip = (label, n) => '<span class="chip">' + label + ' calls today <b>' + escHtml(String(n || 0)) + '</b></span>';
@@ -1282,7 +1358,7 @@ function emailTag(p) {
   if (!p.email) return '';
   // Fall back to the legacy boolean for rows predating email_status.
   const status = p.email_status || (p.email_verified ? 'verified' : 'guess');
-  if (!STATUS[status]) return '';
+  if (!own(STATUS, status)) return '';
   const m = statusMeta(status);
   return ' <span class="mini t-' + m.tone + '" title="Email ' + escHtml(m.label.toLowerCase()) + '">' +
     escHtml(m.label) + '</span>';
@@ -1411,6 +1487,12 @@ async function loadOutbox() {
   const list = document.getElementById('outbox-list');
   const actions = document.getElementById('outbox-actions');
   if (!data) { desk.innerHTML = offlineState(); list.innerHTML = ''; return; }
+  if (data.error) {
+    // Never let a failed read pass for "Nothing to review".
+    desk.innerHTML = emptyState(icon('alert'), 'Couldn\'t read the Outbox', escHtml(data.error));
+    list.innerHTML = '';
+    return;
+  }
 
   const pending = data.pending || [];
   _desk.items = pending;
@@ -1441,7 +1523,9 @@ async function loadOutbox() {
     ? '<div class="banner bad">' + icon('alert') + '<div><b>Sending is paused</b>' +
         '<p>' + escHtml(data.paused) + '. Approved mail stays queued until you resume.</p></div></div>'
     : '';
-  if (data.compliance_notice) {
+  // Only once there is mail to warn about: a fresh install sends nothing.
+  const anyMail = pending.length || (data.approved || []).length || (data.sent || []).length;
+  if (data.compliance_notice && anyMail) {
     banner.innerHTML +=
       '<div class="banner wait">' + icon('alert') + '<div><b>Add your postal address</b>' +
         '<p>' + escHtml(data.compliance_notice) + '</p></div></div>';
@@ -1455,7 +1539,7 @@ async function loadOutbox() {
   const table = (title, rows, cols) => {
     if (!rows || !rows.length) return '';
     let h = '<div class="subhead">' + title + ' <span class="hint">' + rows.length + '</span></div>' +
-      '<div class="table-card"><table><thead><tr>' +
+      '<div class="table-card"><table class="nowrap clip"><thead><tr>' +
       cols.map(c => '<th>' + c[0] + '</th>').join('') + '</tr></thead><tbody>';
     for (const r of rows) {
       h += '<tr>' + cols.map(c => '<td' + (c[2] ? ' class="muted"' : '') + '>' +
@@ -1550,13 +1634,13 @@ function renderDesk(items, i) {
     ? '<div class="desk-footer" title="Added when it sends (compliance in harvey.yaml)">' +
         escHtml(added) + '</div>' : '';
   const actions = editing
-    ? '<button class="btn btn-primary" onclick="deskSave(\'' + cur.id + '\')">Save</button>' +
+    ? '<button class="btn btn-primary" onclick="deskSave(' + jsq(cur.id) + ')">Save</button>' +
       '<button class="btn btn-secondary" onclick="deskEdit(null)">Cancel</button>'
-    : '<button class="btn btn-primary" onclick="outboxAct(\'' + cur.id + '\',\'approve\')">' +
+    : '<button class="btn btn-primary" onclick="outboxAct(' + jsq(cur.id) + ',\'approve\')">' +
         'Approve <kbd>A</kbd></button>' +
-      '<button class="btn btn-secondary" onclick="deskEdit(\'' + cur.id + '\')">' +
+      '<button class="btn btn-secondary" onclick="deskEdit(' + jsq(cur.id) + ')">' +
         'Edit <kbd>E</kbd></button>' +
-      '<button class="btn btn-secondary" onclick="outboxAct(\'' + cur.id + '\',\'reject\')">' +
+      '<button class="btn btn-secondary" onclick="outboxAct(' + jsq(cur.id) + ',\'reject\')">' +
         'Reject <kbd>R</kbd></button>';
 
   return '<div class="desk">' +
@@ -1652,7 +1736,7 @@ async function outboxAct(id, action) {
   if (deskBusy()) return;
   const data = await api('/api/outbox/' + encodeURIComponent(id) + '/' + action, {method: 'POST'});
   if (data && data.success) showToast(action === 'approve' ? 'Approved — will send on schedule.' : 'Rejected.', 'success');
-  else showToast('Action failed.', 'error');
+  else showToast(failMsg(data, 'Action failed.'), 'error');
   loadOutbox();
 }
 
@@ -1660,14 +1744,14 @@ async function outboxApproveAll() {
   if (deskBusy()) return;
   const data = await api('/api/outbox/approve-all', {method: 'POST'});
   if (data && data.success) showToast('Approved ' + data.approved + ' email(s).', 'success');
-  else showToast('Approve-all failed.', 'error');
+  else showToast(failMsg(data, 'Approve-all failed.'), 'error');
   loadOutbox();
 }
 
 async function sendingToggle(action) {
   const data = await api('/api/sending/' + action, {method: 'POST'});
   if (data && data.success) showToast(action === 'pause' ? 'Sending paused.' : 'Sending resumed.', 'success');
-  else showToast('Failed.', 'error');
+  else showToast(failMsg(data, action === 'pause' ? 'Could not pause sending.' : 'Could not resume sending.'), 'error');
   loadOutbox();
 }
 
@@ -1679,7 +1763,8 @@ async function loadCompanies() {
   _companies = data;
   if (!data.length) {
     el.innerHTML = emptyState(icon('companies'), 'No companies yet',
-      'Harvey\'s Scout agent hasn\'t researched any companies. Finish <b>Setup</b>, then start Harvey from the <b>Controls</b> tab.');
+      'Confirm your <b>Signals</b>, then find businesses on the <b>Discover</b> tab. ' +
+      'OpenStreetMap is free and needs no account.');
     return;
   }
   let html = '<div class="table-card"><table class="nowrap"><thead><tr><th>Company</th><th>Industry</th>' +
@@ -1740,7 +1825,7 @@ async function submitFeedback(entityType, entityId, promptText) {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({entity_type: entityType, entity_id: entityId, comment: comment})
   });
-  if (data && data.success) showToast('Feedback saved. Harvey will take it into account.', 'success');
+  if (data && data.success) showToast('Feedback saved.', 'success');
   else showToast((data && data.message) || 'Could not save feedback.', 'error');
 }
 
@@ -1782,6 +1867,8 @@ async function loadProspects() {
         'aria-label="Search contacts" oninput="_contactQuery=this.value;renderContacts()"></label>' +
       '<div class="segmented" id="contact-filters" role="group" aria-label="Filter by status"></div>' +
       '</div><div id="contact-rows"></div>';
+    // A rebuild after an offline blip must show the search still applied.
+    document.getElementById('contact-search').value = _contactQuery;
   }
   renderContacts();
 }
@@ -1800,14 +1887,14 @@ function renderContacts() {
   const rowsEl = document.getElementById('contact-rows');
   const filtersEl = document.getElementById('contact-filters');
   if (!rowsEl) return;
+  const q = _contactQuery.trim().toLowerCase();
+  const found = p => !q || [p.first_name, p.last_name, p.company, p.email, p.title].join(' ').toLowerCase().includes(q);
   filtersEl.innerHTML = CONTACT_FILTERS.map(f =>
-    '<button class="' + (f[0] === _contactFilter ? 'on' : '') + '" onclick="setContactFilter(\'' + f[0] + '\')">' +
-      f[1] + ' <span class="n">' + _prospects.filter(p => contactMatches(p, f[0])).length + '</span></button>'
+    '<button class="' + (f[0] === _contactFilter ? 'on' : '') + '" aria-pressed="' + (f[0] === _contactFilter) + '" onclick="setContactFilter(\'' + f[0] + '\')">' +
+      f[1] + ' <span class="n">' + _prospects.filter(p => contactMatches(p, f[0]) && found(p)).length + '</span></button>'
   ).join('');
 
-  const q = _contactQuery.trim().toLowerCase();
-  const rows = _prospects.map((p, i) => [p, i]).filter(([p]) => contactMatches(p, _contactFilter) &&
-    (!q || [p.first_name, p.last_name, p.company, p.email, p.title].join(' ').toLowerCase().includes(q)));
+  const rows = _prospects.map((p, i) => [p, i]).filter(([p]) => contactMatches(p, _contactFilter) && found(p));
   if (!rows.length) {
     rowsEl.innerHTML = '<div class="table-card">' + emptyState(icon('discover'), 'No matches',
       'Nothing matches that search and filter.') + '</div>';
@@ -1821,7 +1908,9 @@ function renderContacts() {
         '<span class="cell-sub">' + escHtml(p.title) + '</span></div></div></td>' +
       '<td>' + escHtml(p.company) + '</td>' +
       '<td><div class="cell-stack"><span>' + escHtml(p.email) + '</span>' +
-        '<span class="cell-sub">' + emailTag(p) + (p.phone ? ' · ' + escHtml(p.phone) : '') + '</span>' +
+        '<span class="cell-sub">' + [emailTag(p).trim(), p.phone ? escHtml(p.phone) +
+          (p.phone_verified ? ' <span class="verified" title="Phone verified">&#10003;</span>' : '') : '']
+          .filter(Boolean).join(' · ') + '</span>' +
         '</div></td>' +
       '<td>' + (p.score || p.score === 0 ? meterHtml(p.score) : '') + '</td>' +
       '<td>' + badge(p.status) + '</td>' +
@@ -1904,6 +1993,7 @@ async function markSent(ci, ri, sent) {
   const ok = !!(res && res.success);
   if (!ok) showToast((res && res.message) || 'Could not save that. Try again.', 'error');
   else if (!sent && res.sent) showToast('They already replied, so this stays marked as sent.');
+  else showToast(sent ? 'Marked as sent by you.' : 'Unmarked.', 'success');
   loadCampaigns();
   // True only when this call changed it: a status means they replied or
   // opted out, 'already' means another click or tab got there first.
@@ -1968,7 +2058,7 @@ async function loadCampaigns() {
             : '';
         }
         const risky = r.email_status === 'risky'
-          ? ' <span class="mini t-waiting" title="Catch-all address: it may bounce">Catch-all</span>' : '';
+          ? ' <span class="mini t-waiting">Catch-all, may bounce</span>' : '';
         return '<span class="rcpt-who">' + escHtml(r.email) + risky + '</span>' +
           '<button class="btn btn-secondary btn-sm" onclick="openInGmail(' + i + ',' + s + ',' + ri + ')">' +
           'Open in Gmail</button>' +
@@ -2030,10 +2120,13 @@ function renderConversations() {
   const el = document.getElementById('conversations-list');
   const filter = CONVO_FILTERS.find(f => f[0] === _convoFilter) || CONVO_FILTERS[3];
   const bar = '<div class="toolbar"><div class="segmented" role="group" aria-label="Filter conversations">' +
-    CONVO_FILTERS.map(f => '<button class="' + (f[0] === filter[0] ? 'on' : '') +
+    CONVO_FILTERS.map(f => '<button class="' + (f[0] === filter[0] ? 'on' : '') + '" aria-pressed="' + (f[0] === filter[0]) +
       '" onclick="setConvoFilter(\'' + f[0] + '\')">' + f[1] + ' <span class="n">' +
       _convos.filter(f[2]).length + '</span></button>').join('') + '</div></div>';
-  const shown = _convos.filter(filter[2]);
+  // Handed-to-you first, then drafts waiting; otherwise newest first (as served).
+  const rank = c => c.status === 'needs_human' ? 0 : c.draft ? 1 : 2;
+  const shown = _convos.filter(filter[2]).map((c, i) => [c, i])
+    .sort((a, b) => rank(a[0]) - rank(b[0]) || a[1] - b[1]).map(x => x[0]);
   if (!shown.length) {
     el.innerHTML = bar + '<div class="card">' + emptyState(icon('check'), 'Nothing here',
       'No conversation matches this filter.') + '</div>';
@@ -2045,7 +2138,9 @@ function renderConversations() {
 function convoCard(c) {
   const items = (c.emails || []).map(e => ({ts: e.sent_at, email: e}))
     .concat((c.thread || []).map(m => ({ts: m.timestamp, msg: m})))
-    .sort((a, b) => parseTs(a.ts) - parseTs(b.ts));
+    .map(it => ({...it, key: +parseTs(it.ts)}))
+    // An item with no time goes last instead of scrambling the order.
+    .sort((a, b) => (isNaN(a.key) ? Infinity : a.key) - (isNaN(b.key) ? Infinity : b.key) || 0);
   const first = c.first_name || 'Them';
   const thread = items.map(it => {
     if (it.email) {
@@ -2065,14 +2160,47 @@ function convoCard(c) {
       '<button class="btn btn-primary btn-sm" onclick="goTab(\'outbox\')">Review in Outbox' + icon('arrow') + '</button></div>'
     : '';
   const name = [c.first_name, c.last_name].filter(Boolean).join(' ') || 'Unknown';
-  const stage = STAGE_LABELS[c.stage] ? '<span class="tag">' + STAGE_LABELS[c.stage] + '</span>' : '';
+  const stage = own(STAGE_LABELS, c.stage) ? '<span class="tag">' + STAGE_LABELS[c.stage] + '</span>' : '';
   return '<div class="convo-card"><div class="convo-head">' +
     '<span class="avatar">' + initials(c.first_name, c.last_name) + '</span>' +
     '<div><h3>' + escHtml(name) + '</h3><div class="sub">' +
       escHtml([c.company, c.prospect_email].filter(Boolean).join(' · ')) + ' · ' + relTime(c.updated_at) + '</div></div>' +
-    '<div class="tags">' + (c.intent ? badge(c.intent) : '') + stage + badge(c.status) + '</div></div>' +
+    // An escalation's intent badge says the same as its status: show one.
+    '<div class="tags">' + (c.intent && !(c.status === 'needs_human' && c.intent === 'escalate') ? badge(c.intent) : '') +
+      stage + badge(c.status) + '</div></div>' +
     '<div class="thread">' + (thread || '<p class="muted" style="font-size:13px">No messages in this thread yet.</p>') +
-    draft + '</div></div>';
+    draft + '</div>' + convoActions(c) + '</div>';
+}
+
+// Harvey answers new replies only on open conversations: an escalated one
+// waits for you to reply yourself, then close it or hand it back.
+function convoActions(c) {
+  if (c.status === 'needs_human') {
+    return '<div class="convo-actions"><span class="muted">' + icon('alert') +
+      'Harvey handed this to you. Reply from your inbox, then:</span>' +
+      '<button class="btn btn-secondary btn-sm" onclick="setConvoStatus(' + jsq(c.id) + ',\'open\')">Hand back to Harvey</button>' +
+      '<button class="btn btn-secondary btn-sm" onclick="setConvoStatus(' + jsq(c.id) + ',\'closed\')">Close</button></div>';
+  }
+  if (c.status === 'open') {
+    return '<div class="convo-actions"><button class="btn btn-ghost btn-sm" onclick="setConvoStatus(' +
+      jsq(c.id) + ',\'closed\')">Close conversation</button></div>';
+  }
+  if (c.status === 'closed') {
+    return '<div class="convo-actions"><button class="btn btn-ghost btn-sm" onclick="setConvoStatus(' +
+      jsq(c.id) + ',\'open\')">Reopen</button></div>';
+  }
+  return '';
+}
+
+async function setConvoStatus(id, status) {
+  const data = await api('/api/conversations/' + encodeURIComponent(id) + '/status', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({status: status}),
+  });
+  if (data && data.success) showToast(status === 'open' ? 'Open again. Harvey will answer the next reply.' : 'Closed. A new reply starts a new conversation.', 'success');
+  else showToast(failMsg(data, 'Could not update that conversation.'), 'error');
+  loadConversations();
+  loadToday();
 }
 
 async function loadActivity() {
@@ -2090,7 +2218,7 @@ async function loadActivity() {
     const label = dayLabel(a.created_at);
     if (label !== day) { day = label; html += '<div class="tl-day">' + escHtml(label) + '</div>'; }
     html += '<div class="tl-item' + (a.agent === 'main' ? ' quiet' : '') + '"><span class="tl-time">' + timeOfDay(a.created_at) + '</span>' +
-      '<span class="tl-icon">' + icon(AGENT_ICONS[a.agent] || 'activity') + '</span>' +
+      '<span class="tl-icon">' + icon(own(AGENT_ICONS, a.agent) || 'activity') + '</span>' +
       '<span class="tl-text">' + actionText(a) + '</span>' +
       '<span class="tl-agent">' + escHtml(a.agent) + '</span></div>';
   }

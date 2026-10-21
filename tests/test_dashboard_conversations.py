@@ -52,3 +52,39 @@ def test_a_conversation_without_emails_or_draft(client):
     _sql(client.db_path, "INSERT INTO conversations (id, prospect_id, thread_json, status) VALUES ('c9', 'p9', '[]', 'open')")
     [convo] = client.get("/api/conversations").json()
     assert convo["emails"] == [] and convo["draft"] is None
+
+
+def test_a_prospect_in_two_campaigns_sees_only_the_sequence_the_reply_answers(client):
+    _seed(client.db_path)
+    _sql(client.db_path, "INSERT INTO outbox (id, prospect_id, campaign_id, kind, step, to_email, subject, body, "
+         "status, sent_at, send_at) VALUES ('o7', 'p1', 'k2', 'sequence', 1, 'x@x.test', 'other campaign', "
+         "'Hi again.', 'sent', '2026-09-01T09:00:00', '2026-09-01T09:00:00')")
+    [convo] = client.get("/api/conversations").json()
+    assert [e["subject"] for e in convo["emails"]] == ["quick question", "re: booking"]
+    assert all("campaign_id" not in e for e in convo["emails"])
+
+
+def test_an_escalated_conversation_shows_on_today_and_can_be_handed_back(client):
+    db = client.db_path
+    asyncio.run(StateManager(str(db)).init_db())
+    _sql(db, "INSERT INTO prospects (id, first_name, email, status) VALUES ('p1', 'Iris', 'i@x.test', 'replied')")
+    _sql(db, "INSERT INTO conversations (id, prospect_id, status) VALUES ('c1', 'p1', 'needs_human')")
+    today = client.get("/api/today").json()
+    assert today["stats"]["needs_human"] == 1
+    assert any(i["key"] == "needs-human" and i["tab"] == "conversations" for i in today["items"])
+
+    assert client.post("/api/conversations/c1/status", json={"status": "open"}).json()["success"]
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT status FROM conversations WHERE id='c1'").fetchone()[0] == "open"
+        logged = conn.execute("SELECT details_json FROM actions WHERE action_type='conversation_status'").fetchone()
+    conn.close()
+    assert json.loads(logged[0]) == {"conversation_id": "c1", "from": "needs_human", "to": "open"}
+    assert not any(i["key"] == "needs-human" for i in client.get("/api/today").json()["items"])
+
+
+def test_conversation_status_rejects_bad_input(client):
+    asyncio.run(StateManager(str(client.db_path)).init_db())
+    _sql(client.db_path, "INSERT INTO conversations (id, status) VALUES ('c1', 'open')")
+    assert client.post("/api/conversations/c1/status", json={"status": "needs_human"}).status_code == 400
+    assert client.post("/api/conversations/c1/status", json=["closed"]).status_code == 400
+    assert client.post("/api/conversations/nope/status", json={"status": "closed"}).status_code == 404

@@ -192,7 +192,7 @@ svg.icon { width: 16px; height: 16px; flex: none; stroke: currentColor; fill: no
 
 /* ── App shell: sidebar + content ────────────────────────────── */
 
-.app { display: grid; grid-template-columns: var(--sidebar-w) minmax(0, 1fr); min-height: 100dvh; }
+.app { display: grid; grid-template-columns: var(--sidebar-w) minmax(0, 1fr); align-items: start; min-height: 100dvh; }
 
 .sidebar {
   position: sticky; top: 0; height: 100dvh;
@@ -202,15 +202,8 @@ svg.icon { width: 16px; height: 16px; flex: none; stroke: currentColor; fill: no
   background: var(--bg);
   overflow-y: auto; overscroll-behavior: contain;
 }
-.brand { display: flex; align-items: center; gap: 10px; padding: 4px 6px; }
-.brand .mark {
-  width: 28px; height: 28px; flex: none; border-radius: 8px;
-  display: flex; align-items: center; justify-content: center;
-  background: var(--accent); color: var(--accent-text);
-  font-size: 15px; font-weight: 600; letter-spacing: -0.02em;
-  box-shadow: var(--btn-primary-shadow);
-}
-.brand h1 { font-size: var(--fs-body); font-weight: 600; letter-spacing: -0.01em; line-height: 1.2; }
+.brand { display: flex; flex-direction: column; gap: 2px; padding: 4px 8px; }
+.brand h1 { font-size: 17px; font-weight: 650; letter-spacing: -0.025em; line-height: 1.15; }
 .brand .tagline { font-size: var(--fs-caption); color: var(--text-3); line-height: 1.2; }
 
 nav { display: flex; flex-direction: column; gap: var(--sp-4); }
@@ -602,7 +595,7 @@ tr:focus-within .row-action { opacity: 1; }
   background: var(--surface-2); color: var(--text-2);
 }
 .tl-icon .icon { width: 13px; height: 13px; }
-.tl-text { font-size: var(--fs-ui); color: var(--text); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tl-text { font-size: var(--fs-ui); color: var(--text); min-width: 0; overflow-wrap: anywhere; }
 .tl-text::first-letter { text-transform: uppercase; }
 .tl-agent { font-size: var(--fs-caption); color: var(--text-3); }
 .tl-item.quiet .tl-text { color: var(--text-3); }
@@ -859,6 +852,8 @@ textarea.form-input { height: auto; padding: 8px 12px; }
 }
 .convo-head { display: flex; align-items: center; gap: var(--sp-3); margin-bottom: var(--sp-4); flex-wrap: wrap; }
 .convo-head h3 { font-size: var(--fs-body); font-weight: 600; }
+.convo-head > div:nth-child(2) { min-width: 0; flex: 1 1 200px; }
+.convo-head h3, .convo-head .sub { overflow-wrap: anywhere; }
 .convo-head .sub { font-size: var(--fs-caption); color: var(--text-3); }
 .convo-head .tags { margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap; }
 .thread { display: flex; flex-direction: column; gap: var(--sp-2); }
@@ -953,7 +948,7 @@ textarea.form-input { height: auto; padding: 8px 12px; }
 /* ── Small screens: the sidebar becomes a top bar ────────────── */
 
 @media (max-width: 900px) {
-  .app { grid-template-columns: minmax(0, 1fr); }
+  .app { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto 1fr; }
   .sidebar {
     position: sticky; top: 0; z-index: 20; height: auto; flex-direction: row; flex-wrap: wrap;
     align-items: center; gap: var(--sp-2) var(--sp-3); padding: var(--sp-2) var(--sp-4);
@@ -978,3 +973,17 @@ textarea.form-input { height: auto; padding: 8px 12px; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
 }
+
+/* Replies and scraped text are written by outsiders: a 3,000-character URL
+   must wrap inside its box, never push the page sideways. */
+.desk-pane .body, .thread-msg, .te-body, .td-body, .te-head span, .cell-main, .cell-sub { overflow-wrap: anywhere; }
+
+.convo-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: var(--sp-4); padding-top: var(--sp-3); border-top: 1px solid var(--line); }
+.convo-actions .muted { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-caption); margin-right: auto; }
+.convo-actions .btn-ghost { margin-left: auto; }
+.facts { display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 10px 4px 0; margin-bottom: var(--sp-5); font-size: var(--fs-caption); color: var(--text-3); }
+.facts b { color: var(--text-2); font-weight: 600; font-variant-numeric: tabular-nums; }
+.cell-sub .verified { color: var(--good); font-weight: 600; }
+/* Long subjects end in an ellipsis; the card scrolls sideways if it must. */
+table.clip td { max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
+.live-next .btn { margin-left: auto; }

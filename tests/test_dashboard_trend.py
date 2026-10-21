@@ -40,3 +40,17 @@ def test_trend_days_are_bounded(client):
     assert len(client.get("/api/trend?days=500").json()["days"]) == 90
     assert len(client.get("/api/trend?days=0").json()["days"]) == 1
     assert client.get("/api/trend?days=x").status_code == 422
+
+
+def test_trend_counts_days_in_the_viewers_time_zone(client):
+    asyncio.run(StateManager(str(client.db_path)).init_db())
+    now = datetime.now(timezone.utc)
+    # 3 hours ago UTC is "today" in UTC but, 10 hours west, belongs to whatever
+    # local day it was then; compute the expected local day the same way.
+    stamp = (now - timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%S")
+    _sql(client.db_path, "INSERT INTO prospects (id, first_name, status, created_at) VALUES ('p1', 'A', 'new', ?)", (stamp,))
+    local = (now - timedelta(hours=3) - timedelta(minutes=600)).date().isoformat()
+    data = client.get("/api/trend?days=7&tz=-600").json()
+    assert data["days"][-1] == (now - timedelta(minutes=600)).date().isoformat()
+    assert data["found"][data["days"].index(local)] == 1
+    assert len(client.get("/api/trend?days=3&tz=99999").json()["days"]) == 3   # clamped, no crash
