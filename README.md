@@ -13,21 +13,23 @@ $ harvey run
 Harvey is online. Always Be Closing.
 ============================================================
 Checking pipeline state...
-Decision: prospect (only 3 new prospects; pipeline needs leads)
-  discover  → 41 businesses in Portland, OR       ($0.00, OpenStreetMap)
-  profile   → 41 sites read, 288 observations     (free, no model calls)
-  scout     → 12 scored against your ICP
-Decision: write_campaign (12 new prospects with no drafts)
-  writer    → 3-email sequence for Cascade Landscaping
-  outbox    → 12 emails waiting for your approval
+Decision: handle_replies (2 new replies)
+  handler   → Elena Park, Harbor Dental Studio     interested, answer drafted
+  handler   → Priya Nair, Highline Roofing         objection, answer drafted
+Decision: write_campaign (3 new prospects with no drafts)
+  writer    → 2-email sequence: Phoenix HVAC hiring a dispatcher
+  outbox    → 5 emails waiting for your approval
 Cycle complete. Sleeping for 15 minutes.
 ```
 
-And the dashboard it keeps, at `localhost:5555` — confirming a signal, building a
-cohort out of the confirmed ones, pricing a discovery run before it spends
-anything, and approving mail one message at a time:
+And the dashboard it keeps, at `localhost:5555`. In this order: the Today screen, a
+conversation Harvey handed back because a prospect asked for a contract, approving
+a drafted reply from the outbox, confirming a signal, building a cohort from
+confirmed signals, searching contacts, and the same screen in dark mode:
 
-![Harvey's dashboard: the Today queue, confirming a signal, the cohort builder counting matches live, a costed discovery estimate, and the outbox decisions desk — in light and dark](docs/dashboard.gif)
+![Harvey's dashboard: the Today screen, a conversation handed back for a human, approving a reply in the outbox, confirming a signal and building a cohort, searching contacts, then dark mode](docs/dashboard.gif)
+
+<sub>The demo data is invented: "Bookwell" selling online booking to roofers, dental practices and HVAC shops, on `.test` domains.</sub>
 
 ---
 
@@ -358,23 +360,34 @@ harvey dashboard     # prints the link to open, e.g. http://127.0.0.1:5555/#toke
 
 Plain HTML, CSS and JavaScript served from `harvey/web/`. No build step, no framework, no bundler — edit `app.css` and reload. Fonts are vendored, so it renders correctly with the network off.
 
-- **Today** — an asymmetric two-column screen: anything waiting on a decision down the left with the activity feed beneath it, and a rail carrying pipeline figures, collector runs and setup. It opens here rather than on a setup checklist, because the question you actually have is "is anything waiting on me?" Setup lives in the rail and disappears entirely once it's done.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/today-dark.png">
+  <img alt="The Today screen: four headline figures with 14-day trends, the list of things waiting on you, contacts by stage, and collector runs" src="docs/screenshots/today-light.png">
+</picture>
+
+The sidebar is grouped by what you're doing: **Work** (what needs you), **Pipeline** (what Harvey is building) and **System** (how it's running). Counts next to a tab mean something is waiting there.
+
+**Work**
+- **Today** — four headline figures with 14-day trends (contacts found, emails sent, conversations, waiting on you), then everything that needs a decision, contacts by stage, collector runs and what the pipeline is doing right now. Setup shows here until it's finished, then disappears.
+- **Outbox** — the decisions desk. Each email sits next to what Harvey knew when it wrote it: the company, how the address was found and verified, and the signals the email draws on. `J`/`K` to move, `A` approve, `E` edit, `R` reject.
+- **Conversations** — every reply in the context of the emails that led to it. Threads Harvey handed to you (a contract request, a reply it had no safe answer for) come first, with **Hand back to Harvey**, **Close** and **Reopen**.
+
+**Pipeline**
 - **Signals** — the confirmation gate and the cohort builder
-- **Discover** — the provider menu with prices side by side, an estimate, then a run
-- **Companies / Contacts** — everything found, with CSV export
-- **Outbox** — the decisions desk
-- **Conversations** — every reply and how Harvey handled it
-- **Usage** — Claude or Codex quota gauges and per-agent token counts. No dollar figures: you're on a subscription, you aren't billed per token, and pretending otherwise would be theater.
+- **Discover** — the provider menu with prices side by side, an estimate, then a run; plus reading the sites of companies found but not yet looked at
+- **Companies / Contacts** — everything found, searchable, with CSV export
+- **Campaigns** — each sequence Harvey wrote, who it's going to, and per-campaign feedback for the writer
 
-Three rules hold the interface together:
+**System**
+- **Activity**, **Usage**, **Controls**, **Settings**, **Help**. Usage shows Claude or Codex quota gauges and per-agent token counts, with no dollar figures: you're on a subscription and aren't billed per token, so showing costs would be made up.
 
-**The interface carries no colour.** The chrome is warm greyscale in both modes, so the only coloured thing on screen is status — if something has a hue, it means something.
+| Outbox | Conversations |
+|---|---|
+| <picture><source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/outbox-dark.png"><img alt="The outbox decisions desk: a drafted reply to an objection, with the company, contact, verification and signals beside it" src="docs/screenshots/outbox-light.png"></picture> | <picture><source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/conversations-dark.png"><img alt="A conversation Harvey handed back: the two emails sent, the prospect asking for a contract, and the Hand back to Harvey and Close buttons" src="docs/screenshots/conversations-light.png"></picture> |
 
-**One status vocabulary.** Prospects, campaigns, conversations, the outbox, signals and email deliverability all resolve to the same five tones, so "waiting on you" looks identical wherever it appears.
+Colour is kept for meaning. The chrome is neutral and a single blue marks what you can act on. Status (waiting on you, done, failed, running) uses the same small set of tones in every tab, so "waiting on you" looks the same wherever it shows up. Figures are tabular, so columns line up and a changing number doesn't shift the layout.
 
-**Every figure is monospaced and tabular**, so columns of numbers line up and a value changing doesn't shift the layout.
-
-Appearance has three states, not two. `auto` follows your OS and is the default, so the dashboard matches the rest of your machine until you deliberately pick light or dark. Dark isn't a separate design — it's the same design re-tokenised.
+Appearance has three states: `auto` follows your OS and is the default, or pick light or dark from the button at the bottom of the sidebar. Dark mode uses the same layout with a different set of colour tokens.
 
 ---
 
