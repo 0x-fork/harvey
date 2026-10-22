@@ -5,6 +5,7 @@ import ipaddress
 import json
 import logging
 import os
+import shutil
 import signal
 import stat
 import subprocess
@@ -156,6 +157,37 @@ def _write_env_file(updates: dict[str, str]):
     load_dotenv(str(ENV_FILE), override=True)
 
 
+def _pid_alive(pid: int) -> bool:
+    """True if a process with this PID is running.
+
+    On Windows os.kill(pid, 0) is not a probe: any signal other than the
+    console-control ones calls TerminateProcess, and a dead PID raises
+    WinError 87. Ask the OS for the exit code instead.
+    """
+    if os.name == "nt":
+        import ctypes
+
+        process_query_limited_information = 0x1000
+        still_active = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+            return bool(ok) and code.value == still_active
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def _check_harvey_pid() -> int | None:
     """Check if there's a running Harvey process from a PID file."""
     global _harvey_process, _harvey_started_at
@@ -164,10 +196,11 @@ def _check_harvey_pid() -> int | None:
     if PID_FILE.exists():
         try:
             pid = int(PID_FILE.read_text(encoding="utf-8").strip())
-            os.kill(pid, 0)  # Check if process exists
+        except ValueError:
+            pid = None
+        if pid and _pid_alive(pid):
             return pid
-        except (ValueError, ProcessLookupError, PermissionError):
-            PID_FILE.unlink(missing_ok=True)
+        PID_FILE.unlink(missing_ok=True)
     return None
 
 
@@ -526,15 +559,23 @@ async def start_harvey():
     # Ensure data dir exists
     (PROJECT_ROOT / "data").mkdir(parents=True, exist_ok=True)
 
+    # The native Claude CLI installer puts claude in ~/.local/bin without
+    # always adding it to PATH; the heartbeat can't think without it.
+    env = os.environ.copy()
+    local_bin = Path.home() / ".local" / "bin"
+    if not shutil.which("claude") and local_bin.is_dir():
+        env["PATH"] = str(local_bin) + os.pathsep + env.get("PATH", "")
+
     try:
         log_handle = open(LOG_FILE, "a", encoding="utf-8")
         try:
             _harvey_process = subprocess.Popen(
-                [sys.executable, "-m", "harvey"],
+                [sys.executable, "-m", "harvey", "run"],
                 cwd=str(PROJECT_ROOT),
                 stdout=log_handle,
                 stderr=log_handle,
                 start_new_session=True,
+                env=env,
             )
         finally:
             # Child holds its own copies of the fds; don't leak ours.
@@ -566,15 +607,14 @@ async def stop_harvey():
         os.kill(pid, signal.SIGTERM)
         # Wait briefly for graceful shutdown
         for _ in range(10):
-            try:
-                os.kill(pid, 0)
-                await asyncio.sleep(0.5)
-            except ProcessLookupError:
+            if not _pid_alive(pid):
                 break
+            await asyncio.sleep(0.5)
         else:
-            # Force kill if still running
+            # Force kill if still running (Windows has no SIGKILL; its
+            # SIGTERM is already TerminateProcess).
             try:
-                os.kill(pid, signal.SIGKILL)
+                os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
             except (ProcessLookupError, PermissionError):
                 pass
     except (ProcessLookupError, PermissionError):

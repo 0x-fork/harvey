@@ -36,6 +36,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from harvey.brain import Brain
+from harvey.collectors.profile import ProfileCollector
 from harvey.config import HarveyConfig, EnvConfig
 from harvey.integrations.email_finder import find_email, verify_published_address
 from harvey.integrations.linkedin import LinkedInAutomation
@@ -1386,6 +1387,24 @@ Respond ONLY with the JSON array."""
                     "last_name": parts[1].strip(),
                     "title": title[:120],
                 })
+
+            # Most small-business sites have no team-card markup, just a
+            # heading per person with their role beside it. The profiler's
+            # detector already reads that layout, so fall back to it here.
+            # Its heading match is case-insensitive, so require capitalised
+            # name parts ("Trusted leadership" is a heading, not a person) and
+            # cut any markup that leaked into the title.
+            if not members:
+                for person in ProfileCollector(state=None).detect_people(resp.text):
+                    first, last = person["first_name"], person["last_name"]
+                    if not all(p[:1].isupper() for p in f"{first} {last}".split()):
+                        continue
+                    title = person["title"].split("<", 1)[0].strip(" ,.|-—·")
+                    members.append({
+                        "first_name": first,
+                        "last_name": last,
+                        "title": title[:120],
+                    })
 
             if members:
                 break

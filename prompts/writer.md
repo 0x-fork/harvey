@@ -44,6 +44,13 @@ SOUNDS-HUMAN CHECKS — the patterns that still give AI away after the rules abo
 - Curly quotes or fancy punctuation. Straight quotes only.
 - Every sentence the same length. Mix short sentences with longer ones, the way people write when they type fast.
 
+SELL THE OUTCOME, NOT THE PRODUCT:
+- The reader buys what changes for them, not how it works. Lead with the result in their world: booked jobs, a fuller appointment book, past clients coming back, quotes turning into work, time their team gets back.
+- Describe the outcome in their terms and their setting ("the patients who never booked their treatment plan, back in the chair"), not ours.
+- Mechanics stay out of cold email: no "AI", "automation", "campaigns", "texts and emails", "integrates with", "platform", "software", "system". If they reply asking how, explain then.
+- When the company is named (email 2 onward), name it as the one who delivers the outcome, in one short clause ("{{persona_company}} gets them back in the book"), never as a feature list.
+- Outcomes must still be honest: only results the product info supports, no invented numbers, percentages or guarantees.
+
 SPAM FILTER RULES — these words and patterns get emails junked. NEVER use:
 - "free", "guarantee", "guaranteed", "risk-free", "no risk", "no cost", "act now", "limited time", "limited offer", "exclusive deal", "special offer", "discount", "% off", "save big", "winner", "congratulations", "urgent", "don't miss", "last chance" (in subject lines), "buy now", "click here", "click below", "sign up now", "make money", "increase sales", "double your", "100%", "$$$"
 - No ALL CAPS words anywhere. No more than one question mark per email.

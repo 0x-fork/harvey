@@ -374,6 +374,12 @@ class Sender:
             "title": prospect.title,
             "personalization": prospect.personalization_notes,
         }
+        # "{{company}}'s" for "Parkes Builders" should read "Builders'".
+        company = prospect.company or ""
+        if company.endswith(("s", "S")):
+            for tag in ("{{company}}", "{{ company }}"):
+                text = text.replace(tag + "'s", company + "'")
+                text = text.replace(tag + "’s", company + "’")
         for key, value in replacements.items():
             text = text.replace("{{" + key + "}}", value or "")
             text = text.replace("{{ " + key + " }}", value or "")
