@@ -86,6 +86,7 @@ def test_live_status_on_an_empty_database(client):
     assert data["running"] == [] and data["stopped"] == []
     assert _step(data, "Read their websites")["state"] == "waiting"
     assert data["next"] == "Search for businesses to get started."
+    assert data["next_tab"] == "discover"
 
 
 def test_live_status_without_a_database_file(client, env):
@@ -111,6 +112,7 @@ def test_queued_drafts_are_not_counted_as_sent(client, env):
     assert (sent["done"], sent["total"]) == (1, 2)
     assert _step(data, "Write first emails")["done"] == 2  # per person, not per campaign
     assert data["next"] == "Open Campaigns and send the 1 unsent email(s)."
+    assert data["next_tab"] == "campaigns"
 
 
 def test_unconfirmed_emails_are_reported_not_hidden(client, env):
@@ -133,7 +135,7 @@ def test_a_live_run_shows_progress_and_time_left(client, env):
     assert [r["stage"] for r in data["running"]] == ["profile"]
     assert data["running"][0]["eta_text"].endswith("min left")
     assert _step(data, "Read their websites")["state"] == "running"
-    assert data["next"].startswith("Wait")
+    assert data["next"].startswith("Wait") and data["next_tab"] == ""
 
 
 def test_a_killed_run_is_reported_as_stopped_not_running(client, env):

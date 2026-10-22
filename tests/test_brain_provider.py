@@ -597,7 +597,7 @@ def _render_js(func: str, data, helpers=("escHtml", "formatDate")) -> str:
     node = shutil.which("node")
     if not node:
         pytest.skip("node is not installed")
-    source = (Path(dash.__file__).parent / "web" / "app.js").read_text()
+    source = (Path(dash.__file__).parent / "web" / "app.js").read_text(encoding="utf-8")
     funcs = []
     for name in (*helpers, func):
         match = re.search(rf"^function {name}\(.*?^}}\n", source, re.S | re.M)
