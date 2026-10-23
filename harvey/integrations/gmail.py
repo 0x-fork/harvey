@@ -40,6 +40,11 @@ TOKEN_URL = "https://oauth2.googleapis.com/token"
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 SCOPE = "https://www.googleapis.com/auth/gmail.modify"
 LOOPBACK_PORT = 8765
+MAX_INBOX_PAGES = 40
+
+class GmailError(RuntimeError):
+    pass
+
 
 TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0)
 
@@ -126,7 +131,8 @@ class GmailProvider(MailProvider):
         try:
             return resp.json()
         except ValueError:
-            return {}
+            logger.error(f"Gmail returned malformed JSON ({path})")
+            return None
 
     async def send_email(
         self,
@@ -173,23 +179,50 @@ class GmailProvider(MailProvider):
         )
 
     async def get_replies(self, limit: int = 50) -> list[InboundMessage]:
-        listing = await self._request(
-            "GET", "/messages",
-            params={"q": "in:inbox -from:me newer_than:7d", "maxResults": limit},
-        )
-        if not listing:
-            return []
+        """Read the complete recent inbox or raise, so sends wait on failure.
+
+        ``limit`` is a page size, not a cap on replies: a reply beyond the
+        first page must still stop its queued follow-ups. Like the Graph
+        provider, bound pagination and never return a partial inbox.
+        """
+        params = {"q": "in:inbox -from:me newer_than:7d",
+                  "maxResults": max(1, min(500, int(limit)))}
         out = []
-        for stub in listing.get("messages", [])[:limit]:
-            data = await self._request(
-                "GET", f"/messages/{stub['id']}", params={"format": "full"}
-            )
-            if not data:
-                continue
-            msg = self._parse_message(data)
-            if msg:
-                out.append(msg)
-        return out
+        seen_ids = set()
+        seen_tokens = set()
+        for page in range(1, MAX_INBOX_PAGES + 1):
+            listing = await self._request("GET", "/messages", params=dict(params))
+            if not isinstance(listing, dict):
+                raise GmailError(f"inbox page {page}: could not read messages")
+            # Gmail omits 'messages' when a successful query has no matches.
+            messages = listing.get("messages", [])
+            if not isinstance(messages, list):
+                raise GmailError(f"inbox page {page}: messages is not a list")
+            for stub in messages:
+                msg_id = stub.get("id") if isinstance(stub, dict) else None
+                if not isinstance(msg_id, str) or not msg_id:
+                    raise GmailError(f"inbox page {page}: message has no id")
+                if msg_id in seen_ids:
+                    continue
+                data = await self._request(
+                    "GET", f"/messages/{msg_id}", params={"format": "full"}
+                )
+                if not isinstance(data, dict) or data.get("id") != msg_id:
+                    raise GmailError(f"inbox page {page}: could not read message {msg_id}")
+                msg = self._parse_message(data)
+                seen_ids.add(msg_id)
+                if msg:
+                    out.append(msg)
+            token = listing.get("nextPageToken")
+            if token is None:
+                return out
+            if not isinstance(token, str) or not token or token in seen_tokens:
+                raise GmailError(f"inbox page {page}: invalid or repeated nextPageToken")
+            seen_tokens.add(token)
+            params["pageToken"] = token
+        raise GmailError(
+            f"inbox has more than {MAX_INBOX_PAGES} pages; refusing a partial read"
+        )
 
     @staticmethod
     def _parse_message(data: dict) -> InboundMessage | None:
