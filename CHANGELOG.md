@@ -39,6 +39,12 @@ minor versions can still change behaviour.
   They're now left out even when `--status` or `--email-status` is given;
   `harvey export --all` (and `?all=true`) is still the raw, unfiltered dump.
   From #64 by hifzabuildsai.
+- **An opt-out now stays an opt-out.** Any later message from someone who
+  opted out (an out-of-office, a "thanks") set them back to *replied* or
+  *lost*, which put them back in the export, and a question from them got a
+  drafted answer in the Outbox. Now their message is kept in a closed
+  conversation for you to read, nothing is drafted, and no code path can
+  move a prospect off *opted out*.
 - **`aiosmtplib` is now 5.1.3 or later** (was `>=3.0.1,<4`). Older versions
   wrote a CR/LF inside an address straight to the SMTP server, so an address
   scraped from a website could add commands of its own

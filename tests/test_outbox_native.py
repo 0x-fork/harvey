@@ -305,6 +305,49 @@ async def test_reply_cancels_pending_outbox(state):
     assert await collect_prospects(state) == []
 
 
+class RefusingBrain(StubBrain):
+    """Fails the test if anything asks the model about this reply."""
+    async def think(self, *_a, **_k):
+        raise AssertionError("no model call for someone who opted out")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [
+    "Thanks, actually could you tell me more about pricing?",
+    "I am out of the office until Monday.",
+    "Not interested.",
+])
+async def test_reply_after_opt_out_keeps_them_opted_out(state, body):
+    # An out-of-office or a later "thanks" used to set them to 'replied'
+    # (or 'lost'), which put them back in the export, and a question got a
+    # drafted answer in the Outbox.
+    pid = await seed_prospect(state, status="opted_out")
+    provider = FakeProvider()
+    provider.inbound = [InboundMessage(
+        provider_id="in2", from_email="jane@acme.com", subject="Re: hi", body=body,
+    )]
+    handler = make_handler(state, provider)
+    handler.brain = RefusingBrain()
+    await handler._run_native()
+
+    assert (await state.get_prospect(pid)).status == "opted_out"
+    assert await state.get_outbox() == []
+    from harvey.export import collect_prospects
+    assert await collect_prospects(state) == []
+    # Their message is still kept where a human can read it.
+    convos = await state.get_conversations_by_status("closed")
+    assert [c.prospect_id for c in convos] == [pid]
+    assert convos[0].thread[-1].content.startswith(body.split(",")[0].split(".")[0])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["replied", "lost", "contacted", "queued", "new"])
+async def test_an_opt_out_is_never_overwritten(state, status):
+    pid = await seed_prospect(state, status="opted_out")
+    await state.update_prospect_status(pid, status)
+    assert (await state.get_prospect(pid)).status == "opted_out"
+
+
 @pytest.mark.asyncio
 async def test_bounce_marks_invalid_and_kill_switch(state):
     pid = await seed_prospect(state, status="contacted")

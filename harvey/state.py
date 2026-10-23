@@ -741,9 +741,12 @@ class StateManager:
                 return [self._prospect_from_row(r) for r in rows]
 
     async def update_prospect_status(self, prospect_id: str, status: str):
+        # An opt-out is permanent: nothing Harvey does later (a reply, a
+        # send, a retry) may move someone off it and back into outreach.
         async with self._connect() as db:
             await db.execute(
-                "UPDATE prospects SET status = ?, updated_at = ? WHERE id = ?",
+                "UPDATE prospects SET status = ?, updated_at = ? "
+                "WHERE id = ? AND status IS NOT 'opted_out'",
                 (status, _utcnow().isoformat(), prospect_id),
             )
             await db.commit()

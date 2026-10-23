@@ -291,6 +291,39 @@ class Handler:
             compliance.postal_address, compliance.opt_out_line, DEFAULT_OPT_OUT_LINE,
         ])
 
+    async def _record_after_opt_out(self, prospect, reply_text: str, campaign_id: str = ""):
+        """Keep a message from someone who opted out, and do nothing else.
+
+        No model call and no reply: they asked not to be contacted, and an
+        out-of-office or a "thanks" doesn't change that. Their status stays
+        opted_out (so they stay out of exports), anything still queued for
+        them is cancelled, and the message lands in a closed conversation a
+        human can read and act on by hand.
+        """
+        try:
+            await self.state.cancel_pending_outbox_for_prospect(prospect.id)
+        except Exception as e:
+            logger.debug(f"Handler: outbox cancel failed: {e}")
+        await self.state.add_conversation(Conversation(
+            id="",
+            prospect_id=prospect.id,
+            campaign_id=campaign_id,
+            channel="email",
+            thread=[Message(sender="prospect", content=reply_text)],
+            intent="unsubscribe",
+            stage="closed_lost",
+            status="closed",
+        ))
+        await self.state.log_action(
+            action_type="reply_after_opt_out",
+            agent="handler",
+            details={"prospect_email": prospect.email},
+        )
+        logger.info(
+            f"Handler: {prospect.email} opted out earlier and wrote again. "
+            "Kept the message; no reply sent."
+        )
+
     async def _process_reply(
         self,
         lead_email: str,
@@ -316,6 +349,10 @@ class Handler:
         keyword_text = _flat(their_text)
         stripped = strip_quoted_reply(reply_text) or reply_text
         reply_text = ours.remove(stripped).strip() or stripped
+
+        if prospect.status == "opted_out":
+            await self._record_after_opt_out(prospect, reply_text, campaign_id)
+            return
 
         # Update prospect status + stop-on-reply: a human answered, so every
         # queued sequence email for them is now wrong to send.

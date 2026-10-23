@@ -44,7 +44,8 @@ async def _fake_smtp_server():
 @pytest.mark.parametrize("command", ["mail", "rcpt"])
 async def test_crlf_in_address_never_reaches_the_server(command):
     server, port, received = await _fake_smtp_server()
-    smtp = aiosmtplib.SMTP(hostname="127.0.0.1", port=port, timeout=5)
+    smtp = aiosmtplib.SMTP(hostname="127.0.0.1", port=port, timeout=5,
+                          local_hostname="localhost")
     raised = False
     try:
         await smtp.connect()
