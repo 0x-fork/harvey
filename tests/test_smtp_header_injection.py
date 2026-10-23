@@ -46,7 +46,7 @@ async def test_crlf_in_address_never_reaches_the_server(command):
     server, port, received = await _fake_smtp_server()
     smtp = aiosmtplib.SMTP(hostname="127.0.0.1", port=port, timeout=5,
                           local_hostname="localhost")
-    raised = False
+    outcome = None
     try:
         await smtp.connect()
         await smtp.ehlo()
@@ -56,10 +56,8 @@ async def test_crlf_in_address_never_reaches_the_server(command):
             # Bounded: a vulnerable version sends two commands, the replies
             # fall out of step, and the call would otherwise just wait.
             await asyncio.wait_for(getattr(smtp, command)(INJECTED), 5)
-        except ValueError:
-            raised = True
-        except Exception:
-            pass
+        except Exception as e:
+            outcome = e
     finally:
         smtp.close()
         server.close()
@@ -69,4 +67,5 @@ async def test_crlf_in_address_never_reaches_the_server(command):
             pass
 
     assert not any("victim@example.org" in line for line in received), received
-    assert raised, f"{command}() accepted an address containing CR/LF"
+    assert isinstance(outcome, ValueError), (
+        f"{command}() should refuse an address containing CR/LF, got {outcome!r}")
