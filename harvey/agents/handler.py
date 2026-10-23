@@ -291,14 +291,17 @@ class Handler:
             compliance.postal_address, compliance.opt_out_line, DEFAULT_OPT_OUT_LINE,
         ])
 
-    async def _record_after_opt_out(self, prospect, reply_text: str, campaign_id: str = ""):
+    async def _record_after_opt_out(
+        self, prospect, reply_text: str, campaign_id: str = "", escalate: bool = False,
+    ):
         """Keep a message from someone who opted out, and do nothing else.
 
         No model call and no reply: they asked not to be contacted, and an
         out-of-office or a "thanks" doesn't change that. Their status stays
         opted_out (so they stay out of exports), anything still queued for
         them is cancelled, and the message lands in a closed conversation a
-        human can read and act on by hand.
+        human can read and act on by hand. A complaint or legal threat goes
+        to Needs you instead, as it would from anyone else.
         """
         try:
             await self.state.cancel_pending_outbox_for_prospect(prospect.id)
@@ -310,10 +313,21 @@ class Handler:
             campaign_id=campaign_id,
             channel="email",
             thread=[Message(sender="prospect", content=reply_text)],
-            intent="unsubscribe",
+            intent="escalate" if escalate else "unsubscribe",
             stage="closed_lost",
-            status="closed",
+            status="needs_human" if escalate else "closed",
         ))
+        if escalate:
+            await self.state.log_action(
+                action_type="escalation",
+                agent="handler",
+                details={"prospect_email": prospect.email, "reply_preview": reply_text[:200]},
+            )
+            logger.warning(
+                f"Handler: ESCALATED reply from {prospect.email}, who opted out earlier. "
+                "Needs human review. No auto-reply sent."
+            )
+            return
         await self.state.log_action(
             action_type="reply_after_opt_out",
             agent="handler",
@@ -351,7 +365,8 @@ class Handler:
         reply_text = ours.remove(stripped).strip() or stripped
 
         if prospect.status == "opted_out":
-            await self._record_after_opt_out(prospect, reply_text, campaign_id)
+            escalate = any(p in keyword_text for p in ESCALATION_PATTERNS)
+            await self._record_after_opt_out(prospect, reply_text, campaign_id, escalate)
             return
 
         # Update prospect status + stop-on-reply: a human answered, so every

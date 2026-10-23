@@ -341,6 +341,29 @@ async def test_reply_after_opt_out_keeps_them_opted_out(state, body):
 
 
 @pytest.mark.asyncio
+async def test_complaint_after_opt_out_still_reaches_a_human(state):
+    pid = await seed_prospect(state, status="opted_out")
+    provider = FakeProvider()
+    provider.inbound = [InboundMessage(
+        provider_id="in3", from_email="jane@acme.com", subject="Re: hi",
+        body="I told you to stop. I'm reporting you for spam.",
+    )]
+    handler = make_handler(state, provider)
+    handler.brain = RefusingBrain()
+    await handler._run_native()
+
+    assert (await state.get_prospect(pid)).status == "opted_out"
+    assert await state.get_outbox() == []
+    flagged = await state.get_conversations_by_status("needs_human")
+    assert [c.prospect_id for c in flagged] == [pid]
+    import aiosqlite
+    async with aiosqlite.connect(state.db_path) as db:
+        async with db.execute("SELECT action_type FROM actions") as cursor:
+            logged = [r[0] for r in await cursor.fetchall()]
+    assert "escalation" in logged
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["replied", "lost", "contacted", "queued", "new"])
 async def test_an_opt_out_is_never_overwritten(state, status):
     pid = await seed_prospect(state, status="opted_out")
