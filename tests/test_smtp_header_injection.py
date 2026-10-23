@@ -67,5 +67,11 @@ async def test_crlf_in_address_never_reaches_the_server(command):
             pass
 
     assert not any("victim@example.org" in line for line in received), received
-    assert isinstance(outcome, ValueError), (
-        f"{command}() should refuse an address containing CR/LF, got {outcome!r}")
+    # Either is safe: aiosmtplib refuses the address, or (on Pythons whose
+    # email.utils.parseaddr cuts it at the line break, like 3.11.9) only the
+    # clean address goes out. Anything else, or anything smuggled, is not.
+    verb = "MAIL FROM:" if command == "mail" else "RCPT TO:"
+    sent = [line for line in received if line.startswith(verb)][-1:]
+    refused = isinstance(outcome, ValueError) and sent == []
+    trimmed = outcome is None and sent == [f"{verb}<a@example.com>"]
+    assert refused or trimmed, (outcome, received)
