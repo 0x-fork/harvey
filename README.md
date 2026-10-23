@@ -461,6 +461,12 @@ harvey gmail auth            # one-time Gmail OAuth
 harvey microsoft auth|test  # one-time Microsoft 365 sign-in (docs/microsoft365.md)
 ```
 
+Prospect CSV exports exclude opted-out contacts, including when using
+`--status` or `--email-status` filters. `harvey export --all` is an unfiltered
+raw-data export for inspection: it includes opted-out and unverified contacts
+and should not be imported as an outreach list. The dashboard's prospect CSV
+download follows the same policy; `?all=true` selects its raw export.
+
 
 ## Using a ChatGPT plan instead (Codex)
 

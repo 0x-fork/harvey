@@ -300,6 +300,10 @@ async def test_reply_cancels_pending_outbox(state):
     prospect = await state.get_prospect(pid)
     assert prospect.status == "opted_out"   # opt-out keywords honored
 
+    # Taking the list to another sequencer must not undo the handled opt-out.
+    from harvey.export import collect_prospects
+    assert await collect_prospects(state) == []
+
 
 @pytest.mark.asyncio
 async def test_bounce_marks_invalid_and_kill_switch(state):
