@@ -33,6 +33,18 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- **Opted-out contacts are no longer in the prospect CSV.** Someone who
+  replied "unsubscribe" stayed in `harvey export` and the dashboard's Export
+  button, so taking the list to another sequencer could email them again.
+  They're now left out even when `--status` or `--email-status` is given;
+  `harvey export --all` (and `?all=true`) is still the raw, unfiltered dump.
+  From #64 by hifzabuildsai.
+- **`aiosmtplib` is now 5.1.3 or later** (was `>=3.0.1,<4`). Older versions
+  wrote a CR/LF inside an address straight to the SMTP server, so an address
+  scraped from a website could add commands of its own
+  (GHSA-v3q9-hj7j-63hq), and kept plaintext bytes across STARTTLS
+  (GHSA-vxj7-4xrp-5vr4). Harvey passes scraped addresses to it when sending
+  over SMTP and when probing a mailbox. Reported in #66.
 - A follow-up no longer goes out before, or right after, the email it
   follows. Each step now waits until the previous one has actually been sent
   and its gap (at least a day) has passed. Before, approving a batch of drafts
