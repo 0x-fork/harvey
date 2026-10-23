@@ -112,7 +112,9 @@ class GmailProvider(MailProvider):
         self._access_expires = time.time() + float(data.get("expires_in", 3600))
         return self._access_token or None
 
-    async def _request(self, method: str, path: str, **kwargs):
+    async def _request(
+        self, method: str, path: str, *, sending: bool = False, **kwargs
+    ):
         token = await self._token()
         if not token:
             return None
@@ -124,14 +126,27 @@ class GmailProvider(MailProvider):
                 )
         except httpx.HTTPError as e:
             logger.error(f"Gmail request failed ({path}): {e}")
+            if sending:
+                # The request may have reached Gmail before the connection failed.
+                raise RuntimeError("Gmail send outcome is unknown") from e
             return None
+        if sending and not (200 <= resp.status_code < 300
+                            or 400 <= resp.status_code < 500):
+            raise RuntimeError("Gmail send outcome is unknown")
         if resp.status_code >= 400:
             logger.error(f"Gmail API {resp.status_code} on {path}: {resp.text[:200]}")
             return None
         try:
-            return resp.json()
-        except ValueError:
+            data = resp.json()
+            if sending and (not isinstance(data, dict)
+                            or not isinstance(data.get("id"), str)
+                            or not data["id"].strip()):
+                raise ValueError("Missing Gmail send message ID")
+            return data
+        except ValueError as e:
             logger.error(f"Gmail returned malformed JSON ({path})")
+            if sending:
+                raise RuntimeError("Gmail send returned an unreadable response") from e
             return None
 
     async def send_email(
@@ -157,7 +172,7 @@ class GmailProvider(MailProvider):
         if thread_ref:
             payload["threadId"] = thread_ref
 
-        data = await self._request("POST", "/messages/send", json=payload)
+        data = await self._request("POST", "/messages/send", sending=True, json=payload)
         if data is None:
             return SendResult(ok=False, error="gmail send failed")
 
@@ -165,17 +180,27 @@ class GmailProvider(MailProvider):
         message_id = ""
         gmail_id = data.get("id", "")
         if gmail_id:
-            meta = await self._request(
-                "GET", f"/messages/{gmail_id}",
-                params={"format": "metadata", "metadataHeaders": "Message-ID"},
-            )
-            for h in ((meta or {}).get("payload") or {}).get("headers", []):
-                if h.get("name", "").lower() == "message-id":
-                    message_id = h.get("value", "")
+            try:
+                meta = await self._request(
+                    "GET", f"/messages/{gmail_id}",
+                    params={"format": "metadata", "metadataHeaders": "Message-ID"},
+                )
+            except Exception:
+                # Sending already succeeded; optional metadata cannot undo it.
+                logger.warning("Gmail sent message metadata could not be read")
+                meta = None
+            metadata = meta.get("payload") if isinstance(meta, dict) else None
+            headers = metadata.get("headers") if isinstance(metadata, dict) else None
+            for h in headers if isinstance(headers, list) else []:
+                if (isinstance(h, dict) and isinstance(h.get("name"), str)
+                        and h["name"].lower() == "message-id"
+                        and isinstance(h.get("value"), str)):
+                    message_id = h["value"]
         return SendResult(
             ok=True,
             message_id=message_id or gmail_id,
-            thread_ref=data.get("threadId", ""),
+            thread_ref=(data.get("threadId", "")
+                        if isinstance(data.get("threadId", ""), str) else ""),
         )
 
     async def get_replies(self, limit: int = 50) -> list[InboundMessage]:
