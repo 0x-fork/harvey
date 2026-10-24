@@ -20,7 +20,17 @@ country from the address, company records or the company's website.
 
 A response Precleared can't vouch for (network trouble, daily allowance used
 up, a bad key, or a malformed body) holds cold email for a later cycle instead
-of failing it.
+of failing it. When the failure is about Precleared rather than the address
+(no connection or no answer in time, a busy server, the allowance or the rate
+limit, the key, an answer Harvey can't read), no more fresh checks are made
+that cycle, but a stored verdict is still used, so email to people already
+cleared carries on. Any other failure moves just that address's email back
+(see the sender's ADDRESS_RETRY_AFTER) and the rest of the cycle carries on,
+unless addresses at different domains fail with no answer in between, which
+pauses checks too. When the check timed out or Precleared's answer couldn't be
+read, that email is moved back as well, in case the address is the cause (a
+slow lookup, an odd answer), so one address can't keep every other one
+waiting.
 
 Without an API key Precleared allows 10 checks a day; a free key
 (https://precleared.dev/get-key, PRECLEARED_API_KEY) allows 25 a day.
@@ -32,6 +42,7 @@ A hold is also recorded under STATUS_KEY, so the dashboard's Today page and
 key, a pack, or nothing but time). The next fresh answer clears it.
 """
 
+import asyncio
 import hashlib
 import ipaddress
 import json
@@ -52,6 +63,9 @@ API_URL = "https://precleared.dev/api/v1/check"
 # Precleared answers within 25 seconds (with verdict "unknown" if a register
 # lookup is slow), so the read timeout sits just above that.
 TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
+# httpx's read timeout applies to each chunk, so an answer that trickles in
+# could outlast it; this bounds the whole request.
+TOTAL_TIMEOUT = 40.0
 CACHE_DAYS = 30
 # Bump when the facts in _fingerprint change, so older cache entries are
 # ignored rather than reused.
@@ -72,10 +86,13 @@ STATUS_KEY = "precleared_status"
 # Precleared's allowance resets daily, so a hold not seen for this long is
 # stale: Harvey stopped running, or the check was switched off.
 STATUS_MAX_AGE = timedelta(hours=26)
-HOLD_KINDS = ("keyless_limit", "out_of_checks", "key_rejected", "unavailable")
+HOLD_KINDS = ("keyless_limit", "out_of_checks", "key_rejected", "rate_limited", "unavailable")
 # A 402's checkout link is only followed to Precleared itself or its card
 # checkout; any other host falls back to BUY_URL.
 BUY_HOSTS = ("precleared.dev", "checkout.stripe.com")
+# Answers that mean Precleared's server is busy or down, not that it can't
+# check one address.
+SERVER_BUSY = (502, 503, 504)
 
 
 @dataclass
@@ -84,12 +101,18 @@ class Clearance:
 
     ``allowed``: send it. ``held``: the check could not be made right now
     (network trouble, daily allowance used up, bad key, malformed response),
-    so the email stays queued and is tried again on a later cycle. Otherwise
-    the email is blocked and ``reason`` says why.
+    so the email stays queued and is tried again on a later cycle.
+    ``pause_checks``: that failure is about Precleared rather than this
+    address, so no more fresh checks are made this cycle. ``retry_address``:
+    the check timed out or its answer couldn't be read, which this address
+    may have caused, so its email is moved back too. Otherwise the email is
+    blocked and ``reason`` says why.
     """
 
     allowed: bool
     held: bool = False
+    pause_checks: bool = False
+    retry_address: bool = False
     verdict: str = ""
     reason: str = ""
     receipt_id: str = ""
@@ -166,24 +189,43 @@ class PreclearedClient:
 
     async def clear(self, to_email: str, state) -> Clearance:
         """Return the verdict for one address, from the cache when possible."""
-        email = (to_email or "").strip().lower()
-        key = SETTINGS_PREFIX + email
-        inputs = self._fingerprint()
-        cached = _from_cache(await state.get_setting(key), inputs)
-        if cached is not None:
-            return cached
+        cached = await self.cached(to_email, state)
+        return cached if cached is not None else await self.check(to_email, state)
 
-        result = await self._check(email)
+    async def cached(self, to_email: str, state) -> Clearance | None:
+        """The stored verdict for this address and these facts, or None."""
+        email = (to_email or "").strip().lower()
+        return _from_cache(await state.get_setting(SETTINGS_PREFIX + email), self._fingerprint())
+
+    def stored_verdicts(self) -> tuple[str, str, str]:
+        """What a stored verdict needs to still be used, for counting in SQL:
+        its settings key prefix, these facts' fingerprint, and the oldest
+        ``checked_at`` that hasn't expired."""
+        oldest = (_utcnow() - timedelta(days=CACHE_DAYS)).isoformat()
+        return SETTINGS_PREFIX, self._fingerprint(), oldest
+
+    async def check(self, to_email: str, state) -> Clearance:
+        """Ask Precleared now, and store a definite verdict for next time."""
+        email = (to_email or "").strip().lower()
+        try:
+            result = await self._check(email)
+        except Exception as e:
+            # A failure nobody planned for holds cold email and pauses checks
+            # (it may well happen for every address); it never stops the cycle.
+            return Clearance(allowed=False, held=True, pause_checks=True, retry_address=True,
+                             hold_kind="unavailable",
+                             reason=_clean(self._redact(
+                                 f"Precleared check failed ({type(e).__name__}: {e})"))[:240])
         if not result.held and result.verdict in DEFINITE_VERDICTS:
             # One entry per address: a fresh verdict replaces any earlier
             # one, including legacy entries written without a fingerprint.
-            await state.set_setting(key, json.dumps({
+            await state.set_setting(SETTINGS_PREFIX + email, json.dumps({
                 "verdict": result.verdict,
                 "reason": result.reason,
                 "receipt_id": result.receipt_id,
                 "country": result.country,
                 "checked_at": _utcnow().isoformat(),
-                "inputs": inputs,
+                "inputs": self._fingerprint(),
             }))
         return result
 
@@ -213,19 +255,44 @@ class PreclearedClient:
             "User-Agent": "harvey (+https://github.com/ethanplusai/harvey)",
         }
         if self.api_key:
+            if not re.fullmatch(r"[!-~]+", self.api_key):
+                # A key is plain printable ASCII. One pasted with a curly
+                # quote, a space or a line break can't be sent as a header,
+                # and the error would print it back, so it isn't tried.
+                return Clearance(allowed=False, held=True, pause_checks=True,
+                                 hold_kind="key_rejected", fix_url=GET_KEY_URL,
+                                 reason="PRECLEARED_API_KEY has a character that can't be "
+                                        "sent (a curly quote, a space or a line break); "
+                                        "check it in .env")
             headers["Authorization"] = f"Bearer {self.api_key}"
 
         try:
             async with httpx.AsyncClient(timeout=TIMEOUT, transport=self._transport) as client:
-                resp = await client.post(API_URL, json=payload, headers=headers)
+                resp = await asyncio.wait_for(
+                    client.post(API_URL, json=payload, headers=headers), TOTAL_TIMEOUT)
         except httpx.HTTPError as e:
-            return Clearance(allowed=False, held=True, hold_kind="unavailable",
+            # No answer in time may be this address (a slow lookup); no
+            # connection, or one dropped (a restart), is the same for everyone.
+            slow = isinstance(e, httpx.ReadTimeout)
+            return Clearance(allowed=False, held=True, pause_checks=True, retry_address=slow,
+                             hold_kind="unavailable",
                              reason=self._redact(f"Precleared unreachable: {e}"))
+        except asyncio.TimeoutError:
+            return Clearance(allowed=False, held=True, pause_checks=True, retry_address=True,
+                             hold_kind="unavailable",
+                             reason="Precleared took too long to answer")
 
         if resp.status_code == 429:
+            if self.api_key or _error_code(resp) == "rate_limited":
+                # A key that runs out of checks gets a 402, so a 429 on a key
+                # is Precleared's per-minute rate limit, not the daily one.
+                return Clearance(allowed=False, held=True, pause_checks=True,
+                                 hold_kind="rate_limited",
+                                 reason="Precleared rate limit reached; asking again next cycle")
             # Keyless allowance used up: a free key gives this install its own.
             return Clearance(
-                allowed=False, held=True, hold_kind="keyless_limit", fix_url=GET_KEY_URL,
+                allowed=False, held=True, pause_checks=True,
+                hold_kind="keyless_limit", fix_url=GET_KEY_URL,
                 reason="Precleared daily allowance used up; add PRECLEARED_API_KEY "
                        "(free key: https://precleared.dev/get-key) or wait until tomorrow",
             )
@@ -235,7 +302,8 @@ class PreclearedClient:
             # The 402 answer carries a checkout link for this key.
             buy_url = _buy_url(resp, self.api_key)
             return Clearance(
-                allowed=False, held=True, hold_kind="out_of_checks", fix_url=buy_url,
+                allowed=False, held=True, pause_checks=True,
+                hold_kind="out_of_checks", fix_url=buy_url,
                 reason=self._redact(
                     "Precleared: today's free checks on your key are used and it has "
                     f"no credits left; add a pack ({buy_url}) "
@@ -243,29 +311,36 @@ class PreclearedClient:
                 ),
             )
         if resp.status_code == 401:
-            return Clearance(allowed=False, held=True, hold_kind="key_rejected",
-                             fix_url=GET_KEY_URL,
+            return Clearance(allowed=False, held=True, pause_checks=True,
+                             hold_kind="key_rejected", fix_url=GET_KEY_URL,
                              reason="PRECLEARED_API_KEY was rejected (wrong or revoked)")
         if resp.status_code != 200:
-            return Clearance(allowed=False, held=True, hold_kind="unavailable",
+            # A busy or unreachable server affects every address; anything
+            # else may be about this address alone, so only its email waits.
+            return Clearance(allowed=False, held=True,
+                             pause_checks=resp.status_code in SERVER_BUSY, hold_kind="unavailable",
                              reason=f"Precleared HTTP {resp.status_code}: "
                                     f"{_clean(self._redact(resp.text))[:200]}")
 
         try:
             data = resp.json()
-        except ValueError:
-            return Clearance(allowed=False, held=True, hold_kind="unavailable",
-                             reason="Precleared returned invalid JSON")
+        except (ValueError, RecursionError):
+            return Clearance(allowed=False, held=True, pause_checks=True, retry_address=True,
+                             hold_kind="unavailable", reason="Precleared returned invalid JSON")
 
         # Only a JSON object with a known verdict counts as an answer.
         # Anything else is treated like an unavailable check, so cold email
-        # is held, not failed, and the rest of the cycle carries on.
+        # is held, not failed. A 200 means the check was made (and counted),
+        # and an answer Harvey can't read is about the API, not the address,
+        # so no more checks are spent on it this cycle.
         if not isinstance(data, dict):
-            return Clearance(allowed=False, held=True, hold_kind="unavailable",
+            return Clearance(allowed=False, held=True, pause_checks=True, retry_address=True,
+                             hold_kind="unavailable",
                              reason="Precleared returned an unexpected response (not a JSON object)")
         verdict = data.get("verdict")
         if not isinstance(verdict, str) or verdict not in VERDICTS:
-            return Clearance(allowed=False, held=True, hold_kind="unavailable",
+            return Clearance(allowed=False, held=True, pause_checks=True, retry_address=True,
+                             hold_kind="unavailable",
                              reason="Precleared returned a response without a known verdict")
 
         receipt = data.get("receipt")
@@ -278,7 +353,7 @@ class PreclearedClient:
         return Clearance(
             allowed=False,
             verdict=verdict,
-            reason=_reason(data),
+            reason=_clean(_reason(data)),
             receipt_id=receipt_id,
             country=country,
         )
@@ -316,6 +391,15 @@ def _contains_key(text: str, api_key: str) -> bool:
     return True
 
 
+def _error_code(resp: httpx.Response) -> str:
+    """The ``error`` field of a JSON error body, or ""."""
+    try:
+        data = resp.json()
+    except (ValueError, RecursionError):
+        return ""
+    return _text(data.get("error")) if isinstance(data, dict) else ""
+
+
 def _buy_url(resp: httpx.Response, api_key: str = "") -> str:
     """The checkout link from a 402 answer's ``buy_url``, or BUY_URL.
 
@@ -324,7 +408,7 @@ def _buy_url(resp: httpx.Response, api_key: str = "") -> str:
     """
     try:
         data = resp.json()
-    except ValueError:
+    except (ValueError, RecursionError):
         return BUY_URL
     url = data.get("buy_url") if isinstance(data, dict) else None
     if not (
@@ -547,6 +631,13 @@ def hold_message(hold: dict) -> dict:
                        "Check the key in .env, get a new free key at "
                        f"{url or GET_KEY_URL}, or switch the check off "
                        f"(compliance.precleared.enabled: false). {replies}"),
+        }
+    if kind == "rate_limited":
+        return {
+            "tone": "warn", "url": "", "url_label": "",
+            "title": "Precleared is limiting how fast Harvey can check",
+            "detail": (f"{emails}. Precleared allows a set number of checks a minute, "
+                       f"and Harvey asks again next cycle. {replies}"),
         }
     reason = _text(_clean(_text(hold.get("reason")))) or "no answer"
     return {
