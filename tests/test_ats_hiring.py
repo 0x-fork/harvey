@@ -321,7 +321,7 @@ async def test_a_board_with_no_matching_role_records_only_the_count():
                    {"https://api.lever.co/v0/postings/acme?mode=json": LEVER},
                    keywords=["chief of staff"])
     obs = await c.profile_company("c1", "acme.com")
-    assert [(o["signal_code"], o["value_num"]) for o in obs] == [("OPEN_ROLES", 2)]
+    assert [(o["signal_code"], o["value_num"]) for o in obs] == [("OPEN_ROLES", 2), ("HIRING_ROLE", 0)]
 
 
 @pytest.mark.asyncio
@@ -470,3 +470,142 @@ async def test_a_product_page_about_hiring_is_not_the_careers_page():
     await c.profile_company("c1", "acme.com")
     assert "https://acme.com/company/careers" in c.requested
     assert "https://acme.com/scheduling/hiring-marketplaces" not in c.requested
+
+
+# ── review fixes ──
+
+@pytest.mark.asyncio
+async def test_a_board_with_no_matching_role_says_not_hiring():
+    home = HOME.replace("/careers", "https://jobs.lever.co/acme")
+    c = _collector({"HIRING_ROLE"}, {"https://acme.com": home},
+                   {"https://api.lever.co/v0/postings/acme?mode=json": LEVER},
+                   keywords=["chief of staff"])
+    obs = await c.profile_company("c1", "acme.com")
+    assert [(o["signal_code"], o["value_num"], o["value_text"]) for o in obs] == [("HIRING_ROLE", 0, "")]
+    assert obs[0]["evidence_url"] == "https://jobs.lever.co/acme"
+
+
+@pytest.mark.asyncio
+async def test_a_closed_role_stops_being_current(state):
+    await seed_signal_catalog(state)
+    cid = await state.add_company(Company(name="Acme", domain="acme.com"))
+    await state.add_observations([{
+        "company_id": cid, "signal_code": "HIRING_ROLE", "collector": "profile",
+        "value_text": "Head of Growth · Marketing", "observed_at": "2026-09-01 10:00:00"}], run_id="r1")
+    assert await state.cohort(["HIRING_ROLE"]) == [cid]
+    # Next month the board no longer lists a matching role.
+    await state.add_observations([{
+        "company_id": cid, "signal_code": "HIRING_ROLE", "collector": "profile",
+        "value_num": 0, "value_text": "", "observed_at": "2026-10-01 10:00:00"}], run_id="r2")
+    assert await state.cohort(["HIRING_ROLE"]) == []
+    assert not any(r["signal_code"] == "HIRING_ROLE" for r in await state.signal_counts())
+
+
+@pytest.mark.asyncio
+async def test_a_failing_board_read_keeps_the_other_signals(monkeypatch):
+    import harvey.collectors.profile as P
+    home = HOME.replace("/careers", "https://jobs.lever.co/acme") + '<script src="https://js.stripe.com/v3"></script>'
+
+    async def boom(client, board):
+        raise RecursionError("deep")
+
+    monkeypatch.setattr(P, "read_board", boom)
+    c = _collector({"HIRING_ROLE", "OPEN_ROLES", "TECH_STACK"}, {"https://acme.com": home}, {})
+    obs = await c.profile_company("c1", "acme.com")
+    assert [o["signal_code"] for o in obs] == ["TECH_STACK"]
+
+
+@pytest.mark.asyncio
+async def test_deeply_nested_json_reads_as_none(monkeypatch):
+    # Deep nesting makes json.loads raise RecursionError on 3.11/3.12; newer
+    # Pythons parse it. Simulate the raise so every version checks the catch.
+    import harvey.collectors.ats as ats
+
+    def too_deep(_):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(ats.json, "loads", too_deep)
+    async with _client(lambda r: httpx.Response(
+            200, content=b"[[[[]]]]", headers={"content-type": "application/json"})) as client:
+        assert await read_board(client, Board("lever", "acme")) is None
+
+
+def test_encoded_tokens_are_decoded_once():
+    board = detect_board('<a href="https://jobs.ashbyhq.com/Acme%20Inc">Jobs</a>', "acme.com")
+    assert board.token == "Acme Inc"
+    assert feed_url(board) == "https://api.ashbyhq.com/posting-api/job-board/Acme%20Inc"
+
+
+@pytest.mark.parametrize("html", [
+    '<script src="https://boards.greenhouse.io/embed.js"></script>',
+    '<script src="https://jobs.ashbyhq.com/embed.js"></script>',
+    '<script src="https://jobs.lever.co/widget.min.js"></script>',
+    '<a href="mailto:jobs@acme.workable.com">Email us</a>',
+    "<p>Write to careers@acme.workable.com</p>",
+])
+def test_asset_names_and_emails_are_not_boards(html):
+    assert detect_board(html, "acme.com") is None
+
+
+def test_greenhouse_job_app_embed_is_a_board():
+    html = '<iframe src="https://boards.greenhouse.io/embed/job_app?for=acme&token=123"></iframe>'
+    assert detect_board(html, "acme.com") == Board("greenhouse", "acme")
+
+
+def test_a_page_listing_many_boards_is_nobodys():
+    html = ('<a href="https://jobs.lever.co/portco1">1</a>'
+            '<a href="https://boards.greenhouse.io/portco2">2</a>'
+            '<a href="https://jobs.ashbyhq.com/portco3">3</a>')
+    assert detect_board(html, "bigvc.com") is None
+    # ...unless one of them is named like the site.
+    assert detect_board(html + '<a href="https://jobs.lever.co/bigvc">us</a>', "bigvc.com") == Board("lever", "bigvc")
+    # Two boards is still a choice (a customer story plus their own).
+    assert detect_board(html.split("<a href=\"https://jobs.ashbyhq")[0], "x.com") is not None
+
+
+@pytest.mark.parametrize("keyword, title, hit", [
+    ("vp marketing", "Vice President, Marketing", True),
+    ("vice president of sales", "VP Sales", True),
+    ("cmo", "Chief Marketing Officer", True),
+    ("chief technology officer", "CTO", True),
+    ("senior account executive", "Sr. Account Executive", True),
+    ("frontend engineer", "Front-End Engineer", True),
+    ("ceo", "Executive Assistant to the CEO", False),
+    ("ceo", "Chief of Staff to the CEO", False),
+    ("vp marketing", "Assistant to the VP of Marketing", False),
+    ("ceo", "CEO", True),
+])
+def test_role_equivalences_and_assistants(keyword, title, hit):
+    assert bool(matching_roles([parse_feed("lever", [{"text": title}])[0]], [keyword])) is hit
+
+
+def test_the_hiring_preset_needs_roles():
+    empty = _config(titles=(), hiring=())
+    problem = preset_problem("hiring", "serper", config=empty)
+    assert problem and "hiring_signals" in problem
+    assert preset_problem("hiring", "serper", config=_config()) is None
+    assert preset_problem("yc", "serper", config=empty) is None
+
+
+@pytest.mark.parametrize("domain", [
+    "jobs.lever.co", "jobs.ashbyhq.com", "apply.workable.com", "jobs.smartrecruiters.com",
+    "jobs.jobvite.com", "jobs.co.uk", "careers.co.uk", "careers-acme.icims.com", "acme.bamboohr.com",
+    "acme.recruitee.com", "acme.teamtailor.com", "acme.jobs.personio.de", "acme.breezy.hr",
+    "acme.applytojob.com", "ats.rippling.com", "acme.wd5.myworkdayjobs.com",
+])
+@pytest.mark.asyncio
+async def test_hiring_preset_hits_on_ats_hosts_are_never_prospects(state, monkeypatch, domain):
+    from harvey.collectors import discover as D
+    monkeypatch.setitem(D.PROVIDERS, "fake", _OneHit(domain))
+    monkeypatch.setattr("harvey.config.load_env", lambda: SimpleNamespace(model_dump=lambda: {}),
+                        raising=False)
+    await seed_signal_catalog(state)
+    await state.set_signal_status("FOUND_IN_SERP", "confirmed")
+    report = await run_discovery(state, _config(), "fake", build_queries(_config(), preset="hiring")[:1])
+    assert report.new_companies == 0 and report.junk == 1
+
+
+def test_the_hiring_preset_excludes_other_ats_hosts():
+    [q] = build_queries(_config(hiring=("SDR",)), preset="hiring")
+    for site in ("smartrecruiters.com", "jobvite.com", "icims.com", "bamboohr.com", "myworkdayjobs.com"):
+        assert f"-site:{site}" in q.term

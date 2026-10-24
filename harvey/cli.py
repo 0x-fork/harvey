@@ -580,7 +580,7 @@ def cmd_discover(args):
         # Semicolons, not commas: "Denver, CO" is one city, not two.
         cities = [c.strip() for c in args.city.split(";") if c.strip()] or None
         preset = getattr(args, "preset", "") or ""
-        problem = preset_problem(preset, args.provider)
+        problem = preset_problem(preset, args.provider, config=config)
         if problem:
             print(f"\n  {problem}\n")
             sys.exit(2)

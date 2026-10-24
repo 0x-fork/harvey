@@ -1511,7 +1511,7 @@ def _discovery_queries(body: dict, config):
     from harvey.collectors.discover import build_queries, preset_problem
 
     preset = str(body.get("preset") or "")
-    problem = preset_problem(preset, str(body.get("provider") or ""))
+    problem = preset_problem(preset, str(body.get("provider") or ""), config=config)
     if problem:
         raise ValueError(problem)
     cities = [c.strip() for c in (body.get("cities") or []) if c.strip()] or None

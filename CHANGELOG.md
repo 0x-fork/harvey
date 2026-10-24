@@ -17,7 +17,13 @@ minor versions can still change behaviour.
   script loads them. `HIRING_ROLE` now records the roles matching
   `icp.hiring_signals` (else `icp.titles`) with department, location,
   posting date and the posting's URL; the new `OPEN_ROLES` signal counts the
-  board's open roles. Sites without a board still get the careers-page read.
+  board's open roles. When the board lists no matching role, `HIRING_ROLE`
+  is recorded as 0, so a role that has closed stops counting in cohorts and
+  shows as "no" to the reviewer. Matching folds VP/Vice President, CMO/Chief
+  Marketing Officer and similar, and "Assistant to the CEO" is not a CEO
+  role. Pages linking three or more boards, none named like the site (an
+  agency or a VC portfolio page), are attributed to nobody. Sites without a
+  board still get the careers-page read.
   The new `hiring` discovery preset (`harvey discover --preset hiring`, or
   *Look for: Companies hiring for your roles*) searches through Serper or
   DataForSEO SERP for companies whose own careers pages list your roles.

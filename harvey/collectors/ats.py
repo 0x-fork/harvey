@@ -19,7 +19,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 import httpx
 
@@ -38,25 +38,30 @@ _TOKEN = r"([A-Za-z0-9][A-Za-z0-9_.%-]*)"
 # (ats, pattern). The token is group 1 except where noted.
 _BOARD_RES = (
     ("greenhouse", re.compile(
-        rf"(?:job-)?boards\.greenhouse\.io{_S}embed{_S}job_board(?:{_S}js)?\?"
+        rf"(?:job-)?boards\.greenhouse\.io{_S}embed{_S}job_(?:board|app)(?:{_S}js)?\?"
         r"(?:[^\"'\s<>]*?&(?:amp;)?)?for=([A-Za-z0-9_-]+)", re.I)),
     ("greenhouse", re.compile(rf"boards-api\.greenhouse\.io{_S}v1{_S}boards{_S}([A-Za-z0-9_-]+)", re.I)),
-    ("greenhouse", re.compile(rf"(?<![\w.-])(?:job-)?boards\.greenhouse\.io{_S}([A-Za-z0-9_-]+)", re.I)),
-    ("lever", re.compile(rf"(?<![\w.-])jobs\.lever\.co{_S}{_TOKEN}", re.I)),
-    ("lever", re.compile(rf"(?<![\w.-])api\.lever\.co{_S}v0{_S}postings{_S}{_TOKEN}", re.I)),
-    ("lever_eu", re.compile(rf"(?<![\w.-])jobs\.eu\.lever\.co{_S}{_TOKEN}", re.I)),
-    ("lever_eu", re.compile(rf"(?<![\w.-])api\.eu\.lever\.co{_S}v0{_S}postings{_S}{_TOKEN}", re.I)),
-    ("ashby", re.compile(rf"jobs\.ashbyhq\.com{_S}{_TOKEN}", re.I)),
+    ("greenhouse", re.compile(rf"(?<![\w.@-])(?:job-)?boards\.greenhouse\.io{_S}([A-Za-z0-9_-]+)", re.I)),
+    ("lever", re.compile(rf"(?<![\w.@-])jobs\.lever\.co{_S}{_TOKEN}", re.I)),
+    ("lever", re.compile(rf"(?<![\w.@-])api\.lever\.co{_S}v0{_S}postings{_S}{_TOKEN}", re.I)),
+    ("lever_eu", re.compile(rf"(?<![\w.@-])jobs\.eu\.lever\.co{_S}{_TOKEN}", re.I)),
+    ("lever_eu", re.compile(rf"(?<![\w.@-])api\.eu\.lever\.co{_S}v0{_S}postings{_S}{_TOKEN}", re.I)),
+    ("ashby", re.compile(rf"(?<![\w.@-])jobs\.ashbyhq\.com{_S}{_TOKEN}", re.I)),
     ("ashby", re.compile(rf"api\.ashbyhq\.com{_S}posting-api{_S}job-board{_S}{_TOKEN}", re.I)),
     ("workable", re.compile(rf"apply\.workable\.com{_S}api{_S}v1{_S}widget{_S}accounts{_S}([A-Za-z0-9_-]+)", re.I)),
-    ("workable", re.compile(rf"apply\.workable\.com{_S}([A-Za-z0-9_-]+)", re.I)),
-    ("workable", re.compile(r"(?<![\w.-])([a-z0-9][a-z0-9-]*)\.workable\.com(?![\w-])", re.I)),
+    ("workable", re.compile(rf"(?<![\w.@-])apply\.workable\.com{_S}([A-Za-z0-9_-]+)", re.I)),
+    ("workable", re.compile(r"(?<![\w.@-])([a-z0-9][a-z0-9-]*)\.workable\.com(?![\w-])", re.I)),
 )
 # Path segments and subdomains that are the ATS's own pages, not a company.
 _NOT_TOKENS = frozenset("""
 embed api j v0 v1 jobs job job_board posting-api www apply app help resources
 careers static assets cdn widget accounts blog login signin
 """.split())
+# Script and asset names on the ATS hosts ("boards.greenhouse.io/embed.js").
+_ASSET = re.compile(r"\.(js|mjs|css|json|png|jpe?g|svg|gif|ico|webp|woff2?|map)$", re.I)
+# A page linking this many boards, none of them named like the site, is a
+# staffing agency's or a VC's portfolio page: none of them is the company's.
+MANY_BOARDS = 3
 
 
 @dataclass(frozen=True)
@@ -118,8 +123,8 @@ def detect_board(html: str, domain: str = "") -> Board | None:
     first: dict[Board, int] = {}
     for ats, pattern in _BOARD_RES:
         for m in pattern.finditer(html):
-            token = m.group(1).strip(".")
-            if not token or token.lower() in _NOT_TOKENS:
+            token = unquote(m.group(1)).strip(".").strip()
+            if not token or token.lower() in _NOT_TOKENS or _ASSET.search(token):
                 continue
             board = Board(ats, token)
             found[board] += 1
@@ -132,7 +137,10 @@ def detect_board(html: str, domain: str = "") -> Board | None:
         token = _alnum(board.token)
         return len(name) >= 3 and len(token) >= 3 and (name in token or token in name)
 
-    return max(found, key=lambda b: (named_like_them(b), found[b], -first[b]))
+    best = max(found, key=lambda b: (named_like_them(b), found[b], -first[b]))
+    if not named_like_them(best) and len(found) >= MANY_BOARDS:
+        return None
+    return best
 
 
 def feed_url(board: Board) -> str:
@@ -271,18 +279,41 @@ async def read_board(client: httpx.AsyncClient, board: Board) -> list[Posting] |
         logger.debug(f"ats: fetch failed {url}: {e}")
         return None
     try:
-        payload = json.loads(bytes(body))
-    except ValueError:
+        return parse_feed(board.ats, json.loads(bytes(body)))
+    except (ValueError, RecursionError):
+        # RecursionError: pathologically nested JSON, which json.loads
+        # recurses into. A board that can't be read is no board.
         return None
-    return parse_feed(board.ats, payload)
 
 
 # ── which roles count ──
 
 _FILLER_WORDS = frozenset({"of", "the", "and", "for", "a", "an", "&", "to"})
+# Spellings of the same role, folded to one before comparing words.
+_EQUIVALENT = tuple((re.compile(p, re.I), r) for p, r in (
+    (r"\bvice[\s-]+president\b", "vp"),
+    (r"\bchief\s+executive\s+officer\b", "ceo"),
+    (r"\bchief\s+marketing\s+officer\b", "cmo"),
+    (r"\bchief\s+technology\s+officer\b", "cto"),
+    (r"\bchief\s+technical\s+officer\b", "cto"),
+    (r"\bchief\s+financial\s+officer\b", "cfo"),
+    (r"\bchief\s+operating\s+officer\b", "coo"),
+    (r"\bchief\s+revenue\s+officer\b", "cro"),
+    (r"\bchief\s+product\s+officer\b", "cpo"),
+    (r"\bsr\b\.?", "senior"),
+    (r"\bjr\b\.?", "junior"),
+    (r"\bfront[\s-]+end\b", "frontend"),
+    (r"\bback[\s-]+end\b", "backend"),
+    (r"\bfull[\s-]+stack\b", "fullstack"),
+))
+# "Executive Assistant to the CEO" is not a CEO role: only the words before
+# "to (the)" name the role being hired.
+_REPORTS_TO = re.compile(r"\s+to\s+(?:the\s+|our\s+)?\S.*$", re.I)
 
 
 def _words(text: str) -> set[str]:
+    for pattern, replacement in _EQUIVALENT:
+        text = pattern.sub(replacement, text)
     return set(re.findall(r"[a-z0-9+#]+", text.lower()))
 
 
@@ -303,4 +334,5 @@ def matching_roles(postings: list[Posting], keywords: list[str]) -> list[Posting
     """Postings whose title holds every word of some keyword, in any order:
     "VP Marketing" matches "VP of Marketing", "cto" doesn't match "Director"."""
     wanted = [w for w in ((_words(k) - _FILLER_WORDS) for k in keywords) if w]
-    return [p for p in postings if any(w <= _words(p.title) for w in wanted)]
+    return [p for p in postings
+            if any(w <= _words(_REPORTS_TO.sub("", p.title)) for w in wanted)]

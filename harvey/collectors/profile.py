@@ -472,6 +472,42 @@ class ProfileCollector:
                 break
         return await self._first_present(site, CAREERS_PATHS)
 
+    async def _hiring(self, site: str, home: str, domain: str, add) -> None:
+        curl, chtml = "", ""
+        board = detect_board(home, domain)
+        if board is None:
+            curl, chtml = await self._careers_page(site, home, domain)
+            board = detect_board(chtml, domain)
+        postings = await read_board(self._client, board) if board else None
+        if postings is not None:
+            add("OPEN_ROLES", num=len(postings), text=board.label, url=board.page_url)
+            keywords = getattr(self, "role_keywords", None) or []
+            matched = matching_roles(postings, keywords)[:MAX_BOARD_ROLES]
+            for post in matched:
+                add("HIRING_ROLE", text=post.summary(), url=post.url or board.page_url)
+            if not matched:
+                # The board answered and lists nothing relevant: say so, so
+                # last month's (now closed) roles stop being the current view.
+                add("HIRING_ROLE", num=0, url=board.page_url)
+            return
+        if board and not chtml:
+            curl, chtml = await self._careers_page(site, home, domain)
+        if chtml and self.wants("HIRING_ROLE"):
+            roles = []
+            for m in re.finditer(
+                r"(?is)<(h[2-5]|a|li)[^>]*>\s*([^<]{6,70})\s*</\1>", _strip_code(chtml)
+            ):
+                t = re.sub(r"\s+", " ", m.group(2)).strip()
+                if re.search(r"\b(hiring|apply|position|opening|wanted|"
+                             r"technician|installer|sales|manager|foreman|"
+                             r"estimator|crew|representative)\b", t, re.I):
+                    if t.lower() not in [r.lower() for r in roles]:
+                        roles.append(t)
+                if len(roles) >= 3:
+                    break
+            for r in roles:
+                add("HIRING_ROLE", text=r, url=curl)
+
     # ── individual detectors ──
 
     def detect_agency(self, html: str, domain: str) -> tuple[str, float, str] | None:
@@ -681,37 +717,13 @@ class ProfileCollector:
 
         # open roles → hiring intent. The job-board feed when their site
         # links one (titles, departments and dates for every role), else
-        # whatever the careers page's own HTML lists.
+        # whatever the careers page's own HTML lists. Any failure here costs
+        # only these two signals, never the rest of the profile.
         if self.wants("HIRING_ROLE") or self.wants("OPEN_ROLES"):
-            curl, chtml = "", ""
-            board = detect_board(home, domain)
-            if board is None:
-                curl, chtml = await self._careers_page(site, home, domain)
-                board = detect_board(chtml, domain)
-            postings = await read_board(self._client, board) if board else None
-            if postings is not None:
-                add("OPEN_ROLES", num=len(postings), text=board.label, url=board.page_url)
-                keywords = getattr(self, "role_keywords", None) or []
-                for post in matching_roles(postings, keywords)[:MAX_BOARD_ROLES]:
-                    add("HIRING_ROLE", text=post.summary(), url=post.url or board.page_url)
-            else:
-                if board and not chtml:
-                    curl, chtml = await self._careers_page(site, home, domain)
-                if chtml and self.wants("HIRING_ROLE"):
-                    roles = []
-                    for m in re.finditer(
-                        r"(?is)<(h[2-5]|a|li)[^>]*>\s*([^<]{6,70})\s*</\1>", _strip_code(chtml)
-                    ):
-                        t = re.sub(r"\s+", " ", m.group(2)).strip()
-                        if re.search(r"\b(hiring|apply|position|opening|wanted|"
-                                     r"technician|installer|sales|manager|foreman|"
-                                     r"estimator|crew|representative)\b", t, re.I):
-                            if t.lower() not in [r.lower() for r in roles]:
-                                roles.append(t)
-                        if len(roles) >= 3:
-                            break
-                    for r in roles:
-                        add("HIRING_ROLE", text=r, url=curl)
+            try:
+                await self._hiring(site, home, domain, add)
+            except Exception as e:
+                logger.info(f"profile: {domain} open roles unread: {type(e).__name__}: {e}")
 
         # team page → people
         if self.wants("CONTACT_FOUND") or self.wants("DECISION_MAKER_TITLE"):
