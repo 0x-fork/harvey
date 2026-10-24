@@ -188,9 +188,11 @@ def test_the_outbox_card_on_today_says_which_mode(client, monkeypatch):
     st = StateManager(str(client.db_path))
     asyncio.run(st.init_db())
     import sqlite3
-    with sqlite3.connect(client.db_path) as db:
+    db = sqlite3.connect(client.db_path)
+    with db:   # commits; close() below lets Windows delete the temp database
         db.execute("INSERT INTO outbox (id, prospect_id, kind, step, to_email, subject, body, status, send_at) "
                    "VALUES ('o1', 'p', 'reply', 1, 'a@x.test', 's', 'b', 'pending_review', ?)", (_now_iso(),))
+    db.close()
     for approval, words in ((True, "Nothing sends until you approve it"), (False, "Autopilot sends the rest")):
         monkeypatch.setattr(dash, "_require_approval_now", lambda a=approval: a)
         [card] = [i for i in client.get("/api/today").json()["items"] if i["key"] == "outbox"]
