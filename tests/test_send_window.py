@@ -508,9 +508,9 @@ async def test_without_recipient_zones_quiet_hours_hold_everything(state, monkey
 async def test_existing_prospects_get_an_empty_zone_on_upgrade(tmp_path):
     db_path = str(tmp_path / "old.db")
     async with aiosqlite.connect(db_path) as db:
-        for script in MIGRATIONS[:11]:  # a database from before v12
+        for script in MIGRATIONS[:13]:  # a database from before v14
             await db.executescript(script)
-        await db.execute("PRAGMA user_version = 11")
+        await db.execute("PRAGMA user_version = 13")
         await db.execute("INSERT INTO prospects (id, email, first_name) VALUES ('p1', 'a@b.co', 'A')")
         await db.commit()
     sm = StateManager(db_path)
