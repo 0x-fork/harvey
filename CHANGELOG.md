@@ -117,7 +117,8 @@ minor versions can still change behaviour.
   the hold, and the Today page and `harvey status` say how many cold emails
   are waiting and what fixes it: a free key, a pack for that key (the checkout
   link from Precleared's answer), or nothing but time. The next fresh answer
-  clears it, and a hold not seen for a day is ignored.
+  clears it, a hold not seen for a day is ignored, and switching the check
+  off clears it. (from #57 by gabrielaoimevbore-beep)
 
 ### Changed
 

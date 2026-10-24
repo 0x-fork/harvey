@@ -229,7 +229,7 @@ class PreclearedClient:
                              reason="PRECLEARED_API_KEY was rejected (wrong or revoked)")
         if resp.status_code != 200:
             return Clearance(allowed=False, held=True, hold_kind="unavailable",
-                             reason=self._redact(f"Precleared HTTP {resp.status_code}: {resp.text[:200]}"))
+                             reason=f"Precleared HTTP {resp.status_code}: {self._redact(resp.text)[:200]}")
 
         try:
             data = resp.json()
@@ -403,7 +403,9 @@ async def record_hold(state, clearance: Clearance, waiting: int) -> None:
     a cycle hit it.
     """
     try:
-        previous = parse_status(await state.get_setting(STATUS_KEY))
+        # Only a hold still current carries its ``since`` over; one not seen
+        # for STATUS_MAX_AGE is over, and this starts a new one.
+        previous = await current_hold(state)
         kind = clearance.hold_kind if clearance.hold_kind in HOLD_KINDS else "unavailable"
         now = _utcnow().replace(microsecond=0).isoformat()
         since = previous.get("since") if (

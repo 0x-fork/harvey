@@ -604,6 +604,10 @@ class Sender:
 
     async def _drain_due(self):
         """Send due, approved outbox items through the provider."""
+        if self.precleared is None:
+            # Check switched off: cold email no longer waits on it, so a
+            # hold recorded while it was on must not stay on Today.
+            await clear_hold(self.state)
         if not self.provider.is_configured():
             logger.warning(
                 f"Sender: mail provider '{self.provider.name}' is not configured "
@@ -799,6 +803,14 @@ class Sender:
 
         if self.precleared is not None:
             if hold is not None:
+                # The page read above stops at a few times the cycle's
+                # budget; count every due cold email still waiting.
+                still_due = await self.state.get_outbox(
+                    status="approved", due_before=now, limit=1000,
+                    skip_unready_follow_ups=True,
+                )
+                waiting_on_check = max(waiting_on_check, sum(
+                    1 for i in still_due if i["kind"] == "sequence"))
                 await record_hold(self.state, hold, waiting_on_check)
             elif answered:
                 await clear_hold(self.state)

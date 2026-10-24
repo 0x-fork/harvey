@@ -42,12 +42,12 @@ async def state():
 
 
 async def two_cold_and_a_reply(state):
-    jane = await seed_prospect(state)
-    sam = await seed_prospect(state, email="sam@beta.com")
-    await queue(state, jane)
-    await queue(state, sam, to="sam@beta.com")
-    ann = await seed_prospect(state, email="ann@gamma.com", status="replied")
-    await queue(state, ann, kind="reply", to="ann@gamma.com")
+    jane = await seed_prospect(state, email="jane@example.com")
+    sam = await seed_prospect(state, email="sam@example.net")
+    await queue(state, jane, to="jane@example.com")
+    await queue(state, sam, to="sam@example.net")
+    ann = await seed_prospect(state, email="ann@example.org", status="replied")
+    await queue(state, ann, kind="reply", to="ann@example.org")
 
 
 async def stored(state):
@@ -66,7 +66,7 @@ async def test_keyless_limit_records_a_hold_pointing_to_a_free_key(state):
 
     await sender._drain_due()
 
-    assert [m["to"] for m in provider.sent] == ["ann@gamma.com"]
+    assert [m["to"] for m in provider.sent] == ["ann@example.org"]
     hold = await stored(state)
     assert hold["status"] == "held"
     assert hold["kind"] == "keyless_limit"
@@ -130,29 +130,29 @@ async def test_since_is_kept_while_the_same_hold_continues(state):
 async def test_a_fresh_answer_clears_the_hold(state):
     await record_hold(state, Clearance(allowed=False, held=True, hold_kind="keyless_limit",
                                        fix_url="https://precleared.dev/get-key"), 2)
-    pid = await seed_prospect(state)
-    await queue(state, pid)
+    pid = await seed_prospect(state, email="jane@example.com")
+    await queue(state, pid, to="jane@example.com")
     provider = FakeProvider()
     sender = with_check(make_sender(state, provider), mock_status(200, OK_BODY))
 
     await sender._drain_due()
 
-    assert [m["to"] for m in provider.sent] == ["jane@acme.com"]
+    assert [m["to"] for m in provider.sent] == ["jane@example.com"]
     assert await state.get_setting(STATUS_KEY) == ""
     assert await current_hold(state) == {}
 
 
 @pytest.mark.asyncio
 async def test_a_cached_verdict_alone_does_not_clear_the_hold(state):
-    pid = await seed_prospect(state)
+    pid = await seed_prospect(state, email="jane@example.com")
     provider = FakeProvider()
     sender = with_check(make_sender(state, provider), mock_status(200, OK_BODY))
-    await queue(state, pid, step=1)
+    await queue(state, pid, step=1, to="jane@example.com")
     await sender._drain_due()  # caches jane's verdict
 
     await record_hold(state, Clearance(allowed=False, held=True, hold_kind="keyless_limit"), 1)
     await days_pass(state)
-    await queue(state, pid, step=2)
+    await queue(state, pid, step=2, to="jane@example.com")
     # Step 2 goes out on the cached verdict without asking Precleared, so
     # nothing says the allowance is back: the hold stays.
     await sender._drain_due()
@@ -265,3 +265,73 @@ def test_cli_status_shows_the_hold(monkeypatch, tmp_path, capsys):
     assert f"Precleared:           HOLDING COLD EMAIL since {since}" in out
     assert "2 cold emails are waiting" in out
     assert "PRECLEARED_API_KEY" in out
+
+
+# ── integration fixes ──
+
+
+@pytest.mark.asyncio
+async def test_since_restarts_after_a_stale_gap(state):
+    # A hold last seen days ago (Harvey stopped, or the check was off) is
+    # over: hitting the same kind again starts a new one, not "since" then.
+    old = (datetime.now(timezone.utc) - timedelta(days=3)).replace(microsecond=0).isoformat()
+    await state.set_setting(STATUS_KEY, json.dumps({
+        "status": "held", "kind": "keyless_limit", "waiting": 1,
+        "url": "", "reason": "", "since": old, "at": old,
+    }))
+
+    await record_hold(state, Clearance(allowed=False, held=True, hold_kind="keyless_limit"), 2)
+
+    hold = await stored(state)
+    assert hold["since"] == hold["at"]
+    assert hold["since"] != old
+
+
+@pytest.mark.asyncio
+async def test_switching_the_check_off_clears_a_recorded_hold(state):
+    # With the check off, cold email no longer waits on Precleared, so a
+    # card saying it does would be wrong.
+    await record_hold(state, Clearance(allowed=False, held=True, hold_kind="key_rejected"), 4)
+    await two_cold_and_a_reply(state)
+    provider = FakeProvider()
+    sender = make_sender(state, provider)
+    sender.precleared = None
+
+    await sender._drain_due()
+
+    assert len(provider.sent) == 3
+    assert await current_hold(state) == {}
+
+
+@pytest.mark.asyncio
+async def test_waiting_counts_every_cold_email_behind_the_hold(state):
+    # More cold email is due than one cycle reads; the count must not stop
+    # at the page size.
+    for n in range(30):
+        email = f"person{n}@example.com"
+        pid = await seed_prospect(state, email=email)
+        await queue(state, pid, to=email)
+    sender = with_check(make_sender(state, FakeProvider()),
+                        mock_status(429, {"error": "daily_limit"}))
+
+    await sender._drain_due()
+
+    assert (await stored(state))["waiting"] == 30
+
+
+@pytest.mark.asyncio
+async def test_no_piece_of_the_key_reaches_the_hold(state):
+    # An error body that echoes the key across the 200-character cut must
+    # not leave its first characters in the reason shown on Today.
+    key = "pc_live_Zq8vN3kW1xR7tB5yM2"
+    body = "x" * 190 + key
+    transport = httpx.MockTransport(lambda request: httpx.Response(500, text=body))
+    await two_cold_and_a_reply(state)
+    sender = with_check(make_sender(state, FakeProvider()), transport, api_key=key)
+
+    await sender._drain_due()
+
+    hold = await stored(state)
+    assert hold["kind"] == "unavailable"
+    assert key[:10] not in json.dumps(hold)
+    assert key[:10] not in hold_message(hold)["detail"]
