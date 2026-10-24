@@ -21,7 +21,8 @@ The recipient's zone comes from what Harvey already knows, in this order:
 A country with several zones and nothing more specific stays unresolved, as
 does an empty location. Those recipients get the window in
 ``usage.quiet_hours.timezone``, which is what Harvey did before. A resolved
-zone is stored on the prospect, so it is worked out once.
+zone is stored on the prospect, so it is worked out once (unless a country
+found later could still change it; see ``recipient_zone``).
 
 Two-letter codes follow the US convention: "Berlin, DE" reads as Delaware
 unless the cached coordinates or Precleared's country say Germany. Writing
@@ -355,6 +356,12 @@ def zone_for(location: str = "", country: str = "", point: str = "") -> str:
     return ""
 
 
+def _state_and_country_codes(location: str) -> list[str]:
+    """Two-letter codes in the location that are a US state and a country too."""
+    return [code for part in _parts(location) for code in part.split()
+            if code in US_STATES and country_code(code)]
+
+
 # ── The window itself ──
 
 def _clock(value: str) -> time:
@@ -435,9 +442,18 @@ async def recipient_zone(state, prospect, config, country: str = "") -> str:
     if location.strip():
         cached = await state.get_setting("geo:" + location.strip().lower())
         point = "" if not cached or cached == "-" else cached
-    hint = country_code(country) or _prospect_country(config)
+    known = country_code(country)
+    hint = known or _prospect_country(config)
     zone = zone_for(location, country=hint, point=point)
-    if zone:
+    # Not stored while a country found later could still change it: when
+    # only the configured prospect_country settled it, or when a code in
+    # the location is a US state and a country ("Berlin, DE") and nothing
+    # has said which. Precleared's country then still takes its place.
+    settled = zone and (hint == known or zone_for(location, country=known, point=point) == zone)
+    if settled and not known:
+        settled = all(zone_for(location, country=code, point=point) == zone
+                      for code in _state_and_country_codes(location))
+    if settled:
         prospect.timezone = zone
         await state.set_prospect_timezone(prospect.id, zone)
     return zone

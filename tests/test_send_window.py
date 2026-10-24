@@ -402,6 +402,67 @@ async def test_precleared_country_sets_the_zone_when_nothing_else_does(state, mo
 
 
 @pytest.mark.asyncio
+async def test_precleared_country_wins_over_the_configured_prospect_country(state, monkeypatch):
+    # prospect_country is the fallback for when nothing else places the
+    # recipient: once Precleared says Germany, the window is Berlin's, not
+    # the London one the configured default gave before the check ran.
+    from harvey.config import ComplianceConfig
+    pid = await seed_at(state, "", "lena@de-acme.example")
+    item = await approved(state, pid, "lena@de-acme.example")
+    calls = []
+    provider = FakeProvider()
+    sender = window_sender(state, provider, monkeypatch, operator_zone="Asia/Tokyo")
+    monkeypatch.setattr(sender.config, "compliance", ComplianceConfig(
+        precleared={"prospect_country": "GB"}), raising=False)
+    ok_de = {**OK_GB, "facts": {"recipient_country": "DE"}}
+    sender.precleared = PreclearedClient(sender_country="GB", transport=precleared_mock(calls, ok_de))
+
+    # 15:30 UTC on a Wednesday: 16:30 in London, 17:30 in Berlin.
+    pin_now(monkeypatch, datetime(2026, 10, 21, 15, 30))
+    await sender._drain_due()
+    assert provider.sent == [] and len(calls) == 1
+    assert (await state.get_prospect(pid)).timezone == "Europe/Berlin"
+    moved = datetime.fromisoformat((await outbox_row(state, item))["send_at"])
+    assert_office_hours(moved, "Europe/Berlin")
+
+
+@pytest.mark.asyncio
+async def test_precleared_country_settles_a_code_that_is_a_state_and_a_country(state, monkeypatch):
+    # "Berlin, DE" reads as Delaware until something says Germany. Staging
+    # mustn't store that reading for good, or Precleared's answer never counts.
+    pid = await seed_at(state, "Berlin, DE", "lena@de-acme.example", status="new")
+    campaign = await seed_campaign(state, [pid])
+    calls = []
+    provider = FakeProvider()
+    sender = window_sender(state, provider, monkeypatch)
+    ok_de = {**OK_GB, "facts": {"recipient_country": "DE"}}
+    sender.precleared = PreclearedClient(sender_country="GB", transport=precleared_mock(calls, ok_de))
+
+    # 15:30 UTC on a Wednesday: 11:30 in New York, 17:30 in Berlin.
+    pin_now(monkeypatch, datetime(2026, 10, 21, 15, 30))
+    await sender._stage_campaign_native(campaign)
+    first = [r for r in await state.get_outbox(limit=10) if r["step"] == 1][0]
+    await sender._drain_due()
+    assert provider.sent == [] and len(calls) == 1
+    assert (await state.get_prospect(pid)).timezone == "Europe/Berlin"
+    moved = datetime.fromisoformat((await outbox_row(state, first["id"]))["send_at"])
+    assert_office_hours(moved, "Europe/Berlin")
+
+
+@pytest.mark.asyncio
+async def test_a_state_code_that_is_also_a_country_still_gets_the_state_window(state, monkeypatch):
+    # Without Precleared nothing settles "DE", so it isn't stored, but the
+    # US reading still applies every time it's worked out.
+    pid = await seed_at(state, "Wilmington, DE", "sam@de-state.example", status="new")
+    campaign = await seed_campaign(state, [pid])
+    pin_now(monkeypatch, WED_0200)
+    await window_sender(state, FakeProvider(), monkeypatch)._stage_campaign_native(campaign)
+    for row in await state.get_outbox(limit=10):
+        assert_office_hours(datetime.fromisoformat(row["send_at"]), "America/New_York")
+    assert (await state.get_prospect(pid)).timezone == ""
+
+
+@pytest.mark.asyncio
 async def test_precleared_keeps_the_country_with_the_cached_verdict(state):
     calls = []
     client = PreclearedClient(sender_country="GB", transport=precleared_mock(calls, OK_GB))
