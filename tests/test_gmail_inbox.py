@@ -137,3 +137,33 @@ async def test_second_page_opt_out_cancels_approved_send(monkeypatch, tmp_path):
     assert harvey.mail.sent == []
     assert await harvey.state.is_reply_processed('stop')
     assert len(await harvey.state.get_outbox(status='cancelled')) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_message_already_read_is_not_downloaded_again():
+    """Every cycle reads the whole week's inbox. A Gmail message never
+    changes, so only new ones are fetched; the listing still comes first."""
+    p = provider([
+        {'messages': [{'id': 'm1'}, {'id': 'm2'}]}, message('m1'), message('m2', body='Stop'),
+        {'messages': [{'id': 'm3'}, {'id': 'm1'}, {'id': 'm2'}]}, message('m3'),
+        {'messages': [{'id': 'm3'}]},
+    ])
+    first = await p.get_replies()
+    second = await p.get_replies()
+    assert [m.provider_id for m in first] == ['m1', 'm2']
+    assert [m.provider_id for m in second] == ['m3', 'm1', 'm2']
+    assert second[2].body == 'Stop'
+    assert [m.provider_id for m in await p.get_replies()] == ['m3']
+    fetched = [c.args[1] for c in p._request.call_args_list if c.args[1] != '/messages']
+    assert fetched == ['/messages/m1', '/messages/m2', '/messages/m3']
+    assert set(p._read_cache) == {'m3'}          # what left the week is forgotten
+
+
+@pytest.mark.asyncio
+async def test_a_failed_read_keeps_what_it_did_read():
+    p = provider([{'messages': [{'id': 'm1'}], 'nextPageToken': 'next'}, message('m1'), None])
+    with pytest.raises(RuntimeError):
+        await p.get_replies()
+    assert p._read_cache.get('m1') is not None                 # read fine: kept
+    p._request = AsyncMock(side_effect=[{'messages': [{'id': 'm1'}]}])
+    assert [m.provider_id for m in await p.get_replies()] == ['m1']

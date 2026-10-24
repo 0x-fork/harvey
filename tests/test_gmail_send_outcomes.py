@@ -14,7 +14,15 @@ from tests.test_gmail_inbox import message
 
 def transport_provider(monkeypatch, handler):
     client = httpx.AsyncClient
-    transport = httpx.MockTransport(handler)
+
+    # The patch below replaces httpx.AsyncClient for the whole process, so
+    # other requests in a heartbeat (the Claude usage check) come here too.
+    # Only Gmail's reach the scripted handler, so they can't use up its replies.
+    def gmail_only(request):
+        if request.url.host != 'gmail.googleapis.com':
+            return httpx.Response(404, json={})
+        return handler(request)
+    transport = httpx.MockTransport(gmail_only)
     monkeypatch.setattr(gmail.httpx, 'AsyncClient',
                         lambda **kwargs: client(transport=transport, **kwargs))
     config = SimpleNamespace(persona=SimpleNamespace(

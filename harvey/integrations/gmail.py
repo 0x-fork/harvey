@@ -78,6 +78,10 @@ class GmailProvider(MailProvider):
         self.client_secret = getattr(env, "gmail_client_secret", "")
         self._access_token = ""
         self._access_expires = 0.0
+        # Messages already read, by Gmail id (None: not a reply we use).
+        # A Gmail message's content never changes, so each cycle's complete
+        # read only downloads what's new. Memory only.
+        self._read_cache: dict[str, InboundMessage | None] = {}
 
     def is_configured(self) -> bool:
         return bool(self.client_id and self.client_secret and _load_token())
@@ -229,17 +233,23 @@ class GmailProvider(MailProvider):
                     raise GmailError(f"inbox page {page}: message has no id")
                 if msg_id in seen_ids:
                     continue
-                data = await self._request(
-                    "GET", f"/messages/{msg_id}", params={"format": "full"}
-                )
-                if not isinstance(data, dict) or data.get("id") != msg_id:
-                    raise GmailError(f"inbox page {page}: could not read message {msg_id}")
-                msg = self._parse_message(data)
+                if msg_id in self._read_cache:
+                    msg = self._read_cache[msg_id]
+                else:
+                    data = await self._request(
+                        "GET", f"/messages/{msg_id}", params={"format": "full"}
+                    )
+                    if not isinstance(data, dict) or data.get("id") != msg_id:
+                        raise GmailError(f"inbox page {page}: could not read message {msg_id}")
+                    msg = self._parse_message(data)
+                    self._read_cache[msg_id] = msg
                 seen_ids.add(msg_id)
                 if msg:
                     out.append(msg)
             token = listing.get("nextPageToken")
             if token is None:
+                # A complete read: forget what has left the week's window.
+                self._read_cache = {k: v for k, v in self._read_cache.items() if k in seen_ids}
                 return out
             if not isinstance(token, str) or not token or token in seen_tokens:
                 raise GmailError(f"inbox page {page}: invalid or repeated nextPageToken")
