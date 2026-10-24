@@ -30,19 +30,28 @@ async def sync_sending_mode(config, state) -> bool:
 
 def held_message(hold: dict, waiting: int) -> tuple[str, str]:
     """What Today and `harvey status` say while sending is held because
-    replies couldn't all be read: (title, detail)."""
+    replies couldn't all be read or handled: (title, detail)."""
     reason = str(hold.get("reason") or "replies couldn't all be read").strip().rstrip(".")
     low = reason.lower()
-    if "harvey gmail auth" in low or "gmail" in low and ("sign" in low or "authoriz" in low):
-        fix = "Run `harvey gmail auth` to sign in again."
-    elif "harvey microsoft auth" in low or "microsoft" in low and "authoriz" in low:
-        fix = "Run `harvey microsoft auth` to sign in again."
-    elif "partial read" in low or "pages" in low:
-        fix = ("The mailbox got more mail in the last week than Harvey reads, so it can't "
-               "be sure it saw every reply. Send from a dedicated mailbox, or archive old mail.")
-    else:
+    if low.startswith("a reply from"):
+        # The inbox was read; handling one reply failed. Its text and the
+        # sender's address are no guide to a fix, so match nothing in it.
+        title = "Harvey isn't sending: it couldn't handle a reply"
         fix = "Harvey tries again every cycle; if this lasts, check the log."
+    else:
+        title = "Harvey isn't sending: it couldn't read your inbox"
+        # Only the providers' own messages name a fix.
+        if "harvey gmail auth" in low:
+            fix = "Run `harvey gmail auth` to sign in again."
+        elif "harvey microsoft auth" in low:
+            fix = "Run `harvey microsoft auth` to sign in again."
+        elif "refusing a partial read" in low:
+            fix = ("The mailbox got more mail in the last week than Harvey reads, so it can't "
+                   "be sure it saw every reply. Send from a dedicated mailbox, or archive old mail.")
+        else:
+            fix = "Harvey tries again every cycle; if this lasts, check the log."
     emails = "1 email is waiting" if waiting == 1 else f"{waiting} emails are waiting"
-    return ("Harvey isn't sending: it couldn't read your inbox",
+    return (title,
             f"{reason}. {fix} {emails}: replies are read first, so an opt-out "
-            f"stops its follow-up before anything goes. Held since {str(hold.get('since', '?'))[:16].replace('T', ' ')} UTC.")
+            f"stops its follow-up before anything goes. Held since "
+            f"{str(hold.get('since', '?'))[:16].replace('T', ' ')} UTC.")

@@ -100,7 +100,7 @@ def test_the_message_names_the_fix(reason, fix):
 # ── where it shows ──
 
 
-def test_today_shows_the_hold_first(client):
+def test_today_shows_the_hold(client):
     st = StateManager(str(client.db_path))
     asyncio.run(st.init_db())
     asyncio.run(st.note_sends_held("Gmail: not signed in to Gmail. Run 'harvey gmail auth'."))
@@ -124,3 +124,74 @@ def test_harvey_status_shows_it(tmp_path, monkeypatch, capsys):
     cli.cmd_status(argparse.Namespace(check=False))
     out = capsys.readouterr().out
     assert "NOT SENDING" in out and "harvey gmail auth" in out
+
+
+# ── review of the notice ──
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stored,status,body,expect", [
+    (None, None, None, "harvey gmail auth"),                        # never signed in
+    ({"refresh_token": "r"}, 400, {"error": "invalid_grant"}, "harvey gmail auth"),
+    ({"refresh_token": "r"}, "network", None, "couldn't reach Google"),
+    ({"refresh_token": "r"}, 503, {}, "couldn't reach Google"),
+])
+async def test_gmail_says_which_sign_in_problem_it_is(monkeypatch, stored, status, body, expect):
+    import httpx
+    import harvey.integrations.gmail as gmail
+    def respond(request):
+        if status == "network":
+            raise httpx.ConnectError("down")
+        return httpx.Response(status, json=body)
+    client_cls = httpx.AsyncClient
+    monkeypatch.setattr(gmail.httpx, "AsyncClient",
+                        lambda **kw: client_cls(transport=httpx.MockTransport(respond), **kw))
+    monkeypatch.setattr(gmail, "_load_token", lambda: stored)
+    p = gmail.GmailProvider(SimpleNamespace(), SimpleNamespace(gmail_client_id="i", gmail_client_secret="s"))
+    with pytest.raises(gmail.GmailError) as e:
+        await p.get_replies()
+    assert expect in str(e.value)
+    if expect != "harvey gmail auth":
+        assert "harvey gmail auth" not in str(e.value)
+
+
+def test_a_reply_that_couldnt_be_handled_is_worded_as_that():
+    reason = "a reply from ann@gmail.com couldn't be handled (KeyError: 'signature' not authorized pages)"
+    title, detail = held_message({"reason": reason, "since": "2026-10-24T08:00:00"}, waiting=1)
+    assert "couldn't handle a reply" in title
+    assert "harvey gmail auth" not in detail and "more mail" not in detail
+    assert "1 email is waiting" in detail
+
+
+@pytest.mark.asyncio
+async def test_a_new_hold_after_a_stale_one_starts_now(state):
+    old = (datetime.now(timezone.utc) - timedelta(days=3)).replace(tzinfo=None).isoformat()
+    await state.set_setting(SENDS_HELD_KEY, json.dumps({"since": old, "last_seen": old, "reason": "x"}))
+    await state.note_sends_held("Gmail: not signed in")
+    assert (await state.current_sends_held())["since"] > old
+
+
+@pytest.mark.parametrize("unread,paused,problem,expected", [
+    (["read_replies"], "", "gmail: not signed in", "gmail: not signed in"),
+    (["read_replies"], "", "", "replies couldn't all be read and handled."),
+    (["read_replies"], "Codex is paused", "gmail: x", None),      # the brain card covers it
+    ([], "", "", ""),                                             # sending ran: clear
+])
+def test_when_the_heartbeat_records_a_hold(unread, paused, problem, expected):
+    from harvey.main import send_hold_reason
+    assert send_hold_reason(unread, paused, problem) == expected
+
+
+def test_the_outbox_card_on_today_says_which_mode(client, monkeypatch):
+    import harvey.dashboard as dash
+    from tests.test_outbox_native import _now_iso
+    st = StateManager(str(client.db_path))
+    asyncio.run(st.init_db())
+    import sqlite3
+    with sqlite3.connect(client.db_path) as db:
+        db.execute("INSERT INTO outbox (id, prospect_id, kind, step, to_email, subject, body, status, send_at) "
+                   "VALUES ('o1', 'p', 'reply', 1, 'a@x.test', 's', 'b', 'pending_review', ?)", (_now_iso(),))
+    for approval, words in ((True, "Nothing sends until you approve it"), (False, "Autopilot sends the rest")):
+        monkeypatch.setattr(dash, "_require_approval_now", lambda a=approval: a)
+        [card] = [i for i in client.get("/api/today").json()["items"] if i["key"] == "outbox"]
+        assert words in card["detail"]

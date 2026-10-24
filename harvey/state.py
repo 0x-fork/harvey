@@ -1180,10 +1180,8 @@ class StateManager:
     async def note_sends_held(self, reason: str):
         """The heartbeat held sending this cycle. Keeps when it started."""
         now = _utcnow().isoformat()
-        try:
-            since = json.loads(await self.get_setting(SENDS_HELD_KEY) or "{}").get("since") or now
-        except (json.JSONDecodeError, AttributeError):
-            since = now
+        # A hold that went stale (Harvey stopped) doesn't date a new one.
+        since = ((await self.current_sends_held()) or {}).get("since") or now
         await self.set_setting(SENDS_HELD_KEY, json.dumps(
             {"since": since, "last_seen": now, "reason": str(reason)[:500]}))
 
