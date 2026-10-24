@@ -242,7 +242,7 @@
   <div class="section-head">
     <div>
       <h2>Outbox</h2>
-      <p>Every outgoing email stops here. Read one, decide, move on &mdash;
+      <p>Emails waiting for you. Read one, decide, move on &mdash;
          <kbd>A</kbd> approve, <kbd>R</kbd> reject, <kbd>E</kbd> edit, <kbd>J</kbd>/<kbd>K</kbd> to move.</p>
     </div>
     <div class="page-actions" id="outbox-actions"></div>
@@ -276,6 +276,9 @@
 <!-- Settings -->
 <div id="settings" class="section">
   <div class="section-head"><div><h2>Settings</h2><p>Credentials are stored locally in <code>.env</code> and never sent anywhere except the services themselves.</p></div></div>
+
+  <div class="subhead">Sending</div>
+  <div id="sending-mode-card"></div>
 
   <div class="subhead">Email provider <span class="hint">Active: <b id="active-provider">…</b> &middot; set <code>channels.email.provider</code> in <code>harvey.yaml</code> to gmail, microsoft, smtp or instantly</span></div>
   <div class="card">

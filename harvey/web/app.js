@@ -416,7 +416,7 @@ function loadCurrentTab() {
     case 'conversations': loadConversations(); break;
     case 'activity': loadActivity(); break;
     case 'usage': loadUsage(); break;
-    case 'settings': loadSettings(); break;
+    case 'settings': loadSettings(); loadSendingModeCard(); break;
     case 'controls': loadHarveyStatus(); loadLogs(); break;
   }
 }
@@ -1512,7 +1512,8 @@ async function loadUsage() {
 // wait in the rail.
 
 async function loadOutbox() {
-  const data = await api('/api/outbox');
+  const [data, mode] = await Promise.all([api('/api/outbox'), api('/api/sending-mode')]);
+  _sendingMode = mode && !mode.error ? mode : null;
   const banner = document.getElementById('outbox-banner');
   const desk = document.getElementById('outbox-desk');
   const list = document.getElementById('outbox-list');
@@ -1552,10 +1553,10 @@ async function loadOutbox() {
 
   // The kill switch gets a banner only when it's actually on — a permanent
   // bar for a thing that isn't happening is just noise.
-  banner.innerHTML = data.paused
+  banner.innerHTML = sendingModeBanner(_sendingMode) + (data.paused
     ? '<div class="banner bad">' + icon('alert') + '<div><b>Sending is paused</b>' +
         '<p>' + escHtml(data.paused) + '. Approved mail stays queued until you resume.</p></div></div>'
-    : '';
+    : '');
   // Only once there is mail to warn about: a fresh install sends nothing.
   const anyMail = pending.length || (data.approved || []).length || (data.sent || []).length;
   if (data.compliance_notice && anyMail) {
@@ -1566,7 +1567,9 @@ async function loadOutbox() {
 
   desk.innerHTML = pending.length ? renderDesk(pending, _desk.i) :
     '<div class="card">' + emptyState(icon('check'), 'Nothing to review',
-      'Every draft Harvey writes lands here first. Approve one and it sends on schedule.') +
+      _sendingMode && _sendingMode.mode === 'autopilot'
+        ? 'Autopilot is on, so Harvey sends on its own. Anything it holds for you shows up here.'
+        : 'Every draft Harvey writes lands here first. Approve one and it sends on schedule.') +
     '</div>';
 
   const table = (title, rows, cols) => {
@@ -1633,6 +1636,105 @@ function renderDeskContext(ctx) {
       ' <span class="muted">(how they were found, not a fact about them)</span>' : '') +
     row('Writer notes', escHtml(ctx.notes)) +
   '</div>';
+}
+
+// ── Approval or autopilot ──
+// Approval (the default): every email waits in the Outbox for you.
+// Autopilot (channels.email.require_approval: false): Harvey sends on its
+// own, and still holds what gate.autopilot_review flags. Turning autopilot
+// on takes typing the word; turning it off is one click and works at once.
+let _sendingMode = null, _autopilotArmed = false, _modeBusy = false;
+
+function sendingModeBanner(m) {
+  if (!m) return '';
+  if (m.mode === 'autopilot') {
+    return '<div class="banner wait mode-banner">' + icon('alert') + '<div><b>Autopilot is on</b>' +
+      '<p>Harvey sends email on its own. It holds anything that links to a site that isn’t yours or ' +
+      'quotes its own instructions; those wait here' + (m.held ? ' (' + m.held + ' now)' : '') + '.</p></div>' +
+      '<button class="btn btn-secondary btn-sm" onclick="setSendingMode(\'approval\')"' +
+        (_modeBusy ? ' disabled' : '') + '>Turn off autopilot</button></div>';
+  }
+  const instantly = m.provider === 'instantly';
+  return '<div class="banner mode-banner">' + icon('check') + '<div><b>Approval mode</b>' +
+    '<p>' + (instantly
+      ? 'Instantly can’t hold single emails, so campaigns aren’t sent to Instantly until you turn on autopilot.'
+      : 'Every email Harvey writes waits here until you approve it.') +
+    ' <a href="#" onclick="goTab(\'settings\');return false">About autopilot</a></p></div></div>';
+}
+
+function sendingModeCard(m) {
+  if (!m) return '<div class="card muted">Couldn’t read the sending mode.</div>';
+  const auto = m.mode === 'autopilot';
+  const instantly = m.provider === 'instantly';
+  const domains = (m.your_domains || []).map(escHtml).join(', ') || 'none yet';
+  let html = '<div class="card mode-card"><h3>Sending mode: ' + (auto ? 'Autopilot' : 'Approval') + '</h3>' +
+    '<p><b>Approval</b> (the default): every email Harvey writes, first emails, follow-ups and replies, ' +
+      'waits in the Outbox until you approve it.' +
+      (instantly ? ' On Instantly, which can’t hold single emails, that means campaigns aren’t deployed.' : '') + '</p>' +
+    '<p><b>Autopilot</b>: Harvey sends on its own, on schedule, within your daily limit and quiet hours. ' +
+      'Opt-outs, bounces and Pause all sending work the same. It still holds an email for you when it links ' +
+      'to, or gives an address at, a site that isn’t yours, or quotes Harvey’s own instructions: text from ' +
+      'websites and replies can try to steer what it writes. The first reply after you undo an opt-out waits too.</p>' +
+    '<p class="muted">Counted as yours: ' + domains + (m.booking_page ? '; your booking page ' + escHtml(m.booking_page) : '') +
+      '. Add others under <code>channels.email.link_domains</code> in <code>' + escHtml(m.file) + '</code>.</p>';
+  if (auto) {
+    html += '<div class="convo-actions"><span class="muted">Turning it off works at once: emails autopilot ' +
+      'approved that haven’t gone out come back to the Outbox.</span>' +
+      '<button class="btn btn-primary btn-sm" onclick="setSendingMode(\'approval\')"' +
+        (_modeBusy ? ' disabled' : '') + '>Turn off autopilot</button></div>';
+  } else if (_autopilotArmed) {
+    html += '<div class="convo-actions mode-confirm"><span class="muted">Approve a batch or two by hand first ' +
+      'and read what Harvey writes. Type <b>autopilot</b> to turn it on. It starts from Harvey’s next cycle.</span>' +
+      '<input class="form-input" id="autopilot-confirm" autocomplete="off" aria-label="Type autopilot to confirm" ' +
+        'oninput="document.getElementById(\'autopilot-go\').disabled = this.value.trim().toLowerCase() !== \'autopilot\'">' +
+      '<button class="btn btn-primary btn-sm" id="autopilot-go" disabled onclick="setSendingMode(\'autopilot\')">Turn on autopilot</button>' +
+      '<button class="btn btn-ghost btn-sm" onclick="_autopilotArmed=false;renderSendingModeCard()">Cancel</button></div>';
+  } else {
+    html += '<div class="convo-actions"><button class="btn btn-secondary btn-sm" ' +
+      'onclick="_autopilotArmed=true;renderSendingModeCard()">Turn on autopilot…</button></div>';
+  }
+  return html + '</div>';
+}
+
+function renderSendingModeCard() {
+  const el = document.getElementById('sending-mode-card');
+  if (el) el.innerHTML = sendingModeCard(_sendingMode);
+  const input = document.getElementById('autopilot-confirm');
+  if (input) input.focus();
+}
+
+async function loadSendingModeCard() {
+  const m = await api('/api/sending-mode');
+  _sendingMode = m && !m.error ? m : null;
+  renderSendingModeCard();
+}
+
+async function setSendingMode(mode) {
+  if (_modeBusy) return;
+  const body = {mode};
+  if (mode === 'autopilot') {
+    const input = document.getElementById('autopilot-confirm');
+    body.confirm = input ? input.value.trim().toLowerCase() : '';
+  }
+  _modeBusy = true;
+  try {
+    const res = await api('/api/sending-mode', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+    });
+    if (res && res.success) {
+      _autopilotArmed = false;
+      showToast(mode === 'autopilot'
+        ? 'Autopilot is on from Harvey’s next cycle. Held emails still wait for you.'
+        : 'Autopilot is off. Every email waits for you' +
+          (res.requeued ? '; ' + res.requeued + ' queued by autopilot came back to the Outbox.' : '.'), 'success');
+    } else {
+      showToast(failMsg(res, 'Couldn’t change the sending mode.'), 'error');
+    }
+  } finally {
+    _modeBusy = false;
+  }
+  loadSendingModeCard();
+  loadOutbox();
 }
 
 // Why autopilot sent this back for a human (sender: gate.autopilot_review).

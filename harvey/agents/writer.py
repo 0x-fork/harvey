@@ -221,6 +221,7 @@ class Writer:
                 send_at=now,
                 status=status,
                 provider=provider,
+                approved_by="" if require_approval else "autopilot",
             )
             if item_id:
                 drafted += 1

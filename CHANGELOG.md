@@ -9,6 +9,16 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Approval or autopilot, visible and switchable.** The Outbox now says
+  which sending mode you're in, and Settings → Sending explains both,
+  lists the domains counted as yours and switches them. Turning autopilot
+  on takes typing `autopilot`; turning it off is one click and works at
+  once: emails autopilot approved that haven't gone out come back to the
+  Outbox, and the sender won't send one while approval is on. Only the
+  `require_approval` line of your config changes (comments kept), and a
+  running Harvey picks it up next cycle. Each outbox row records who
+  approved it (`approved_by`: you, autopilot, or earlier for rows from
+  before this). The README has a plain table of what each mode does.
 - **`harvey warmup [domain]`**: checks whether a sending domain is ready for
   cold email. It covers MX, SPF (`+all`, duplicates, top-level lookups), DKIM,
   DMARC, domain age, domain and SMTP-IP blocklists (a list that refuses the

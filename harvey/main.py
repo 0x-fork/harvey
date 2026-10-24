@@ -10,7 +10,8 @@ import pytz
 
 from harvey.brain import Brain
 from harvey.config import (
-    ConfigError, load_config, load_env, HarveyConfig, legacy_sending_held, sending_notice,
+    ConfigError, load_config, load_env, HarveyConfig, legacy_sending_held, refresh_sending_mode,
+    sending_notice,
     compliance_notice,
 )
 from harvey.pipeline import run_profile_stage
@@ -249,6 +250,16 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
 
     while not stop_event.is_set():
         try:
+            # 0. Approval or autopilot, as the config file says now: the
+            # dashboard can switch it while Harvey runs.
+            if refresh_sending_mode(config):
+                logger.warning(
+                    "Sending mode is now "
+                    + ("APPROVAL: every email waits in the Outbox for you."
+                       if config.channels.email.require_approval
+                       else "AUTOPILOT: Harvey sends on its own (held emails still wait for you).")
+                )
+
             # 1. Check quiet hours
             if in_quiet_hours(config):
                 sleep_for = seconds_until_quiet_hours_end(config)

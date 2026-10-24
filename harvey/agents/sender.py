@@ -26,7 +26,8 @@ from harvey.integrations.instantly import InstantlyClient
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
 from harvey.integrations.precleared import PreclearedClient
 from harvey.state import (
-    HAND_SENT_REASON, HELD_FOR_REVIEW, MANUAL_SEND_KEY, MAYBE_SENT_PREFIX, StateManager,
+    AUTOPILOT_OFF_REASON, HAND_SENT_REASON, HELD_FOR_REVIEW, MANUAL_SEND_KEY,
+    MAYBE_SENT_PREFIX, StateManager,
 )
 
 # A follow-up waits at least this long after the email it follows went out,
@@ -461,6 +462,7 @@ class Sender:
                     send_at=send_at.isoformat(),
                     status=initial_status,
                     provider=self.provider.name,
+                    approved_by="" if require_approval else "autopilot",
                 )
                 if item_id:
                     staged += 1
@@ -568,6 +570,10 @@ class Sender:
                 f"{gate.reasons}"
             )
             return "failed", "gate: " + "; ".join(gate.reasons)[:300]
+        if (item.get("approved_by") == "autopilot"
+                and getattr(self.config.channels.email, "require_approval", True)):
+            # Autopilot approved it, and autopilot has since been turned off.
+            return "pending_review", AUTOPILOT_OFF_REASON
         if item.get("approved_by") != "you":
             # Nobody approved this one (autopilot): what a planted
             # instruction would add sends it back to you instead.

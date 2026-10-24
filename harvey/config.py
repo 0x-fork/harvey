@@ -647,6 +647,96 @@ def load_env() -> EnvConfig:
     return env
 
 
+# ── Approval or autopilot ─────────────────────────────────────────────────
+#
+# channels.email.require_approval: true (the default) means every email
+# waits in the Outbox for you; false is autopilot. The dashboard can switch
+# it, so it is edited in place: one line changes and the comments stay.
+
+_APPROVAL_LINE_RE = re.compile(
+    r"^(?P<lead>[ \t]*require_approval[ \t]*:[ \t]*)(?P<val>[^\s#]+)", re.MULTILINE)
+_EMAIL_KEY_RE = re.compile(r"^(?P<ind>[ \t]+)email[ \t]*:[ \t]*(?:#.*)?$", re.MULTILINE)
+
+
+def _email_section(data):
+    channels = data.get("channels") if isinstance(data, dict) else None
+    email = channels.get("email") if isinstance(channels, dict) else None
+    return email if isinstance(email, dict) else None
+
+
+def _with_approval_line(raw: str, word: str) -> list[str]:
+    """Ways to say require_approval: <word> in ``raw``: change the line that
+    is there, or add one under an ``email:`` key."""
+    out = [raw[:m.start("val")] + word + raw[m.end("val"):] for m in _APPROVAL_LINE_RE.finditer(raw)]
+    for m in _EMAIL_KEY_RE.finditer(raw):
+        child = m.group("ind") + "  "
+        for line in raw[m.end():].split("\n")[1:]:
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            indent = line[:len(line) - len(line.lstrip(" \t"))]
+            if len(indent) > len(m.group("ind")):
+                child = indent
+            break
+        out.append(raw[:m.end()] + f"\n{child}require_approval: {word}" + raw[m.end():])
+    return out
+
+
+def set_require_approval(value: bool, path=None) -> Path:
+    """Write channels.email.require_approval into the config file Harvey
+    reads (harvey.local.yaml wins, as in load_config). Only that value
+    changes: the result must parse to the same settings apart from it, or
+    nothing is written and ConfigError says to set it by hand."""
+    import copy
+    import shutil
+    path = Path(path or _find_config_file())
+    raw = read_user_text(path)
+    try:
+        data = yaml.safe_load(raw)
+    except yaml.YAMLError as e:
+        raise ConfigError(f"Invalid YAML in {path.name}: {e}")
+    if _email_section(data) is None:
+        raise ConfigError(f"{path.name} has no channels.email section. Set "
+                          f"channels.email.require_approval there by hand.")
+    expected = copy.deepcopy(data)
+    _email_section(expected)["require_approval"] = bool(value)
+    word = "true" if value else "false"
+    for new in _with_approval_line(raw, word):
+        try:
+            if yaml.safe_load(new) != expected:
+                continue
+        except yaml.YAMLError:
+            continue
+        HarveyConfig(**expected)          # still a valid config
+        if b"\r\n" in path.read_bytes():
+            new = new.replace("\n", "\r\n")
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            tmp.write_bytes(new.encode("utf-8"))
+            shutil.copymode(path, tmp)
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
+        return path
+    raise ConfigError(f"Couldn't change require_approval in {path.name} safely. "
+                      f"Set channels.email.require_approval: {word} there by hand.")
+
+
+def refresh_sending_mode(config, path=None) -> bool:
+    """Bring a running config's require_approval in line with the file, so a
+    switch made while Harvey runs counts from its next cycle. True when it
+    changed. A file that can't be read leaves the running value alone."""
+    try:
+        data = yaml.safe_load(read_user_text(Path(path or _find_config_file())))
+    except Exception:
+        return False
+    email = _email_section(data)
+    value = email.get("require_approval", True) if email is not None else None
+    if not isinstance(value, bool) or value == config.channels.email.require_approval:
+        return False
+    config.channels.email.require_approval = value
+    return True
+
+
 def _find_config_file() -> str:
     """Search for Harvey's config.
 

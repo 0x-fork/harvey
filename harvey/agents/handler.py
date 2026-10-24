@@ -721,6 +721,7 @@ class Handler:
             provider=self.provider.name if self.provider else "",
             thread_ref=reply_meta.get("thread_ref", ""),
             in_reply_to=reply_meta.get("message_id", ""),
+            approved_by="" if require_approval else "autopilot",
         )
         if item_id:
             await self.state.delete_setting(review_key)

@@ -1004,3 +1004,13 @@ table.clip td { max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
 
 /* Outbox: an email autopilot held for you (#66). */
 .desk-held { margin-bottom: var(--sp-3); }
+
+/* Approval or autopilot: the Outbox notice and the Settings card. */
+.mode-banner { align-items: center; }
+.mode-banner > div { flex: 1; }
+.mode-card h3 { margin: 0 0 var(--sp-2); }
+.mode-card p { margin: 0 0 var(--sp-2); font-size: var(--fs-ui); line-height: 1.55; max-width: 72ch; }
+.mode-card .convo-actions .muted { white-space: normal; flex-basis: 100%; }
+.mode-confirm .form-input { width: 12rem; }
+.mode-card .convo-actions .btn-ghost { margin-left: 0; }
+.mode-banner:not(.wait) { background: var(--surface); border-color: var(--line); }

@@ -922,6 +922,59 @@ async def get_outbox_api():
         return {"error": str(e)}
 
 
+@app.get("/api/sending-mode")
+async def get_sending_mode():
+    """Approval (every email waits for you) or autopilot, and what that means here."""
+    from harvey.config import load_config
+    from harvey.gate import _booking_prefix, allowed_link_domains
+    path = _resolve_config_file()
+    try:
+        config = load_config(str(path))
+    except Exception as e:
+        return JSONResponse({"error": f"Couldn't read {path.name}: {e}"}, status_code=500)
+    state = _state()
+    await state.init_db()
+    return {
+        "mode": "approval" if config.channels.email.require_approval else "autopilot",
+        "provider": config.channels.email.provider,
+        "file": path.name,
+        "your_domains": sorted(allowed_link_domains(config)),
+        "booking_page": _booking_prefix(config),
+        "held": await state.count_held_for_review(),
+    }
+
+
+@app.post("/api/sending-mode")
+async def set_sending_mode(request: Request):
+    """Switch it. Autopilot needs {"mode": "autopilot", "confirm": "autopilot"};
+    {"mode": "approval"} works at once and sends back to the Outbox whatever
+    autopilot approved that hasn't gone out."""
+    from harvey.config import ConfigError, set_require_approval
+    try:
+        body = await request.json()
+    except ValueError:
+        body = None
+    mode = body.get("mode") if isinstance(body, dict) else None
+    if mode not in ("approval", "autopilot"):
+        return _refuse('expected {"mode": "approval"} or {"mode": "autopilot", "confirm": "autopilot"}', 400)
+    if mode == "autopilot" and body.get("confirm") != "autopilot":
+        return _refuse('Type "autopilot" to confirm: Harvey will send email without asking you.', 400)
+    path = _resolve_config_file()
+    try:
+        set_require_approval(mode == "approval", path)
+    except ConfigError as e:
+        return _refuse(str(e), 409)
+    state = _state()
+    await state.init_db()
+    requeued = await state.requeue_autopilot_approved() if mode == "approval" else 0
+    await state.log_action("sending_mode", "dashboard", {"mode": mode, "file": path.name,
+                                                         "requeued": requeued})
+    out = {"success": True, "mode": mode}
+    if mode == "approval":
+        out["requeued"] = requeued
+    return out
+
+
 @app.post("/api/outbox/approve-all")
 async def outbox_approve_all():
     try:
