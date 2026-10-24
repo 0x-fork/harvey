@@ -442,6 +442,10 @@ MIGRATIONS: list[str] = [
     """
     CREATE INDEX IF NOT EXISTS idx_actions_type_created ON actions(action_type, created_at);
     """,
+    # ── v13: who approved an outbox row ('you' = a human; '' = autopilot) ──
+    """
+    ALTER TABLE outbox ADD COLUMN approved_by TEXT DEFAULT '';
+    """,
 ]
 
 BRAIN_PROVIDERS = ("claude", "codex")
@@ -1135,18 +1139,22 @@ class StateManager:
             return cursor.rowcount
 
     async def approve_outbox(self, item_id: str | None = None) -> int:
-        """Approve one pending item, or ALL pending when item_id is None."""
+        """Approve one pending item, or ALL pending when item_id is None.
+
+        A human's approval (dashboard or CLI): marked approved_by 'you', so
+        the autopilot review (gate.autopilot_review) doesn't hold it again,
+        and any reason it was held is cleared."""
         async with self._connect() as db:
             if item_id:
                 cursor = await db.execute(
-                    "UPDATE outbox SET status = 'approved', updated_at = ? "
-                    "WHERE id = ? AND status = 'pending_review'",
+                    "UPDATE outbox SET status = 'approved', approved_by = 'you', error = '', "
+                    "updated_at = ? WHERE id = ? AND status = 'pending_review'",
                     (_utcnow().isoformat(), item_id),
                 )
             else:
                 cursor = await db.execute(
-                    "UPDATE outbox SET status = 'approved', updated_at = ? "
-                    "WHERE status = 'pending_review'",
+                    "UPDATE outbox SET status = 'approved', approved_by = 'you', error = '', "
+                    "updated_at = ? WHERE status = 'pending_review'",
                     (_utcnow().isoformat(),),
                 )
             await db.commit()

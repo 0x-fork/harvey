@@ -21,7 +21,7 @@ from harvey.config import (
     HarveyConfig, EnvConfig, cold_daily_cap, compliance_footer_lines, compliance_notice,
     compliance_of,
 )
-from harvey.gate import pre_send_check
+from harvey.gate import autopilot_review, pre_send_check
 from harvey.integrations.instantly import InstantlyClient
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
 from harvey.integrations.precleared import PreclearedClient
@@ -150,6 +150,21 @@ class Sender:
         # 0. Validate before touching the network
         if not self._validate_sequence(campaign):
             await self.state.update_campaign(campaign.id, status="failed")
+            return
+        # Instantly only deploys on autopilot, so nobody has read these
+        # templates: what a planted instruction would add holds the campaign.
+        held = [f"step {s.step} {r}" for s in campaign.sequence
+                for r in autopilot_review(s.subject, s.body, self.config)]
+        if held:
+            logger.warning(f"Sender: Instantly campaign '{campaign.name}' held for review: {held}")
+            key = "instantly_review_hold:" + campaign.id
+            if not await self.state.get_setting(key):
+                await self.state.set_setting(key, "1")
+                await self.state.log_action(
+                    action_type="escalation", agent="sender",
+                    details={"campaign_name": campaign.name,
+                             "reason": "campaign held: " + "; ".join(held)[:200]},
+                )
             return
 
         # 1. Create campaign in Instantly — or resume one from a previous
@@ -535,6 +550,13 @@ class Sender:
                 f"{gate.reasons}"
             )
             return "failed", "gate: " + "; ".join(gate.reasons)[:300]
+        if item.get("approved_by") != "you":
+            # Nobody approved this one (autopilot): what a planted
+            # instruction would add sends it back to you instead.
+            held = autopilot_review(item["subject"], self._outgoing_body(item), self.config)
+            if held:
+                logger.warning(f"Sender: holding email to {item['to_email']} for review: {held}")
+                return "pending_review", ("held for your review: " + "; ".join(held))[:300]
         return None
 
     async def _drain_due(self):

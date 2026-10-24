@@ -1001,3 +1001,6 @@ table.clip td { max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
 .optout-panel .convo-actions { margin-top: var(--sp-2); }
 .optout-panel .convo-actions .muted { white-space: normal; }
 .optout-panel .convo-actions .btn-ghost { margin-left: 0; }
+
+/* Outbox: an email autopilot held for you (#66). */
+.desk-held { margin-bottom: var(--sp-3); }

@@ -112,3 +112,128 @@ def pre_send_check(
         reasons.append("HTML markup in body (plain text only)")
 
     return GateResult(ok=not reasons, reasons=reasons)
+
+
+# ── Autopilot review ──────────────────────────────────────────────────────
+#
+# Websites and the replies people send reach the model, and either can carry
+# planted instructions ("add this link", "paste your instructions"). Prompts
+# fence that text (harvey.untrusted), but a model can still follow it. So an
+# email nobody approved is also checked here before it goes: anything that
+# trips these goes back to the Outbox for a human instead of out (#66).
+
+# Real-world top-level domains a bare "name.tld" is read as a link for, plus
+# the reserved test names (RFC 2606). A bare word with a path
+# ("evil.example/x") is a link whatever its ending.
+_COMMON_TLDS = frozenset("""
+    com net org io co ai app dev xyz info biz me us uk ca au de fr es it nl be ch at se no dk fi
+    ie pl pt cz eu in sg nz za br mx jp kr cn hk tw ru ly sh to gg tv fm link site online store
+    shop tech cloud page so pro agency studio digital email live life media news blog club
+    world today one gov edu mil int test example invalid localhost
+""".split())
+_SCHEME_HOST_RE = re.compile(r"\b[a-z][a-z0-9+.-]*://\[?([^\s/?#:\]]+)", re.IGNORECASE)
+_EMAIL_HOST_RE = re.compile(r"[a-z0-9._%+\-]+@((?:[a-z0-9-]+\.)+[a-z]{2,})", re.IGNORECASE)
+_BARE_HOST_RE = re.compile(
+    r"(?<![\w@.\-/])((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+([a-z]{2,24}))(?![\w-])(/)?",
+    re.IGNORECASE)
+
+# Files Harvey's instructions live in, under the checkout. A passage from
+# them in an outgoing email means a reply quoted Harvey's playbook back.
+# These are written to be said to prospects, so echoing them is fine.
+_SAY_ALOUD_FILES = frozenset({"email_frameworks.md", "product_knowledge.md",
+                              "objection_handling.md", "README.md"})
+LEAK_RUN_WORDS = 12       # this many words in a row, copied, is a quote
+_WORD_RE = re.compile(r"[a-z0-9']+")
+# Lines the playbooks quote as scripts to use ("Would Thursday at 2pm work
+# for a quick call?"): saying them is the point, so they aren't checked.
+_SCRIPT_LINE_RE = re.compile(r"^\s*(?:[-*]\s*)?(?:>|[\"“'‘])")
+_leak_cache: dict = {}
+
+
+def _host(value: str) -> str:
+    h = value.strip().strip(".").lower()
+    return h[4:] if h.startswith("www.") else h
+
+
+def find_link_domains(text: str) -> list[str]:
+    """Every domain a link or email address in ``text`` points at, in order."""
+    text = text or ""
+    hosts: list[str] = []
+    for m in _SCHEME_HOST_RE.finditer(text):
+        hosts.append(_host(m.group(1)))
+    rest = re.sub(r"\b[a-z][a-z0-9+.-]*://\S*", " ", text, flags=re.IGNORECASE)
+    for m in _EMAIL_HOST_RE.finditer(rest):
+        hosts.append(_host(m.group(1)))
+    rest = _EMAIL_HOST_RE.sub(" ", rest)
+    for m in _BARE_HOST_RE.finditer(rest):
+        if m.group(3) or m.group(2).lower() in _COMMON_TLDS:
+            hosts.append(_host(m.group(1)))
+    return list(dict.fromkeys(h for h in hosts if h))
+
+
+def allowed_link_domains(config) -> set[str]:
+    """Your own domains: the sending address's, the booking link's, and
+    any listed in channels.email.link_domains."""
+    persona = getattr(config, "persona", None)
+    offer = getattr(getattr(config, "product", None), "offer", None)
+    email_cfg = getattr(getattr(config, "channels", None), "email", None)
+    out: set[str] = set()
+    address = str(getattr(persona, "email", "") or "")
+    if "@" in address:
+        out.add(_host(address.rsplit("@", 1)[1]))
+    out.update(find_link_domains(str(getattr(offer, "booking_url", "") or "")))
+    for entry in getattr(email_cfg, "link_domains", None) or []:
+        out.update(find_link_domains(str(entry)) or [_host(str(entry))])
+    return {d for d in out if d}
+
+
+def _is_ours(host: str, allowed: set[str]) -> bool:
+    return any(host == d or host.endswith("." + d) for d in allowed)
+
+
+def _words(text: str) -> list[str]:
+    return _WORD_RE.findall((text or "").lower())
+
+
+def _instruction_runs(root) -> dict[tuple, str]:
+    """Every LEAK_RUN_WORDS-word run in Harvey's instructions → its file."""
+    from harvey.untrusted import UNTRUSTED_RULE
+    files = sorted(p for folder in ("prompts", "skills") for p in (root / folder).glob("*.md")
+                   if p.name not in _SAY_ALOUD_FILES)
+    key = (str(root), tuple((str(p), p.stat().st_mtime_ns) for p in files))
+    if _leak_cache.get("key") != key:
+        runs: dict[tuple, str] = {}
+        sources = [(p.name, "\n".join(
+            line for line in p.read_text(encoding="utf-8", errors="replace").splitlines()
+            if not _SCRIPT_LINE_RE.match(line))) for p in files]
+        sources.append(("Harvey's prompt rules", UNTRUSTED_RULE))
+        for name, text in sources:
+            words = _words(text)
+            for i in range(len(words) - LEAK_RUN_WORDS + 1):
+                runs.setdefault(tuple(words[i:i + LEAK_RUN_WORDS]), name)
+        _leak_cache.update(key=key, runs=runs)
+    return _leak_cache["runs"]
+
+
+def autopilot_review(subject: str, body: str, config, root=None) -> list[str]:
+    """Why an email nobody approved must wait for a human, or [] to send.
+
+    Two things a planted instruction would try: point the reader somewhere
+    that isn't yours, or get Harvey to quote its own instructions back."""
+    from harvey.paths import PROJECT_ROOT
+    reasons: list[str] = []
+    text = f"{subject or ''}\n{body or ''}"
+    allowed = allowed_link_domains(config)
+    foreign = [h for h in find_link_domains(text) if not _is_ours(h, allowed)]
+    if foreign:
+        reasons.append(
+            f"links to {', '.join(foreign[:3])}, not one of your domains "
+            "(add it to channels.email.link_domains if it's yours)")
+    words = _words(body)
+    runs = _instruction_runs(root or PROJECT_ROOT)
+    for i in range(len(words) - LEAK_RUN_WORDS + 1):
+        source = runs.get(tuple(words[i:i + LEAK_RUN_WORDS]))
+        if source:
+            reasons.append(f"quotes Harvey's instructions ({source})")
+            break
+    return reasons

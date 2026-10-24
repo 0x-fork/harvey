@@ -33,6 +33,20 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- **Autopilot can't be steered by text from outside** (#66, reported by
+  Yaaaannnn435). Websites Harvey researches and the replies people send
+  reach the model, and either can carry planted instructions. That text is
+  now fenced as data in every prompt (writer, reply handler, scout scoring,
+  Humanizer), in a block it can't close itself. Prompts only lower the odds,
+  so with `require_approval: false` an email nobody approved goes back to
+  the Outbox, marked Held with the reason, when it links to or gives an
+  address at a domain that isn't yours (sending domain, booking link, or
+  `channels.email.link_domains`), or quotes Harvey's own instructions.
+  Bare domains like `example.com/x` count as links. Approving it yourself
+  sends it. On Instantly, replies now run the pre-send gate too and a held
+  one goes to you; a campaign template that would be held isn't deployed.
+  The model never had tools, files or network to act with, so this was
+  never more than what it wrote.
 - **Opted-out contacts are no longer in the prospect CSV.** Someone who
   replied "unsubscribe" stayed in `harvey export` and the dashboard's Export
   button, so taking the list to another sequencer could email them again.

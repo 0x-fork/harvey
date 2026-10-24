@@ -1633,6 +1633,14 @@ function renderDeskContext(ctx) {
   '</div>';
 }
 
+// Why autopilot sent this back for a human (sender: gate.autopilot_review).
+const HELD_PREFIX = 'held for your review: ';
+function heldReason(item) {
+  const e = String((item && item.error) || '');
+  const why = e.startsWith(HELD_PREFIX) ? e.slice(HELD_PREFIX.length) : '';
+  return why.charAt(0).toUpperCase() + why.slice(1);
+}
+
 function renderDesk(items, i) {
   const cur = items[i];
   const rail = items.map((it, n) => {
@@ -1640,7 +1648,9 @@ function renderDesk(items, i) {
     const parts = String(who || '').split(/[\s@.]+/);
     return '<div class="desk-item ' + (n === i ? 'active' : '') + '" onclick="deskGo(' + n + ')">' +
       '<span class="avatar">' + initials(parts[0], parts[1]) + '</span>' +
-      '<div class="di-text"><div class="to">' + escHtml(who) + '</div>' +
+      '<div class="di-text"><div class="to">' + escHtml(who) +
+        (heldReason(it) ? ' <span class="tag t-bad" title="Harvey held this instead of sending it">Held</span>' : '') +
+        '</div>' +
       '<div class="sub">' + escHtml(it.subject || '(no subject)') + '</div></div>' +
     '</div>';
   }).join('');
@@ -1681,6 +1691,11 @@ function renderDesk(items, i) {
         '<span class="tag">' + (cur.kind === 'reply' ? 'Reply' : 'Email ' + escHtml(String(cur.step))) + '</span>' +
         '<span class="muted">sends ' + formatDate(cur.send_at) + '</span></div>' +
       renderDeskContext(cur.context) +
+      (heldReason(cur)
+        ? '<div class="banner wait desk-held">' + icon('alert') + '<div><b>Harvey held this instead of sending it</b>' +
+          '<div>' + escHtml(heldReason(cur)) + '. Read it before approving: text from a website or an ' +
+          'email can try to steer what Harvey writes.</div></div></div>'
+        : '') +
       draft + footer +
       '<div class="desk-actions">' + actions +
         '<span class="muted" style="font-size:12px;margin-left:auto">' +

@@ -155,6 +155,10 @@ class EmailChannelConfig(BaseModel):
     # outbox, so it holds campaigns and escalates replies while this is true.
     # Set false explicitly for full autopilot once you trust the output.
     require_approval: bool = True
+    # Your own domains besides the sending address's and the booking link's
+    # (e.g. your main site when you send from a secondary domain). On
+    # autopilot, an email linking anywhere else waits in the Outbox.
+    link_domains: list[str] = []
     # Kill switch: pause all sending when bounces exceed this fraction of
     # sent mail (measured over the trailing sends). 0 disables the switch.
     max_bounce_rate: float = 0.05

@@ -43,6 +43,7 @@ from harvey.models.company import Company
 from harvey.models.prospect import COMPANY_INBOX_SOURCE, Prospect
 from harvey.public_http import public_http_client
 from harvey.state import StateManager
+from harvey.untrusted import UNTRUSTED_RULE, fence
 
 logger = logging.getLogger("harvey.scout")
 
@@ -1141,8 +1142,10 @@ Target industries: {', '.join(self.config.icp.industries)}
 Target titles: {', '.join(self.config.icp.titles)}
 Target company size: {self.config.icp.company_size}
 
-Here are the prospects to score:
-{chr(10).join(contact_summaries)}
+Here are the prospects to score, as found on the web:
+{fence(chr(10).join(contact_summaries), "found prospects")}
+
+{UNTRUSTED_RULE}
 
 Return a JSON array with one object per prospect, in the same order:
 [{{"index": 1, "score": 75, "personalization": "Short angle for outreach"}}, ...]

@@ -20,6 +20,7 @@ from harvey.humanize import humanize, humanizer_enabled
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS
 from harvey.models.campaign import Campaign, EmailStep
 from harvey.state import WRITABLE_EMAIL_STATUSES, StateManager
+from harvey.untrusted import UNTRUSTED_RULE, fence
 
 logger = logging.getLogger("harvey.writer")
 
@@ -252,13 +253,16 @@ class Writer:
 
     async def _write_personal_email(self, prospect) -> dict | None:
         """One grounded draft for one person. Facts in, one email out."""
+        inbox_rule = ""
         if prospect.is_company_inbox:
             facts = [
-                f"- Name: unknown. This goes to the company's general inbox ({prospect.email}),"
-                " most likely read by the owner or the office manager. Use no first name;"
-                " open with 'Hi there' or address the company's team.",
+                f"- Name: unknown (the company's general inbox, {prospect.email})",
                 f"- Company: {prospect.company}",
             ]
+            inbox_rule = (
+                "\n- This goes to the company's general inbox, most likely read by the owner"
+                "\n  or the office manager. Use no first name; open with 'Hi there' or"
+                "\n  address the company's team.")
         else:
             facts = [
                 f"- Name: {prospect.full_name()}",
@@ -305,11 +309,13 @@ class Writer:
 
 Write ONE cold email (the very first touch) to this specific person.
 
-FACTS — everything you know about them. Every claim about the prospect in
-your email must come from these facts. If a fact isn't listed here, you
-don't know it — do not invent funding rounds, mutual contacts, metrics,
-or anything else:
-{chr(10).join(facts)}
+FACTS — everything you know about them, gathered from their website and
+the web. Every claim about the prospect in your email must come from these
+facts. If a fact isn't listed here, you don't know it — do not invent
+funding rounds, mutual contacts, metrics, or anything else:
+{fence(chr(10).join(facts), "prospect research")}
+
+{UNTRUSTED_RULE}
 
 Requirements:
 - Under 75 words. One specific observation from the FACTS above, one
@@ -317,7 +323,7 @@ Requirements:
 - Write the actual text (no merge variables — you know their name/company).
 - Subject: lowercase, 2-5 words.
 - No postal address, unsubscribe or opt-out line: Harvey adds them when it sends.
-- Follow every STRICT EMAIL RULE above.
+- Follow every STRICT EMAIL RULE above.{inbox_rule}
 
 Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
 
@@ -386,7 +392,9 @@ Pricing: {self.config.product.pricing}"""
         prompt += f"""
 
 Write a 3-email cold outreach sequence for prospects like these:
-{prospect_summary}
+{fence(prospect_summary, "sample prospects")}
+
+{UNTRUSTED_RULE}
 
 Requirements:
 - Email 1: Personalized cold observation + one question. Under 75 words. No pitch.
