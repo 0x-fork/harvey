@@ -9,6 +9,7 @@ from datetime import datetime, time, timedelta
 import pytz
 
 from harvey.brain import Brain
+from harvey.sending_mode import sync_sending_mode
 from harvey.config import (
     ConfigError, load_config, load_env, HarveyConfig, legacy_sending_held, sending_notice,
     compliance_notice,
@@ -249,6 +250,10 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
 
     while not stop_event.is_set():
         try:
+            # 0. Approval or autopilot, as the config file says now: the
+            # dashboard can switch it while Harvey runs.
+            await sync_sending_mode(config, state)
+
             # 1. Check quiet hours
             if in_quiet_hours(config):
                 sleep_for = seconds_until_quiet_hours_end(config)

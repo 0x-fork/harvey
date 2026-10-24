@@ -374,6 +374,14 @@ def merge_trained_config(learned: dict, existing: dict | None) -> dict:
         merged["persona"].update(copy.deepcopy(learned.get("persona", {})))
     if "brain" in learned:
         merged["brain"] = copy.deepcopy(learned["brain"])
+    # The trained site joins your own domains (autopilot may link to it);
+    # the ones already listed stay.
+    trained = ((learned.get("channels") or {}).get("email") or {}).get("link_domains") or []
+    if trained and isinstance(merged.get("channels"), dict):
+        email = merged["channels"].setdefault("email", {})
+        if isinstance(email, dict):
+            have = list(email.get("link_domains") or [])
+            email["link_domains"] = have + [d for d in trained if d not in have]
     return merged
 
 
@@ -875,6 +883,8 @@ What prospects do instead of buying a solution like ours:
                     "enabled": True,
                     "provider": "instantly",
                     "max_daily_sends": 50,
+                    # The trained site is yours: autopilot may link to it.
+                    "link_domains": [email_domain],
                 },
                 "linkedin": {
                     "enabled": False,

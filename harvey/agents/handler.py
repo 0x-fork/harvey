@@ -16,6 +16,7 @@ from harvey.brain import Brain, BrainUnavailable
 from harvey.config import (
     DEFAULT_OPT_OUT_LINE, HarveyConfig, EnvConfig, compliance_of, legacy_sending_held,
 )
+from harvey.gate import autopilot_review, pre_send_check
 from harvey.humanize import humanize, humanizer_enabled
 from harvey.integrations.instantly import InstantlyClient
 from harvey.integrations.mail_provider import (
@@ -23,6 +24,8 @@ from harvey.integrations.mail_provider import (
 )
 from harvey.models.conversation import Conversation, Message
 from harvey.state import REVIEW_NEXT_REPLY_KEY, StateManager
+from harvey.sending_mode import sync_sending_mode
+from harvey.untrusted import UNTRUSTED_RULE, fence
 
 logger = logging.getLogger("harvey.handler")
 
@@ -438,6 +441,7 @@ class Handler:
 
         # 2b. Draft the reply now, while nothing is stored yet. A held
         # Instantly setup can't send it, so don't spend a model call on it.
+        await sync_sending_mode(self.config, self.state)
         held = not self.is_native and legacy_sending_held(self.config)
         response = ""
         if intent in AUTO_REPLY_INTENTS and not held:
@@ -555,6 +559,18 @@ class Handler:
                          "reply_preview": reply_text[:200]},
             )
             logger.info(f"Handler: {lead_email} wrote after their opt-out was undone. Handed to you.")
+        elif held_reasons := self._instantly_reply_held(prospect, response):
+            # Instantly sends at once, with no Outbox to hold it in: an answer
+            # the gate or the autopilot review stops goes to you instead.
+            await self.state.update_conversation(convo.id, status="needs_human")
+            await self.state.log_action(
+                action_type="escalation",
+                agent="handler",
+                details={"prospect_email": lead_email,
+                         "reason": "Harvey's answer was held: " + "; ".join(held_reasons)[:200],
+                         "reply_preview": reply_text[:200]},
+            )
+            logger.warning(f"Handler: answer to {lead_email} held ({held_reasons}). Handed to you.")
         elif reply_uuid:
             result = await self.instantly.send_reply(reply_uuid, response)
             if result is not None:
@@ -683,6 +699,7 @@ class Handler:
         self, response: str, prospect, convo, reply_meta: dict, intent: str
     ):
         """Route Harvey's reply through the outbox (approval ladder applies)."""
+        await sync_sending_mode(self.config, self.state)
         require_approval = getattr(
             self.config.channels.email, "require_approval", True
         )
@@ -707,6 +724,7 @@ class Handler:
             provider=self.provider.name if self.provider else "",
             thread_ref=reply_meta.get("thread_ref", ""),
             in_reply_to=reply_meta.get("message_id", ""),
+            approved_by="" if require_approval else "autopilot",
         )
         if item_id:
             await self.state.delete_setting(review_key)
@@ -718,6 +736,12 @@ class Handler:
                 details={"prospect_email": prospect.email, "intent": intent,
                          "response_preview": response[:100]},
             )
+
+    def _instantly_reply_held(self, prospect, response: str) -> list[str]:
+        """Why an Instantly reply must not go out by itself, or []."""
+        gate = pre_send_check(prospect.email, "Re:", response, kind="reply")
+        return list(gate.reasons) + autopilot_review("", response, self.config,
+                                                     recipient=prospect.email)
 
     async def _classify_intent(self, reply_text: str, prospect) -> str:
         """Ask the brain to classify the reply's intent."""
@@ -734,8 +758,9 @@ class Handler:
 When in doubt between "not_interested" and "unsubscribe", choose "unsubscribe".
 When in doubt between anything and "escalate", choose "escalate".
 
-Reply from {prospect.full_name()} ({prospect.title} at {prospect.company}):
-\"\"\"{reply_text}\"\"\"
+{UNTRUSTED_RULE}
+
+{fence(f"Reply from {prospect.full_name()} ({prospect.title} at {prospect.company}):" + chr(10) + reply_text, "their reply")}
 
 Respond with ONLY the category label, nothing else."""
 
@@ -838,7 +863,9 @@ Product: {self.config.product.name} — {self.config.product.description}"""
         prompt += f"""
 
 Conversation so far:
-{history}
+{fence(history, "the conversation")}
+
+{UNTRUSTED_RULE}
 
 The prospect's intent is: {intent}
 {objection_context}

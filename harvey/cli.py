@@ -463,7 +463,12 @@ def cmd_outbox(args):
 
         if args.approve_all:
             n = await state.approve_outbox()
-            print(f"\n  Approved {n} email(s). They'll send on schedule.\n")
+            print(f"\n  Approved {n} email(s). They'll send on schedule.")
+            held = await state.count_held_for_review()
+            if held:
+                print(f"  {held} email(s) Harvey held for review were left out: read each one,")
+                print("  then approve it with --approve <id>.")
+            print()
             return
         if args.approve:
             n = await state.approve_outbox(args.approve)

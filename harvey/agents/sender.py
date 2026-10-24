@@ -21,12 +21,14 @@ from harvey.config import (
     HarveyConfig, EnvConfig, cold_daily_cap, compliance_footer_lines, compliance_notice,
     compliance_of,
 )
-from harvey.gate import pre_send_check
+from harvey.gate import autopilot_review, pre_send_check
 from harvey.integrations.instantly import InstantlyClient
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
 from harvey.integrations.precleared import PreclearedClient
+from harvey.sending_mode import sync_sending_mode
 from harvey.state import (
-    HAND_SENT_REASON, MANUAL_SEND_KEY, MAYBE_SENT_PREFIX, StateManager,
+    AUTOPILOT_OFF_REASON, HAND_SENT_REASON, HELD_FOR_REVIEW, MANUAL_SEND_KEY,
+    MAYBE_SENT_PREFIX, StateManager,
 )
 
 # A follow-up waits at least this long after the email it follows went out,
@@ -133,11 +135,25 @@ class Sender:
                 return False
         return True
 
+    def _reviewed_leads(self, prospects: list) -> list:
+        """The prospects whose merge fields pass the autopilot review."""
+        kept = []
+        for p in prospects:
+            fields = " \n".join(str(v or "") for v in (
+                p.first_name, p.last_name, p.company, p.title, p.personalization_notes))
+            held = autopilot_review("", fields, self.config, recipient=p.email)
+            if held:
+                logger.warning(f"Sender: left {p.email} out of the Instantly upload: {held}")
+            else:
+                kept.append(p)
+        return kept
+
     async def _deploy_campaign(self, campaign):
         """Deploy a single campaign to Instantly. Idempotent: safe to retry."""
         # Instantly owns campaign scheduling and has no per-message outbox
         # approval here. Fail closed rather than silently bypass the setting,
         # including retries of an already-created remote campaign.
+        await sync_sending_mode(self.config, self.state)
         if getattr(self.config.channels.email, "require_approval", True):
             logger.warning(
                 "Sender: Instantly campaign held because require_approval is true. "
@@ -150,6 +166,21 @@ class Sender:
         # 0. Validate before touching the network
         if not self._validate_sequence(campaign):
             await self.state.update_campaign(campaign.id, status="failed")
+            return
+        # Instantly only deploys on autopilot, so nobody has read these
+        # templates: what a planted instruction would add holds the campaign.
+        held = [f"step {s.step} {r}" for s in campaign.sequence
+                for r in autopilot_review(s.subject, s.body, self.config)]
+        if held:
+            logger.warning(f"Sender: Instantly campaign '{campaign.name}' held for review: {held}")
+            key = "instantly_review_hold:" + campaign.id
+            if not await self.state.get_setting(key):
+                await self.state.set_setting(key, "1")
+                await self.state.log_action(
+                    action_type="escalation", agent="sender",
+                    details={"campaign_name": campaign.name,
+                             "reason": "campaign held: " + "; ".join(held)[:200]},
+                )
             return
 
         # 1. Create campaign in Instantly — or resume one from a previous
@@ -268,6 +299,11 @@ class Sender:
             logger.info(f"Sender: Capping leads from {len(prospects)} to {remaining} (daily limit).")
             prospects = prospects[:remaining]
 
+        # Instantly fills these into the templates on its side, unseen:
+        # scraped text carrying a planted link keeps that lead out.
+        prospects = self._reviewed_leads(prospects)
+        if not prospects:
+            return
         leads = [
             {
                 "email": p.email.strip().lower(),
@@ -385,6 +421,7 @@ class Sender:
             await self.state.update_campaign(campaign.id, status="failed")
             return
 
+        await sync_sending_mode(self.config, self.state)
         require_approval = getattr(
             self.config.channels.email, "require_approval", True
         )
@@ -428,6 +465,7 @@ class Sender:
                     send_at=send_at.isoformat(),
                     status=initial_status,
                     provider=self.provider.name,
+                    approved_by="" if require_approval else "autopilot",
                 )
                 if item_id:
                     staged += 1
@@ -511,6 +549,7 @@ class Sender:
 
     async def _blocked(self, item: dict, prospect, allow_risky: bool) -> tuple[str, str] | None:
         """Why this email must not go out, as (status, error), or None."""
+        await sync_sending_mode(self.config, self.state)   # "Turn off autopilot" counts at once
         if prospect is None:
             return "failed", "prospect missing"
         if item["kind"] == "sequence":
@@ -535,6 +574,18 @@ class Sender:
                 f"{gate.reasons}"
             )
             return "failed", "gate: " + "; ".join(gate.reasons)[:300]
+        if (item.get("approved_by") == "autopilot"
+                and getattr(self.config.channels.email, "require_approval", True)):
+            # Autopilot approved it, and autopilot has since been turned off.
+            return "pending_review", AUTOPILOT_OFF_REASON
+        if item.get("approved_by") != "you":
+            # Nobody approved this one (autopilot): what a planted
+            # instruction would add sends it back to you instead.
+            held = autopilot_review(item["subject"], self._outgoing_body(item), self.config,
+                                    recipient=item["to_email"])
+            if held:
+                logger.warning(f"Sender: holding email to {item['to_email']} for review: {held}")
+                return "pending_review", (HELD_FOR_REVIEW + "; ".join(held))[:300]
         return None
 
     async def _drain_due(self):

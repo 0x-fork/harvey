@@ -41,6 +41,11 @@ HAND_SENT_REASON = "sent_by_hand"
 # Set when you undo someone's opt-out: Harvey's first reply to them after
 # that waits for your approval, even on autopilot. Cleared once it has.
 REVIEW_NEXT_REPLY_KEY = "review_next_reply:"
+# Outbox error prefix for an email autopilot held for a human (gate.
+# autopilot_review): approve-all skips these, they're approved one by one.
+HELD_FOR_REVIEW = "held for your review: "
+# Outbox error on what autopilot had approved when it was turned off.
+AUTOPILOT_OFF_REASON = "waiting for you: autopilot was turned off before it went out"
 # Outbox errors starting with this: the send was cut off and the email may
 # have reached them. Never retried, and counted as Harvey's mail, so the
 # dashboard never offers a second one by hand.
@@ -441,6 +446,12 @@ MIGRATIONS: list[str] = [
     # ── v12: look actions up by type (opt-out history, undone opt-outs) ──
     """
     CREATE INDEX IF NOT EXISTS idx_actions_type_created ON actions(action_type, created_at);
+    """,
+    # ── v13: who approved an outbox row: 'you' (a human), 'autopilot',
+    # 'earlier' (approved before this was recorded), '' (not approved) ──
+    """
+    ALTER TABLE outbox ADD COLUMN approved_by TEXT DEFAULT '';
+    UPDATE outbox SET approved_by = 'earlier' WHERE status IN ('approved', 'sending');
     """,
 ]
 
@@ -922,9 +933,11 @@ class StateManager:
         provider: str = "",
         thread_ref: str = "",
         in_reply_to: str = "",
+        approved_by: str = "",
     ) -> str | None:
         """Queue one outgoing email. Returns its id, or None when the
-        (campaign, prospect, step) slot already exists — the double-send guard."""
+        (campaign, prospect, step) slot already exists — the double-send guard.
+        ``approved_by="autopilot"`` when it's queued approved on autopilot."""
         item_id = _new_id()
         async with self._connect() as db:
             cursor = await db.execute(
@@ -939,6 +952,8 @@ class StateManager:
                     status, send_at, provider, thread_ref, in_reply_to,
                 ),
             )
+            if cursor.rowcount > 0 and approved_by:
+                await db.execute("UPDATE outbox SET approved_by = ? WHERE id = ?", (approved_by, item_id))
             await db.commit()
             return item_id if cursor.rowcount > 0 else None
 
@@ -1135,22 +1150,53 @@ class StateManager:
             return cursor.rowcount
 
     async def approve_outbox(self, item_id: str | None = None) -> int:
-        """Approve one pending item, or ALL pending when item_id is None."""
+        """Approve one pending item, or ALL pending when item_id is None.
+
+        A human's approval (dashboard or CLI): marked approved_by 'you', so
+        the autopilot review (gate.autopilot_review) doesn't hold it again,
+        and any reason it was held is cleared."""
         async with self._connect() as db:
             if item_id:
                 cursor = await db.execute(
-                    "UPDATE outbox SET status = 'approved', updated_at = ? "
-                    "WHERE id = ? AND status = 'pending_review'",
+                    "UPDATE outbox SET status = 'approved', approved_by = 'you', error = '', "
+                    "updated_at = ? WHERE id = ? AND status = 'pending_review'",
                     (_utcnow().isoformat(), item_id),
                 )
             else:
+                # Not the ones autopilot held for a look (possible planted
+                # links or a leak): those are approved one at a time.
                 cursor = await db.execute(
-                    "UPDATE outbox SET status = 'approved', updated_at = ? "
-                    "WHERE status = 'pending_review'",
-                    (_utcnow().isoformat(),),
+                    "UPDATE outbox SET status = 'approved', approved_by = 'you', error = '', "
+                    "updated_at = ? WHERE status = 'pending_review' "
+                    "AND COALESCE(error, '') NOT LIKE ?",
+                    (_utcnow().isoformat(), HELD_FOR_REVIEW + "%"),
                 )
             await db.commit()
             return cursor.rowcount
+
+    async def requeue_autopilot_approved(self) -> int:
+        """Autopilot was turned off: everything it approved that hasn't gone
+        out waits for you instead, and so does what was approved before
+        Harvey recorded who approved ('earlier'; it can't tell). Yours stays
+        approved. Returns how many."""
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE outbox SET status = 'pending_review', approved_by = '', "
+                "error = ?, updated_at = ? WHERE status = 'approved' "
+                "AND approved_by IN ('autopilot', 'earlier')",
+                (AUTOPILOT_OFF_REASON, _utcnow().isoformat()),
+            )
+            await db.commit()
+            return cursor.rowcount
+
+    async def count_held_for_review(self) -> int:
+        """Emails autopilot sent back for a human, still waiting."""
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM outbox WHERE status = 'pending_review' AND error LIKE ?",
+                (HELD_FOR_REVIEW + "%",),
+            ) as cursor:
+                return (await cursor.fetchone())[0]
 
     async def cancel_pending_outbox_for_prospect(
         self, prospect_id: str, reason: str = "stop_on_reply"
