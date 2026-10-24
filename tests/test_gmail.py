@@ -129,3 +129,22 @@ def test_malformed_part_headers_never_lose_the_reply(headers):
             "body": {"data": base64.urlsafe_b64encode(raw).decode()}}
     text = GmailProvider._extract_text(part)
     assert "unsubscribe" in text
+
+
+@pytest.mark.parametrize("charset", ["punycode", "idna", "utf-7", "unicode_escape", "raw-unicode-escape"])
+def test_codecs_that_arent_mail_charsets_fall_back_to_utf8(charset):
+    """punycode is quadratic (a few MB stalled the heartbeat for minutes) and
+    turned "unsubscribe" into garbage; the escape codecs let a sender shape
+    the text. None is a real mail charset."""
+    import time
+    body = b"Please unsubscribe me. " + b"9" * 300_000
+    started = time.perf_counter()
+    text = GmailProvider._extract_text(_part(body, f"text/plain; charset={charset}"))
+    assert time.perf_counter() - started < 1
+    assert text.startswith("Please unsubscribe me.")
+
+
+def test_a_huge_part_is_only_decoded_as_far_as_harvey_reads():
+    body = "Please unsubscribe me. ".encode("iso-8859-1") + b"x" * 5_000_000
+    text = GmailProvider._extract_text(_part(body, "text/plain; charset=iso-8859-1"))
+    assert text.startswith("Please unsubscribe me.") and len(text) <= 200_000
