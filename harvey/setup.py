@@ -692,6 +692,11 @@ class SetupWizard:
             if answer.strip().lower() == "none":
                 prospects = ""
                 break
+            # "no" answers "if they're all in one" but is also Norway's code.
+            if answer.strip().lower() == "no" and not _ask_yes_no(
+                    "NO is Norway's code. Are your prospects all in Norway?", default=False):
+                prospects = ""
+                break
             try:
                 prospects = normalize_prospect_country(answer)
                 break

@@ -347,9 +347,11 @@ minor versions can still change behaviour.
   go out. One check per address, cached for 30 days; changing the sender
   country, address source or product description triggers a fresh check. The
   receipt id is logged with each send. Native providers only. Off by default.
-- **`harvey setup` offers the Precleared check.** A new optional last step
+- **`harvey setup` offers the Precleared check** (from #46 by
+  gabrielaoimevbore-beep). A new optional last step
   asks whether to turn the check on, where your business is based (GB or US)
-  and, if your prospects are all in one country, which one. It then offers a
+  and, if your prospects are all in one country, which one (answering "no"
+  there asks before saving it as Norway's code). It then offers a
   free `PRECLEARED_API_KEY` (hidden input, saved to `.env`; 25 checks a day
   instead of 10). Off unless you say yes. Re-running setup offers your saved
   answers as the defaults, so pressing Enter never switches the check off. The

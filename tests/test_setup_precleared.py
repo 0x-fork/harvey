@@ -147,7 +147,8 @@ def test_sender_country_must_be_gb_or_us_and_blank_skips(files, monkeypatch, cap
 
 
 def test_prospect_country_is_checked_and_norway_stays_a_string(files, monkeypatch, capsys):
-    script(monkeypatch, yes_no=[True], answers=["GB", "Norway", "no", ""])
+    # "no" is also Norway's code, so it's confirmed before being saved.
+    script(monkeypatch, yes_no=[True, True], answers=["GB", "Norway", "no", ""])
     wizard = setup.SetupWizard()
     wizard._setup_compliance()
     finish(wizard)
@@ -156,6 +157,19 @@ def test_prospect_country_is_checked_and_norway_stays_a_string(files, monkeypatc
     # YAML would read an unquoted NO as false; the saved value must stay "NO".
     assert saved(files.config)["prospect_country"] == "NO"
     assert load_config(str(files.config)).compliance.precleared.prospect_country == "NO"
+
+
+def test_answering_no_to_the_prospect_country_does_not_pick_norway(files, monkeypatch):
+    # The question reads "if they're all in one", so "no" usually means "they
+    # aren't". Saving it as NO would tell Precleared they're all in Norway.
+    asked = script(monkeypatch, yes_no=[True, None], answers=["US", "no", ""])
+    wizard = setup.SetupWizard()
+    wizard._setup_compliance()
+    finish(wizard)
+
+    assert asked.yes_no[1][1] is False  # Enter means not Norway
+    assert saved(files.config)["prospect_country"] == ""
+    assert saved(files.config)["enabled"] is True
 
 
 def test_none_clears_a_saved_prospect_country(files, monkeypatch):
@@ -223,3 +237,24 @@ async def test_setup_asks_about_the_check_before_writing_anything(monkeypatch, c
 
     assert calls.index("_setup_behavior") < calls.index("_setup_compliance") < calls.index("_write_env")
     assert "Step 7/7: Cold-Email Check (Optional)" in capsys.readouterr().out
+
+
+def test_saving_the_key_keeps_other_env_lines_and_stays_private(files, monkeypatch, capsys, caplog):
+    other = ('SMTP_PASSWORD=a=b=c\n'
+             'GMAIL_CLIENT_SECRET="quoted # not a comment"\n'
+             "HUNTER_API_KEY='single'\n"
+             'SERPER_API_KEY=abc#def')  # no trailing newline
+    files.env.write_text(other)
+    script(monkeypatch, yes_no=[True], answers=["US", "", FAKE_KEY])
+    wizard = setup.SetupWizard()
+    caplog.set_level("DEBUG")
+    wizard._setup_compliance()
+    finish(wizard)
+
+    lines = files.env.read_text().splitlines()
+    for line in other.splitlines():
+        assert line in lines
+    assert f"PRECLEARED_API_KEY={FAKE_KEY}" in lines
+    assert files.env.stat().st_mode & 0o777 == 0o600
+    assert FAKE_KEY not in capsys.readouterr().out
+    assert FAKE_KEY not in caplog.text
