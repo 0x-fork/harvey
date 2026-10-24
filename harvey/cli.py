@@ -543,7 +543,7 @@ def cmd_discover(args):
     from harvey.state import StateManager
     from harvey.config import load_config
     from harvey.collectors.discover import (
-        PROVIDERS, build_queries, provider_menu, run_discovery,
+        PROVIDERS, build_queries, preset_problem, provider_menu, run_discovery,
     )
 
     async def _discover():
@@ -574,8 +574,13 @@ def cmd_discover(args):
 
         # Semicolons, not commas: "Denver, CO" is one city, not two.
         cities = [c.strip() for c in args.city.split(";") if c.strip()] or None
+        preset = getattr(args, "preset", "") or ""
+        problem = preset_problem(preset, args.provider)
+        if problem:
+            print(f"\n  {problem}\n")
+            sys.exit(2)
         queries = build_queries(config, cities=cities,
-                                depth=args.depth, limit=args.limit)
+                                depth=args.depth, limit=args.limit, preset=preset)
 
         report = await run_discovery(state, config, args.provider, queries,
                                      max_spend=args.max_spend, dry_run=True)
@@ -913,6 +918,10 @@ def main():
                      help="Max records per query (default: 100)")
     sub.add_argument("--max-spend", type=float, default=1.0,
                      help="Hard cap in dollars (default: 1.00)")
+    sub.add_argument("--preset", default="", choices=["", "yc"],
+                     help="A built-in search instead of your ICP's industries. "
+                          "yc: startups whose own site says they're YC-backed "
+                          "(needs serper or dataforseo_serp)")
     sub.add_argument("--no-profile", action="store_true",
                      help="Don't profile what was found (profiling is free)")
     sub.set_defaults(func=cmd_discover)

@@ -234,6 +234,22 @@ class Writer:
                 f"({'awaiting approval' if require_approval else 'approved'})."
             )
 
+    async def _yc(self, company_id) -> str | None:
+        """The company's YC batch (see state.yc_batch); a failed read is just
+        "not known to be YC", never a reason not to write."""
+        state = getattr(self, "state", None)
+        if not company_id or state is None or not hasattr(state, "yc_batch"):
+            return None
+        try:
+            return await state.yc_batch(company_id)
+        except Exception:
+            return None
+
+    def _startup_playbook(self) -> str:
+        """skills/selling_to_startups.md, for YC-backed prospects ("" if absent)."""
+        text = self.brain.load_skill("selling_to_startups") if hasattr(self.brain, "load_skill") else ""
+        return "\n\nSELLING TO STARTUP FOUNDERS\n" + text if text else ""
+
     async def _feedback_block(self, prospect_ids: list[str]) -> str:
         """The owner's notes from the dashboard's Feedback buttons, as prompt
         text ("" when there are none). Never lets a failed read stop writing."""
@@ -292,6 +308,10 @@ class Writer:
                 )
         if prospect.personalization_notes:
             facts.append(f"- Research notes: {prospect.personalization_notes}")
+        yc = await self._yc(prospect.company_id)
+        if yc is not None:
+            facts.append("- Backed by Y Combinator" + (f" (YC {yc})" if yc else "")
+                         + ", as their own site says")
 
         prompt = self.brain.load_prompt(
             "writer",
@@ -306,6 +326,8 @@ class Writer:
         ) or ""
         if self.skills:
             prompt += "\n\n" + self.skills
+        if yc is not None:
+            prompt += self._startup_playbook()
         prompt += await self._feedback_block([prospect.id])
 
         prompt += f"""
@@ -388,6 +410,10 @@ Pricing: {self.config.product.pricing}"""
         # Inject email framework skills
         if self.skills:
             prompt += "\n\n" + self.skills
+        # A batch that's mostly YC startups gets the founder playbook.
+        backed = [await self._yc(p.company_id) for p in prospects]
+        if prospects and sum(b is not None for b in backed) * 2 >= len(prospects):
+            prompt += self._startup_playbook()
         # Campaign notes only: this template goes to the whole batch, so a
         # note about one person ("met her at the expo") must never reach it.
         prompt += await self._feedback_block([])

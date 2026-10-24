@@ -9,6 +9,15 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **A built-in skill for selling to YC startups.** The `yc` discovery preset
+  (`harvey discover --preset yc`, or *Look for: YC startups* on Discover)
+  searches your industries, through Serper or DataForSEO SERP, for companies
+  whose own site says they're backed by Y Combinator. The new `YC_BACKED`
+  signal tags them from their homepage, with the batch when it's stated
+  (W24, S23). For those prospects the writer and reply handler use the new
+  `skills/selling_to_startups.md` playbook: who reads, timing around the
+  batch and Demo Day, what not to do. Harvey never reads ycombinator.com,
+  whose terms forbid scraping it or collecting founders' contact details.
 - **Approval or autopilot, visible and switchable.** The Outbox now says
   which sending mode you're in, and Settings → Sending explains both,
   lists the domains counted as yours and switches them. Turning autopilot

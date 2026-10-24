@@ -1433,6 +1433,17 @@ class StateManager:
             await db.commit()
         return len(payload)
 
+    async def yc_batch(self, company_id: str) -> str | None:
+        """The YC batch the company says it's in ("" when it doesn't say
+        which), or None when it isn't YC-backed or nobody checked."""
+        if not company_id:
+            return None
+        rows = await self.get_observations(company_id=company_id, signal_code="YC_BACKED",
+                                           latest_only=True, limit=1)
+        if rows and rows[0].get("value_num") == 1:
+            return rows[0].get("value_text") or ""
+        return None
+
     async def get_observations(
         self,
         company_id: str = "",

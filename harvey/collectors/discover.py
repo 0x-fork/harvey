@@ -61,6 +61,9 @@ JUNK_DOMAIN_PATTERNS = tuple(re.compile(p, re.I) for p in (
     r"\.(edu|gov|mil)$",
     r"(hospital|healthsystem|medicalcenter)\.",
     r"health\.org$",
+    # startup databases, launch sites and tech press (the YC preset's noise)
+    r"(^|\.)(ycombinator|crunchbase|techcrunch|wellfound|angel|tracxn|pitchbook)\.",
+    r"(^|\.)(cbinsights|producthunt|github|f6s|dealroom|growjo|owler|zoominfo)\.",
     # infrastructure that is never a prospect
     r"(^|\.)(google|bing|yahoo|duckduckgo|amazon|apple|microsoft)\.",
     r"(wordpress|wix|squarespace|shopify|godaddy|weebly|webflow)\.com$",
@@ -789,17 +792,54 @@ class DiscoveryReport:
         }
 
 
+# Built-in searches beyond "your ICP". Each says how to turn an industry into
+# a search, and which kind of provider can run it.
+PRESETS = {
+    # Startups that say on their own site they're YC-backed. Never
+    # ycombinator.com itself, whose terms forbid scraping and harvesting
+    # contacts; its pages and the startup databases are excluded too.
+    "yc": {
+        "label": "YC startups",
+        "kinds": ("serp",),
+        "term": ('"backed by Y Combinator" {industry} -site:ycombinator.com '
+                 "-site:linkedin.com -site:crunchbase.com"),
+        "local": False,
+    },
+}
+
+
+def preset_problem(preset: str, provider_key: str) -> str | None:
+    """Why ``preset`` can't run on ``provider_key``, or None."""
+    if not preset:
+        return None
+    spec = PRESETS.get(preset)
+    if spec is None:
+        return f"Unknown preset {preset!r}. Presets: {', '.join(PRESETS)}."
+    provider = PROVIDERS.get(provider_key)
+    if provider is None or provider.kind not in spec["kinds"]:
+        names = ", ".join(k for k, p in PROVIDERS.items() if p.kind in spec["kinds"])
+        return (f"The {spec['label']} preset is a web search, so it needs a search "
+                f"provider ({names}), not {provider_key}.")
+    return None
+
+
 def build_queries(config, cities: list[str] | None = None,
-                  depth: int = 30, limit: int = 100) -> list[DiscoveryQuery]:
+                  depth: int = 30, limit: int = 100, preset: str = "") -> list[DiscoveryQuery]:
     """Turn the configured ICP into a concrete query list.
 
     One query per (industry x city). Coordinates come from
     ``icp.geo_coordinates`` when present, because listings providers need a
-    radius, not a place name.
+    radius, not a place name. A ``preset`` (PRESETS) rewrites each industry
+    into its search; a non-local one only uses cities you pass.
     """
     icp = config.icp
     terms = list(icp.industries) or [config.product.name]
-    places = cities if cities is not None else list(icp.geography) or [""]
+    spec = PRESETS.get(preset) if preset else None
+    if spec:
+        terms = [spec["term"].format(industry=t) for t in terms]
+        places = cities if cities is not None else ([""] if not spec["local"] else list(icp.geography) or [""])
+    else:
+        places = cities if cities is not None else list(icp.geography) or [""]
     coords = getattr(icp, "geo_coordinates", {}) or {}
 
     return [

@@ -1508,13 +1508,18 @@ _discovery_kind = "discover"   # or "profile": reading sites has no stop switch
 
 
 def _discovery_queries(body: dict, config):
-    from harvey.collectors.discover import build_queries
+    from harvey.collectors.discover import build_queries, preset_problem
 
+    preset = str(body.get("preset") or "")
+    problem = preset_problem(preset, str(body.get("provider") or ""))
+    if problem:
+        raise ValueError(problem)
     cities = [c.strip() for c in (body.get("cities") or []) if c.strip()] or None
     return build_queries(
         config, cities=cities,
         depth=int(body.get("depth") or 30),
         limit=int(body.get("limit") or 100),
+        preset=preset,
     )
 
 
@@ -1555,7 +1560,10 @@ async def estimate_discovery(request: Request):
             return JSONResponse({"error": f"unknown provider {provider!r}"},
                                 status_code=400)
 
-        queries = _discovery_queries(body, load_config())
+        try:
+            queries = _discovery_queries(body, load_config())
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
         return {
             "provider": provider,
             "queries": [q.keyword() for q in queries],
@@ -1592,7 +1600,10 @@ async def start_discovery(request: Request):
                                 status_code=400)
 
         config = load_config()
-        queries = _discovery_queries(body, config)
+        try:
+            queries = _discovery_queries(body, config)
+        except ValueError as e:
+            return JSONResponse({"success": False, "message": str(e)}, status_code=400)
         max_spend = float(body.get("max_spend") or 1.0)
 
         state = _state()
