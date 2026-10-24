@@ -103,6 +103,7 @@ class GmailProvider(MailProvider):
         # reached (kept by confirm_read).
         self._history_id: str | None = None
         self._last_full_read = 0.0
+        self._verify_week = False      # list the week once more after a full read
         self._pending: tuple | None = None
 
     def is_configured(self) -> bool:
@@ -276,14 +277,24 @@ class GmailProvider(MailProvider):
             changed = await self._read_history(self._history_id)
             if changed is not None:
                 messages, marker = changed
-                self._pending = (marker, False)
+                verified = False
+                if self._verify_week:
+                    # The full read listed through Gmail search, which can lag
+                    # new mail by seconds: a reply just under the marker could
+                    # be in neither read. A cycle later the index has caught
+                    # up, so the first history read lists the week once more.
+                    have = {m.provider_id for m in messages}
+                    messages = messages + [m for m in await self._read_week(limit)
+                                           if m.provider_id not in have]
+                    verified = True
+                self._pending = (marker, False, verified)
                 return messages
             logger.info("Gmail: the history marker has expired; reading the last week in full.")
         # The marker comes first: anything arriving during the read is in
         # the next history list (and deduplicated if it's in both).
         marker = await self._current_history_id()
         messages = await self._read_week(limit)
-        self._pending = (marker, True)
+        self._pending = (marker, True, False)
         return messages
 
     def confirm_read(self):
@@ -291,11 +302,14 @@ class GmailProvider(MailProvider):
         the next read starts after it."""
         if not self._pending:
             return
-        marker, full = self._pending
+        marker, full, verified = self._pending
         self._pending = None
         self._history_id = marker
         if full:
             self._last_full_read = time.time()
+            self._verify_week = True
+        elif verified:
+            self._verify_week = False
 
     async def _current_history_id(self) -> str | None:
         """Gmail's current history marker, or None (the next read is the
@@ -337,6 +351,10 @@ class GmailProvider(MailProvider):
         marker = None
         for page in range(1, MAX_INBOX_PAGES + 1):
             data = await self._request("GET", "/history", params=dict(params), not_found=_GONE)
+            if page == 1 and isinstance(data, dict) and isinstance(data.get("historyId"), (str, int)):
+                # The first page's marker: anything recorded while paging is
+                # read again next time (deduplicated) rather than skipped.
+                marker = data["historyId"]
             if data is _GONE:
                 return None
             if not isinstance(data, dict) or not isinstance(data.get("history", []), list):
@@ -351,7 +369,7 @@ class GmailProvider(MailProvider):
                         wanted.append((_entry_id(entry, page), True))
             token = data.get("nextPageToken")
             if token is None:
-                marker = data.get("historyId")
+                marker = marker if marker is not None else data.get("historyId")
                 if not isinstance(marker, (str, int)) or not str(marker):
                     raise GmailError(f"history page {page}: no historyId")
                 break
@@ -367,6 +385,11 @@ class GmailProvider(MailProvider):
             if msg_id in done:
                 continue
             done.add(msg_id)
+            if moved_in:
+                # Judge it on its labels now, not ones cached when it was,
+                # say, in the trash.
+                self._read_cache.pop(msg_id, None)
+                self._label_cache.pop(msg_id, None)
             got = await self._fetch(msg_id, "history")
             if got is _GONE:
                 continue

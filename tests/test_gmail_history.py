@@ -80,8 +80,11 @@ async def test_first_read_is_full_then_only_what_changed():
 
     fake.calls.clear()
     fake.history = {"100": [{"history": [added("m2")], "historyId": "105"}]}
-    assert [m.provider_id for m in await p.get_replies()] == ["m2"]
-    assert fake.paths() == ["/history", "/messages/m2"]       # no week-long listing
+    # m1 again from the week's re-listing: the handler skips it as processed.
+    assert [m.provider_id for m in await p.get_replies()] == ["m2", "m1"]
+    # The first history read after a full one lists the week once more
+    # (search-index lag); after that, history alone.
+    assert fake.paths() == ["/history", "/messages/m2", "/messages"]
     assert fake.calls[0][1]["labelId"] == "INBOX"
     p.confirm_read()
 
@@ -103,7 +106,7 @@ async def test_an_unconfirmed_read_is_read_again():
     assert [m.provider_id for m in await p.get_replies()] == ["m2"]
     # not confirmed: the handler stopped part-way
     assert [m.provider_id for m in await p.get_replies()] == ["m2"]
-    assert fake.calls[-1][0] == "/history" and [c for c in fake.calls if c[0] == "/history"][-1][1]["startHistoryId"] == "100"
+    assert [c for c in fake.calls if c[0] == "/history"][-1][1]["startHistoryId"] == "100"
 
 
 @pytest.mark.asyncio
@@ -171,8 +174,10 @@ async def test_history_pages_are_followed_and_bounded():
     ]}
     assert [m.provider_id for m in await p.get_replies()] == ["a", "b"]
     p.confirm_read()
-    assert p._history_id == "102"
-    fake.history["102"] = [{"history": [], "nextPageToken": "0", "historyId": "102"}]
+    # The first page's marker: a change made while paging is read again
+    # next time rather than skipped (review of #66 follow-up).
+    assert p._history_id == "101"
+    fake.history["101"] = [{"history": [], "nextPageToken": "0", "historyId": "101"}]
     with pytest.raises(GmailError):                           # a token that repeats
         await p.get_replies()
 
@@ -256,7 +261,72 @@ async def test_an_unsubscribe_seen_only_in_history_stops_the_follow_up(monkeypat
     await _approved_item(harness.state)                       # a follow-up to Bob, due now
     calls.clear()
     await harness.run_cycles(1)
-    assert [r.url.path.rsplit("/", 1)[1] for r in calls] == ["history", "stop"]
+    # history, the unsubscribe, and the week once more (search-index lag)
+    assert [r.url.path.rsplit("/", 1)[1] for r in calls] == ["history", "stop", "messages"]
     assert await harness.state.is_reply_processed("stop")
     assert len(await harness.state.get_outbox(status="cancelled")) == 1
     assert p._history_id == "2"
+
+
+# ── review: ways a reply could be missed ──
+
+
+@pytest.mark.asyncio
+async def test_a_reply_the_search_index_hadnt_caught_up_with_is_still_read():
+    """The full read takes the marker, then lists through Gmail search,
+    which can lag new mail by seconds. A reply below the marker that the
+    listing missed would be in neither read, so the first history read
+    after a full read lists the week again too."""
+    fake = FakeGmail()
+    fake.messages = {"late": message("late", body="unsubscribe")}
+    p = provider(fake)
+    assert await p.get_replies() == []                        # index hasn't caught up
+    p.confirm_read()
+    fake.inbox = ["late"]                                     # it has now
+    fake.history = {"100": [{"historyId": "100"}]}            # nothing after the marker
+    assert [m.provider_id for m in await p.get_replies()] == ["late"]
+    p.confirm_read()
+    fake.calls.clear()
+    fake.history["100"] = [{"historyId": "100"}]
+    await p.get_replies()
+    assert fake.paths() == ["/history"]                       # then history alone
+
+
+@pytest.mark.asyncio
+async def test_a_reply_moved_back_into_the_inbox_is_judged_on_its_labels_now():
+    fake = FakeGmail()
+    p = provider(fake)
+    await p.get_replies()
+    p.confirm_read()
+    fake.messages = {"r": message("r", body="stop", labels=("TRASH",))}
+    fake.history = {"100": [{"history": [added("r")], "historyId": "101"}]}
+    assert await p.get_replies() == []                        # trashed before Harvey looked
+    p.confirm_read()
+    fake.messages["r"] = message("r", body="stop", labels=("INBOX",))   # moved back
+    fake.history["101"] = [{"history": [added("r", key="labelsAdded", labels=["INBOX"])],
+                            "historyId": "102"}]
+    assert [m.provider_id for m in await p.get_replies()] == ["r"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["brain", "error"])
+async def test_the_handler_doesnt_confirm_when_a_reply_wasnt_handled(tmp_path, monkeypatch, failure):
+    from harvey.brain import BrainUnavailable
+    from harvey.integrations.mail_provider import InboundMessage
+    from harvey.state import StateManager
+    from tests.test_outbox_native import FakeProvider, make_handler, seed_prospect
+    state = StateManager(str(tmp_path / "u.db"))
+    await state.init_db()
+    await seed_prospect(state, email="jo@acme.com", status="contacted")
+    provider_ = FakeProvider()
+    provider_.inbound = [InboundMessage(provider_id="x1", from_email="jo@acme.com",
+                                        subject="Re: hi", body="Tell me more")]
+    confirmed = []
+    provider_.confirm_read = lambda: confirmed.append(True)
+    handler = make_handler(state, provider_)
+
+    async def boom(*a, **k):
+        raise BrainUnavailable("model down") if failure == "brain" else ValueError("bad")
+    monkeypatch.setattr(handler, "_process_reply", boom)
+    assert await handler._run_native() is False
+    assert confirmed == []
