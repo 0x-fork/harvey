@@ -20,6 +20,8 @@ from harvey.humanize import humanize, humanizer_enabled
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS
 from harvey.models.campaign import Campaign, EmailStep
 from harvey.state import WRITABLE_EMAIL_STATUSES, StateManager
+from harvey.sending_mode import sync_sending_mode
+from harvey.untrusted import UNTRUSTED_RULE, fence
 
 logger = logging.getLogger("harvey.writer")
 
@@ -185,6 +187,7 @@ class Writer:
         (campaign, prospect, step 1) slot. If a draft fails, the slot stays
         empty and the sender falls back to the campaign template.
         """
+        await sync_sending_mode(self.config, self.state)
         require_approval = getattr(
             self.config.channels.email, "require_approval", True
         )
@@ -220,6 +223,7 @@ class Writer:
                 send_at=now,
                 status=status,
                 provider=provider,
+                approved_by="" if require_approval else "autopilot",
             )
             if item_id:
                 drafted += 1
@@ -229,6 +233,22 @@ class Writer:
                 f"Writer: drafted {drafted} personalized first email(s) "
                 f"({'awaiting approval' if require_approval else 'approved'})."
             )
+
+    async def _yc(self, company_id) -> str | None:
+        """The company's YC batch (see state.yc_batch); a failed read is just
+        "not known to be YC", never a reason not to write."""
+        state = getattr(self, "state", None)
+        if not company_id or state is None or not hasattr(state, "yc_batch"):
+            return None
+        try:
+            return await state.yc_batch(company_id)
+        except Exception:
+            return None
+
+    def _startup_playbook(self) -> str:
+        """skills/selling_to_startups.md, for YC-backed prospects ("" if absent)."""
+        text = self.brain.load_skill("selling_to_startups") if hasattr(self.brain, "load_skill") else ""
+        return "\n\nSELLING TO STARTUP FOUNDERS\n" + text if text else ""
 
     async def _feedback_block(self, prospect_ids: list[str]) -> str:
         """The owner's notes from the dashboard's Feedback buttons, as prompt
@@ -252,13 +272,16 @@ class Writer:
 
     async def _write_personal_email(self, prospect) -> dict | None:
         """One grounded draft for one person. Facts in, one email out."""
+        inbox_rule = ""
         if prospect.is_company_inbox:
             facts = [
-                f"- Name: unknown. This goes to the company's general inbox ({prospect.email}),"
-                " most likely read by the owner or the office manager. Use no first name;"
-                " open with 'Hi there' or address the company's team.",
+                f"- Name: unknown (the company's general inbox, {prospect.email})",
                 f"- Company: {prospect.company}",
             ]
+            inbox_rule = (
+                "\n- This goes to the company's general inbox, most likely read by the owner"
+                "\n  or the office manager. Use no first name; open with 'Hi there' or"
+                "\n  address the company's team.")
         else:
             facts = [
                 f"- Name: {prospect.full_name()}",
@@ -285,6 +308,10 @@ class Writer:
                 )
         if prospect.personalization_notes:
             facts.append(f"- Research notes: {prospect.personalization_notes}")
+        yc = await self._yc(prospect.company_id)
+        if yc is not None:
+            facts.append("- Backed by Y Combinator" + (f" (YC {yc})" if yc else "")
+                         + ", as their own site says")
 
         prompt = self.brain.load_prompt(
             "writer",
@@ -299,17 +326,21 @@ class Writer:
         ) or ""
         if self.skills:
             prompt += "\n\n" + self.skills
+        if yc is not None:
+            prompt += self._startup_playbook()
         prompt += await self._feedback_block([prospect.id])
 
         prompt += f"""
 
 Write ONE cold email (the very first touch) to this specific person.
 
-FACTS — everything you know about them. Every claim about the prospect in
-your email must come from these facts. If a fact isn't listed here, you
-don't know it — do not invent funding rounds, mutual contacts, metrics,
-or anything else:
-{chr(10).join(facts)}
+FACTS — everything you know about them, gathered from their website and
+the web. Every claim about the prospect in your email must come from these
+facts. If a fact isn't listed here, you don't know it — do not invent
+funding rounds, mutual contacts, metrics, or anything else:
+{fence(chr(10).join(facts), "prospect research")}
+
+{UNTRUSTED_RULE}
 
 Requirements:
 - Under 75 words. One specific observation from the FACTS above, one
@@ -317,7 +348,7 @@ Requirements:
 - Write the actual text (no merge variables — you know their name/company).
 - Subject: lowercase, 2-5 words.
 - No postal address, unsubscribe or opt-out line: Harvey adds them when it sends.
-- Follow every STRICT EMAIL RULE above.
+- Follow every STRICT EMAIL RULE above.{inbox_rule}
 
 Return ONLY JSON: {{"subject": "...", "body": "..."}}"""
 
@@ -379,6 +410,11 @@ Pricing: {self.config.product.pricing}"""
         # Inject email framework skills
         if self.skills:
             prompt += "\n\n" + self.skills
+        # One template goes to the whole batch: founder framing only when
+        # every prospect in it is a YC startup.
+        backed = [await self._yc(p.company_id) for p in prospects]
+        if prospects and all(b is not None for b in backed):
+            prompt += self._startup_playbook()
         # Campaign notes only: this template goes to the whole batch, so a
         # note about one person ("met her at the expo") must never reach it.
         prompt += await self._feedback_block([])
@@ -386,7 +422,9 @@ Pricing: {self.config.product.pricing}"""
         prompt += f"""
 
 Write a 3-email cold outreach sequence for prospects like these:
-{prospect_summary}
+{fence(prospect_summary, "sample prospects")}
+
+{UNTRUSTED_RULE}
 
 Requirements:
 - Email 1: Personalized cold observation + one question. Under 75 words. No pitch.

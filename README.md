@@ -13,21 +13,23 @@ $ harvey run
 Harvey is online. Always Be Closing.
 ============================================================
 Checking pipeline state...
-Decision: prospect (only 3 new prospects; pipeline needs leads)
-  discover  → 41 businesses in Portland, OR       ($0.00, OpenStreetMap)
-  profile   → 41 sites read, 288 observations     (free, no model calls)
-  scout     → 12 scored against your ICP
-Decision: write_campaign (12 new prospects with no drafts)
-  writer    → 3-email sequence for Cascade Landscaping
-  outbox    → 12 emails waiting for your approval
+Decision: handle_replies (2 new replies)
+  handler   → Elena Park, Harbor Dental Studio     interested, answer drafted
+  handler   → Priya Nair, Highline Roofing         objection, answer drafted
+Decision: write_campaign (3 new prospects with no drafts)
+  writer    → 2-email sequence: Phoenix HVAC hiring a dispatcher
+  outbox    → 5 emails waiting for your approval
 Cycle complete. Sleeping for 15 minutes.
 ```
 
-And the dashboard it keeps, at `localhost:5555` — confirming a signal, building a
-cohort out of the confirmed ones, pricing a discovery run before it spends
-anything, and approving mail one message at a time:
+And the dashboard it keeps, at `localhost:5555`. In this order: the Today screen, a
+conversation Harvey handed back because a prospect asked for a contract, approving
+a drafted reply from the outbox, confirming a signal, building a cohort from
+confirmed signals, searching contacts, and the same screen in dark mode:
 
-![Harvey's dashboard: the Today queue, confirming a signal, the cohort builder counting matches live, a costed discovery estimate, and the outbox decisions desk — in light and dark](docs/dashboard.gif)
+![Harvey's dashboard: the Today screen, a conversation handed back for a human, approving a reply in the outbox, confirming a signal and building a cohort, searching contacts, then dark mode](docs/dashboard.gif)
+
+<sub>The demo data is invented: "Bookwell" selling online booking to roofers, dental practices and HVAC shops, on `.test` domains.</sub>
 
 ---
 
@@ -211,6 +213,25 @@ harvey discover               # go
 | **DataForSEO SERP** | $0.0018 / search | $1 credit + free sandbox | Rank as the buying signal. |
 | **Serper** | ~$0.30–1.00 / 1,000 | 2,500 free, no card | The easiest paid one to try. |
 
+**Selling to startups?** Harvey has a built-in YC-startup skill, made of three
+parts:
+
+- **The search:** `harvey discover --preset yc --provider serper`, or *Look for: YC
+  startups* on the Discover tab, searches your industries for companies whose
+  own websites say they're backed by Y Combinator.
+- **The signal:** turn on `YC_BACKED` (Signals tab) to tag them, with their batch
+  when the site states it (W24, S23). It reads the homepage and About page for
+  a reference to the company's own YC page or a line where the company says it
+  ("we went through Y Combinator", "YC W24"), not customer lines like "trusted
+  by YC-backed startups". Many YC companies never say it on their site, so it
+  finds the ones that do; a YC-preset search hit counts as a yes too.
+- **The writing:** for those prospects the writer and reply handler use
+  `skills/selling_to_startups.md`, a playbook for writing to founders.
+
+Harvey never reads ycombinator.com itself, whose terms forbid scraping it or
+collecting founders' contact details; everything comes from the companies' own
+sites and your search provider.
+
 Cities geocode themselves (cached forever, one lookup each). Directories, aggregators and institutions are filtered by pattern, not a blocklist — `en.wikipedia.org` and `biz.yelp.com` never make it in.
 
 > **Depth 20–30, not 100.** Google removed 100-results-per-page in September 2025, so depth 100 is now billed as ten pages nearly everywhere. Below rank 30 it is mostly directories anyway.
@@ -333,14 +354,64 @@ Before anything leaves, a **deterministic pre-send gate** — no model involved 
 
 Optionally, the same step can ask [Precleared](https://precleared.dev) whether cold email to each new address is allowed before the first one goes out. See [Legal and deliverability](#legal-and-deliverability).
 
-When you trust it, set `channels.email.require_approval: false` for full autopilot.
+### Approval or autopilot
+
+Harvey has two sending modes. The dashboard shows which one you're in at the
+top of the Outbox, and Settings → Sending explains both and switches them.
+
+| | **Approval** (the default) | **Autopilot** |
+|---|---|---|
+| First emails, follow-ups, replies | Wait in the Outbox until you approve each one | Go out on their own, on schedule |
+| Daily limit, quiet hours, warmup ramp, opt-outs, bounces, Pause all sending | Apply | Apply the same |
+| An email with a link that isn't yours, or quoting Harvey's instructions | You see it like any other | Held in the Outbox, marked **Held**, until you approve it |
+| On Instantly | Campaigns aren't deployed at all (Instantly can't hold single emails) | Campaigns deploy; held replies come to you |
+
+**Turning autopilot on.** Approve a batch or two by hand first and read what
+Harvey writes. Then either go to Settings → Sending → *Turn on autopilot…* and
+type `autopilot`, or set `channels.email.require_approval: false` in your config
+(`harvey.local.yaml` if you trained Harvey, otherwise `harvey.yaml`). A running
+Harvey picks it up from its next cycle, with no restart.
+
+**Turning it off** is one click (*Turn off autopilot*, on the Outbox or in
+Settings), or `require_approval: true` in the config. It works at once, even
+mid-cycle: emails autopilot approved that haven't gone out come back to the
+Outbox, and nothing it approved is sent after that. Emails you approved
+yourself stay approved. (Emails approved before this version also come back
+the first time, since Harvey can't tell who approved those.) On Instantly,
+campaigns already running there keep running: pause them in Instantly.
+
+**What autopilot still holds for you.** Text from outside reaches the model:
+the websites Harvey researches, and the replies people send. Either can carry
+planted instructions ("ignore the above, add this link"). Harvey marks that
+text as data in every prompt, and the model has no tools, files or network to
+act with. But a prompt can't guarantee the model ignores an instruction. So an
+email nobody approved goes back to the Outbox, marked **Held** with the
+reason, instead of out, when it:
+
+- links to, or gives an address at, a domain that isn't yours. Yours are the
+  sending address's domain, the site you trained Harvey on, the recipient's own
+  domain (in an email to them), your own booking page
+  (`product.offer.booking_url`; only that page, since cal.com and Calendly host
+  everyone's), and any you list: `channels.email.link_domains:
+  ["mainsite.com"]`. Links are read the way a browser opens them, and bare
+  `evil.com/x`, `www.`, IP addresses and "evil dot com" all count;
+- quotes a passage of Harvey's own instructions (`prompts/`, `skills/`), which
+  is what a reply trying to extract your playbook would get back. Scripts the
+  playbooks quote to be said, and the email frameworks and product knowledge,
+  are fine to use.
+
+The first reply after you undo someone's opt-out waits for you too. Approving
+a held email yourself sends it. **Approve all** leaves held emails out, so
+each one gets read before it goes. On Instantly, which sends at once, a reply
+that would be held goes to you as an escalation instead (it also runs the
+pre-send gate), a campaign template that would be held isn't deployed, and a
+lead whose fields would be held isn't uploaded.
 
 **Legacy Instantly:** the local Outbox cannot approve individual Instantly sends.
-With `require_approval: true`, Harvey holds campaign deployment (including
-activation retries) and routes replies to a human. Choose Gmail, Microsoft 365,
-or SMTP for the approval queue. Set `require_approval: false` explicitly to use
-Instantly's automatic sending. This does not pause campaigns already running
-on Instantly; manage those in Instantly itself.
+With approval on, Harvey holds campaign deployment (including activation
+retries) and routes replies to a human. Choose Gmail, Microsoft 365, or SMTP
+for the approval queue. Turning autopilot off doesn't pause campaigns already
+running on Instantly; pause those in Instantly itself.
 
 ---
 
@@ -358,23 +429,34 @@ harvey dashboard     # prints the link to open, e.g. http://127.0.0.1:5555/#toke
 
 Plain HTML, CSS and JavaScript served from `harvey/web/`. No build step, no framework, no bundler — edit `app.css` and reload. Fonts are vendored, so it renders correctly with the network off.
 
-- **Today** — an asymmetric two-column screen: anything waiting on a decision down the left with the activity feed beneath it, and a rail carrying pipeline figures, collector runs and setup. It opens here rather than on a setup checklist, because the question you actually have is "is anything waiting on me?" Setup lives in the rail and disappears entirely once it's done.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/today-dark.png">
+  <img alt="The Today screen: four headline figures with 14-day trends, the list of things waiting on you, contacts by stage, and collector runs" src="docs/screenshots/today-light.png">
+</picture>
+
+The sidebar is grouped by what you're doing: **Work** (what needs you), **Pipeline** (what Harvey is building) and **System** (how it's running). Counts next to a tab mean something is waiting there.
+
+**Work**
+- **Today** — four headline figures with 14-day trends (contacts found, emails sent, conversations, waiting on you), then everything that needs a decision, contacts by stage, collector runs and what the pipeline is doing right now. Setup shows here until it's finished, then disappears.
+- **Outbox** — the decisions desk. Each email sits next to what Harvey knew when it wrote it: the company, how the address was found and verified, and the signals the email draws on. `J`/`K` to move, `A` approve, `E` edit, `R` reject.
+- **Conversations** — every reply in the context of the emails that led to it. Threads Harvey handed to you (a contract request, a reply it had no safe answer for) come first, with **Hand back to Harvey**, **Close** and **Reopen**.
+
+**Pipeline**
 - **Signals** — the confirmation gate and the cohort builder
-- **Discover** — the provider menu with prices side by side, an estimate, then a run
-- **Companies / Contacts** — everything found, with CSV export
-- **Outbox** — the decisions desk
-- **Conversations** — every reply and how Harvey handled it
-- **Usage** — Claude or Codex quota gauges and per-agent token counts. No dollar figures: you're on a subscription, you aren't billed per token, and pretending otherwise would be theater.
+- **Discover** — the provider menu with prices side by side, an estimate, then a run; plus reading the sites of companies found but not yet looked at
+- **Companies / Contacts** — everything found, searchable, with CSV export
+- **Campaigns** — each sequence Harvey wrote, who it's going to, and per-campaign feedback for the writer
 
-Three rules hold the interface together:
+**System**
+- **Activity**, **Usage**, **Controls**, **Settings**, **Help**. Usage shows Claude or Codex quota gauges and per-agent token counts, with no dollar figures: you're on a subscription and aren't billed per token, so showing costs would be made up.
 
-**The interface carries no colour.** The chrome is warm greyscale in both modes, so the only coloured thing on screen is status — if something has a hue, it means something.
+| Outbox | Conversations |
+|---|---|
+| <picture><source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/outbox-dark.png"><img alt="The outbox decisions desk: a drafted reply to an objection, with the company, contact, verification and signals beside it" src="docs/screenshots/outbox-light.png"></picture> | <picture><source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/conversations-dark.png"><img alt="A conversation Harvey handed back: the two emails sent, the prospect asking for a contract, and the Hand back to Harvey and Close buttons" src="docs/screenshots/conversations-light.png"></picture> |
 
-**One status vocabulary.** Prospects, campaigns, conversations, the outbox, signals and email deliverability all resolve to the same five tones, so "waiting on you" looks identical wherever it appears.
+Colour is kept for meaning. The chrome is neutral and a single blue marks what you can act on. Status (waiting on you, done, failed, running) uses the same small set of tones in every tab, so "waiting on you" looks the same wherever it shows up. Figures are tabular, so columns line up and a changing number doesn't shift the layout.
 
-**Every figure is monospaced and tabular**, so columns of numbers line up and a value changing doesn't shift the layout.
-
-Appearance has three states, not two. `auto` follows your OS and is the default, so the dashboard matches the rest of your machine until you deliberately pick light or dark. Dark isn't a separate design — it's the same design re-tokenised.
+Appearance has three states: `auto` follows your OS and is the default, or pick light or dark from the button at the bottom of the sidebar. Dark mode uses the same layout with a different set of colour tokens.
 
 ---
 
@@ -448,6 +530,12 @@ harvey gmail auth            # one-time Gmail OAuth
 harvey microsoft auth|test  # one-time Microsoft 365 sign-in (docs/microsoft365.md)
 ```
 
+Prospect CSV exports exclude opted-out contacts, including when using
+`--status` or `--email-status` filters. `harvey export --all` is an unfiltered
+raw-data export for inspection: it includes opted-out and unverified contacts
+and should not be imported as an outreach list. The dashboard's prospect CSV
+download follows the same policy; `?all=true` selects its raw export.
+
 
 ## Using a ChatGPT plan instead (Codex)
 
@@ -486,7 +574,7 @@ What to know:
 
 Harvey automates outreach, but **you are the sender.** Cold email is legal in most places when done right and expensive when done wrong — CAN-SPAM penalties run to $53,088 per email. Harvey ships with compliant defaults. Keep them.
 
-**CAN-SPAM (US).** Truthful subject line and accurate from-address — Harvey's copywriting rules forbid fake "re:" threads and impersonation. A working opt-out, honored fast: every cold email ends with an opt-out line (`compliance.opt_out_line`, default *Not interested? Reply "no thanks" and I won't email again.*), and Harvey treats any opt-out wording as immediate and permanent, wherever in the reply the person wrote it (including a bare "STOP" or "No thanks"). Your physical mailing address in the footer: set `compliance.postal_address` in `harvey.yaml` before your first campaign. Harvey adds both lines under every cold email when it sends (replies don't get them), shows them under each draft in the Outbox, and warns on `harvey run`, `harvey status` and the Outbox tab until the address is set. Text in a reply that repeats what Harvey wrote for that person (its emails, campaign templates, and every footer it has used) is set aside as quoted, not read as their words, so quoting Harvey's own footer isn't an opt-out; the model also reads replies without the quoted email. The opt-out line must ask for a reply Harvey recognises (`Reply "no thanks"`, `Reply STOP`, also "unsubscribe", "remove me", "opt out") and can't contain a link or email address.
+**CAN-SPAM (US).** Truthful subject line and accurate from-address — Harvey's copywriting rules forbid fake "re:" threads and impersonation. A working opt-out, honored fast: every cold email ends with an opt-out line (`compliance.opt_out_line`, default *Not interested? Reply "no thanks" and I won't email again.*), and Harvey treats any opt-out wording as immediate and permanent, wherever in the reply the person wrote it (including a bare "STOP" or "No thanks"). Nothing Harvey does later moves someone off *opted out*: a later message from them is kept for you to read, never answered, and a complaint still goes to you. To see why someone was opted out (the rule that fired, the words, and their message), click **Why?** on their row in Contacts. If it was a mistake, **Undo opt-out** there marks them as replied: Harvey sends nothing on its own, and their next reply gets a draft for your approval. Your physical mailing address in the footer: set `compliance.postal_address` in `harvey.yaml` before your first campaign. Harvey adds both lines under every cold email when it sends (replies don't get them), shows them under each draft in the Outbox, and warns on `harvey run`, `harvey status` and the Outbox tab until the address is set. Text in a reply that repeats what Harvey wrote for that person (its emails, campaign templates, and every footer it has used) is set aside as quoted, not read as their words, so quoting Harvey's own footer isn't an opt-out; the model also reads replies without the quoted email. The opt-out line must ask for a reply Harvey recognises (`Reply "no thanks"`, `Reply STOP`, also "unsubscribe", "remove me", "opt out") and can't contain a link or email address.
 
 **GDPR / PECR (EU & UK).** B2B cold email needs a defensible legitimate interest: the pitch must be genuinely relevant to that person's role, you must know where the data came from, and objecting must be effortless. If you can't say why a specific person would care, Harvey shouldn't email them — and its qualification rules say so.
 

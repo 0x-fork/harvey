@@ -200,6 +200,18 @@ SIGNAL_CATALOG: list[dict] = [
         "confidence_floor": 0.0,
     },
     {
+        "code": "YC_BACKED",
+        "label": "Backed by Y Combinator",
+        "description": ("The company says on its own site that it's YC-backed (a batch like "
+                        "W24, a YC badge, or a link to its YC page). Pairs with the YC-startups "
+                        "discovery preset and the startup-founder writing playbook."),
+        "category": "profile",
+        "value_type": "bool",
+        "collector": "profile",
+        "cost_note": "free (homepage HTML)",
+        "confidence_floor": 0.0,
+    },
+    {
         "code": "HIRING_ROLE",
         "label": "Hiring for a relevant role",
         "description": "An open role on their careers page that implies they're buying in your category right now.",

@@ -9,6 +9,28 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **A built-in skill for selling to YC startups.** The `yc` discovery preset
+  (`harvey discover --preset yc`, or *Look for: YC startups* on Discover)
+  searches your industries, through Serper or DataForSEO SERP, for companies
+  whose own site says they're backed by Y Combinator. The new `YC_BACKED`
+  signal tags them from their homepage or About page (a reference to their
+  own YC page, or a line where they say it, never customer or audience
+  lines), with the batch when it's stated (W24, S23). Many YC companies
+  don't say it on their site, so it finds the ones that do. For those prospects the writer and reply handler use the new
+  `skills/selling_to_startups.md` playbook: who reads, timing around the
+  batch and Demo Day, what not to do. Harvey never reads ycombinator.com,
+  whose terms forbid scraping it or collecting founders' contact details.
+- **Approval or autopilot, visible and switchable.** The Outbox now says
+  which sending mode you're in, and Settings → Sending explains both,
+  lists the domains counted as yours and switches them. Turning autopilot
+  on takes typing `autopilot`; turning it off is one click and works at
+  once, mid-cycle too (every step that queues or sends re-reads the mode):
+  emails autopilot approved that haven't gone out come back to the Outbox,
+  and the sender won't send one while approval is on. Only the
+  `require_approval` line of your config changes (comments kept), and a
+  running Harvey picks it up next cycle. Each outbox row records who
+  approved it (`approved_by`: you, autopilot, or earlier for rows from
+  before this). The README has a plain table of what each mode does.
 - **`harvey warmup [domain]`**: checks whether a sending domain is ready for
   cold email. It covers MX, SPF (`+all`, duplicates, top-level lookups), DKIM,
   DMARC, domain age, domain and SMTP-IP blocklists (a list that refuses the
@@ -40,8 +62,79 @@ minor versions can still change behaviour.
   link from Precleared's answer), or nothing but time. The next fresh answer
   clears it, and a hold not seen for a day is ignored.
 
+### Changed
+
+- **Gmail reads only what's new.** After the first complete read of the
+  week, each cycle asks Gmail's history for messages added to the inbox
+  since the last check, so a busy mailbox costs what a quiet one does.
+  Harvey moves past them only once every reply has been handled, so one
+  it couldn't handle is read again. It reads the full week again when
+  Gmail's history marker has expired, and once a day as a backstop.
+
 ### Fixed
 
+- **Gmail reads replies in the charset they were written in** (from #58 by
+  xiaoheiai4719-collab). Every reply was decoded as UTF-8, so a reply sent
+  as ISO-8859-1 or Windows-1252 ("Je préfère mardi") reached the model
+  garbled. Each part now uses its declared charset; an unknown or missing
+  one, or odd headers, falls back to UTF-8 without losing the text. SMTP
+  and Microsoft 365 already decoded correctly.
+- **You see it when Harvey isn't sending because it couldn't read your
+  inbox.** Sending waits until replies are read, so an opt-out stops its
+  follow-up. That hold only showed in the log, so a lapsed Gmail sign-in
+  could stall sending for days unnoticed. Today now shows it first, with
+  the reason, how long, how many emails are waiting and the fix (`harvey
+  gmail auth`, `harvey microsoft auth`, or a mailbox over the read limit),
+  and so does `harvey status`. It clears itself once sending runs again.
+- **Gmail: nothing sends until the whole inbox has been read** (from #62 by
+  xiaoheiai4719-collab). A failed or partial inbox read used to look like
+  an empty inbox, so a follow-up could go out before an opt-out on page two
+  was handled. Gmail now reads every page of the last week, and raises on
+  any failure so the heartbeat holds sending, the same as Microsoft 365. A
+  send whose outcome is unknown (a dropped connection, a 5xx, an unreadable
+  answer) is recorded as maybe-sent and never retried, so nobody gets it
+  twice. Messages already read aren't downloaded again on later cycles.
+- **Autopilot can't be steered by text from outside** (#66, reported by
+  Yaaaannnn435). Websites Harvey researches and the replies people send
+  reach the model, and either can carry planted instructions. That text is
+  now fenced as data in every prompt (writer, reply handler, scout scoring,
+  Humanizer), in a block it can't close itself. Prompts only lower the odds,
+  so with `require_approval: false` an email nobody approved goes back to
+  the Outbox, marked Held with the reason, when it links to or gives an
+  address at a domain that isn't yours (sending domain, booking link, or
+  `channels.email.link_domains`), or quotes Harvey's own instructions.
+  Bare domains like `example.com/x` count as links. Approving it yourself
+  sends it. On Instantly, replies now run the pre-send gate too and a held
+  one goes to you; a campaign template that would be held isn't deployed.
+  The model never had tools, files or network to act with, so this was
+  never more than what it wrote.
+- **Opted-out contacts are no longer in the prospect CSV.** Someone who
+  replied "unsubscribe" stayed in `harvey export` and the dashboard's Export
+  button, so taking the list to another sequencer could email them again.
+  They're now left out even when `--status` or `--email-status` is given;
+  `harvey export --all` (and `?all=true`) is still the raw, unfiltered dump.
+  From #64 by hifzabuildsai.
+- **An opt-out now stays an opt-out.** Any later message from someone who
+  opted out (an out-of-office, a "thanks") set them back to *replied* or
+  *lost*, which put them back in the export, and a question from them got a
+  drafted answer in the Outbox. Now their message is kept in a closed
+  conversation for you to read, nothing is drafted, and no code path can
+  move a prospect off *opted out*. A complaint from them still comes to you.
+- **See why someone opted out, and undo it.** Each opt-out now records the
+  rule that fired (an opt-out phrase, "no thanks", a one-word reply, or the
+  model's judgement), the words it matched and their message. **Why?** on
+  their row in Contacts (or on the conversation) shows it, and **Undo
+  opt-out** reverses a mistaken one after a confirm: they become *replied*,
+  so nothing is sent on its own, and Harvey's answer to their next reply
+  waits for your approval even with `require_approval: false` (on
+  Instantly, which can't hold a reply, that conversation comes to you). Opt-outs from before this show their last message instead, and
+  every undo is logged.
+- **`aiosmtplib` is now 5.1.3 or later** (was `>=3.0.1,<4`). Older versions
+  wrote a CR/LF inside an address straight to the SMTP server, so an address
+  scraped from a website could add commands of its own
+  (GHSA-v3q9-hj7j-63hq), and kept plaintext bytes across STARTTLS
+  (GHSA-vxj7-4xrp-5vr4). Harvey passes scraped addresses to it when sending
+  over SMTP and when probing a mailbox. Reported in #66.
 - A follow-up no longer goes out before, or right after, the email it
   follows. Each step now waits until the previous one has actually been sent
   and its gap (at least a day) has passed. Before, approving a batch of drafts

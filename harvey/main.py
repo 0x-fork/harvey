@@ -9,6 +9,7 @@ from datetime import datetime, time, timedelta
 import pytz
 
 from harvey.brain import Brain
+from harvey.sending_mode import sync_sending_mode
 from harvey.config import (
     ConfigError, load_config, load_env, HarveyConfig, legacy_sending_held, sending_notice,
     compliance_notice,
@@ -197,6 +198,29 @@ async def _interruptible_sleep(seconds: float, stop_event: asyncio.Event) -> boo
         return False
 
 
+def send_hold_reason(unread: list, paused: str, read_problem: str) -> str | None:
+    """What to record about this cycle's send phase: why sending is held by
+    unread replies, "" when it ran (clear the note), or None to leave the
+    note alone (a paused brain has its own Today card)."""
+    if paused:
+        return None
+    if unread:
+        return read_problem or "replies couldn't all be read and handled."
+    return ""
+
+
+async def record_send_phase(state, held_reason: str):
+    """Note why sending was held this cycle (Today and `harvey status` show
+    it), or clear the note when sending ran. Never stops the loop."""
+    try:
+        if held_reason:
+            await state.note_sends_held(held_reason)
+        else:
+            await state.clear_sends_held()
+    except Exception as e:
+        logger.warning(f"Couldn't record the send hold: {e}")
+
+
 async def heartbeat(stop_event: asyncio.Event | None = None):
     """Harvey's main loop. Wakes up, decides, acts, sleeps. Repeat."""
     if stop_event is None:
@@ -249,6 +273,10 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
 
     while not stop_event.is_set():
         try:
+            # 0. Approval or autopilot, as the config file says now: the
+            # dashboard can switch it while Harvey runs.
+            await sync_sending_mode(config, state)
+
             # 1. Check quiet hours
             if in_quiet_hours(config):
                 sleep_for = seconds_until_quiet_hours_end(config)
@@ -362,7 +390,11 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
                         f"Not sending this cycle: {reason} Queued emails wait "
                         "until replies can be read again."
                     )
+                    held = send_hold_reason(unread, paused, getattr(handler, "last_read_problem", ""))
+                    if held is not None:
+                        await record_send_phase(state, held)
                 else:
+                    await record_send_phase(state, send_hold_reason([], "", ""))
                     await _run_agents([(name, run()) for name, run in send_tasks])
 
             # 6. Log the action (best-effort; never kills the loop)

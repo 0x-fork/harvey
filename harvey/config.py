@@ -10,7 +10,9 @@ import yaml
 
 from harvey.textio import read_user_text
 from dotenv import load_dotenv
-from pydantic import BaseModel, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel, PrivateAttr, TypeAdapter, ValidationError, field_validator, model_validator,
+)
 
 from harvey.paths import PROJECT_ROOT
 
@@ -155,6 +157,10 @@ class EmailChannelConfig(BaseModel):
     # outbox, so it holds campaigns and escalates replies while this is true.
     # Set false explicitly for full autopilot once you trust the output.
     require_approval: bool = True
+    # Your own domains besides the sending address's and the booking link's
+    # (e.g. your main site when you send from a secondary domain). On
+    # autopilot, an email linking anywhere else waits in the Outbox.
+    link_domains: list[str] = []
     # Kill switch: pause all sending when bounces exceed this fraction of
     # sent mail (measured over the trailing sends). 0 disables the switch.
     max_bounce_rate: float = 0.05
@@ -498,6 +504,9 @@ class HarveyConfig(BaseModel):
     brain: BrainConfig = BrainConfig()
     compliance: ComplianceConfig = ComplianceConfig()
     writer: WriterConfig = WriterConfig()
+    # The file it was loaded from, so a running Harvey can re-read the
+    # sending mode from that same file (refresh_sending_mode).
+    _source_path: str | None = PrivateAttr(default=None)
 
 
 class EnvConfig(BaseModel):
@@ -568,7 +577,9 @@ def load_config(config_path: str | None = None) -> HarveyConfig:
         )
 
     try:
-        return HarveyConfig(**data)
+        config = HarveyConfig(**data)
+        config._source_path = str(config_path)
+        return config
     except ValidationError as e:
         # Log a friendly, actionable summary, then re-raise the original
         # ValidationError so callers (and tests) keep the pydantic type.
@@ -641,6 +652,126 @@ def load_env() -> EnvConfig:
         precleared_api_key=os.getenv("PRECLEARED_API_KEY", "").strip(),
     )
     return env
+
+
+# ── Approval or autopilot ─────────────────────────────────────────────────
+#
+# channels.email.require_approval: true (the default) means every email
+# waits in the Outbox for you; false is autopilot. The dashboard can switch
+# it, so it is edited in place: one line changes and the comments stay.
+
+_APPROVAL_LINE_RE = re.compile(
+    r"^(?P<lead>[ \t]*require_approval[ \t]*:[ \t]*)(?P<val>[^\s#]+)", re.MULTILINE)
+_EMAIL_KEY_RE = re.compile(r"^(?P<ind>[ \t]+)email[ \t]*:[ \t]*(?:#.*)?$", re.MULTILINE)
+
+
+def _email_section(data):
+    channels = data.get("channels") if isinstance(data, dict) else None
+    email = channels.get("email") if isinstance(channels, dict) else None
+    return email if isinstance(email, dict) else None
+
+
+def _with_approval_line(raw: str, word: str) -> list[str]:
+    """Ways to say require_approval: <word> in ``raw``: change the line that
+    is there, or add one under an ``email:`` key."""
+    out = [raw[:m.start("val")] + word + raw[m.end("val"):] for m in _APPROVAL_LINE_RE.finditer(raw)]
+    for m in _EMAIL_KEY_RE.finditer(raw):
+        child = m.group("ind") + "  "
+        for line in raw[m.end():].split("\n")[1:]:
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            indent = line[:len(line) - len(line.lstrip(" \t"))]
+            if len(indent) > len(m.group("ind")):
+                child = indent
+            break
+        out.append(raw[:m.end()] + f"\n{child}require_approval: {word}" + raw[m.end():])
+    return out
+
+
+def set_require_approval(value: bool, path=None) -> Path:
+    """Write channels.email.require_approval into the config file Harvey
+    reads (harvey.local.yaml wins, as in load_config). Only that value
+    changes: the result must parse to the same settings apart from it, or
+    nothing is written and ConfigError says to set it by hand."""
+    import copy
+    import shutil
+    path = Path(path or _find_config_file())
+    target = path.resolve()          # a symlinked config stays a symlink
+    data_bytes = target.read_bytes()
+    bom = data_bytes.startswith(b"\xef\xbb\xbf")
+    try:
+        raw = data_bytes.decode("utf-8-sig").replace("\r\n", "\n")
+    except UnicodeDecodeError:
+        raise ConfigError(f"{path.name} isn't UTF-8, so it isn't rewritten. Set "
+                          f"channels.email.require_approval there by hand.")
+    try:
+        data = yaml.safe_load(raw)
+    except yaml.YAMLError as e:
+        raise ConfigError(f"Invalid YAML in {path.name}: {e}")
+    if _email_section(data) is None:
+        raise ConfigError(f"{path.name} has no channels.email section. Set "
+                          f"channels.email.require_approval there by hand.")
+    expected = copy.deepcopy(data)
+    _email_section(expected)["require_approval"] = bool(value)
+    word = "true" if value else "false"
+    for new in _with_approval_line(raw, word):
+        try:
+            if yaml.safe_load(new) != expected:
+                continue
+        except yaml.YAMLError:
+            continue
+        HarveyConfig(**expected)          # still a valid config
+        if b"\r\n" in data_bytes:
+            new = new.replace("\n", "\r\n")
+        tmp = target.with_name(target.name + ".tmp")
+        try:
+            tmp.write_bytes((b"\xef\xbb\xbf" if bom else b"") + new.encode("utf-8"))
+            shutil.copymode(target, tmp)
+            os.replace(tmp, target)
+        finally:
+            tmp.unlink(missing_ok=True)
+        _mode_cache.pop(str(target), None)
+        return path
+    raise ConfigError(f"Couldn't change require_approval in {path.name} safely. "
+                      f"Set channels.email.require_approval: {word} there by hand.")
+
+
+_mode_cache: dict[str, tuple[tuple, object]] = {}
+
+
+def refresh_sending_mode(config, path=None) -> bool:
+    """Bring a running config's require_approval in line with the file it was
+    loaded from, so a switch made while Harvey runs counts at once: the
+    sender, writer and handler call this before they queue or send. Cheap:
+    the file is only read again when it changed. True when the value
+    changed. A config not loaded from a file, or a file that can't be read,
+    leaves the running value alone."""
+    path = path or getattr(config, "_source_path", None)
+    if not path:
+        return False
+    try:
+        target = Path(path).resolve()
+        st = target.stat()
+        # Not the mtime alone: a restore or `cp -p` keeps it while the file changes.
+        stamp = (st.st_mtime_ns, st.st_size, st.st_ino, st.st_ctime_ns)
+        cached = _mode_cache.get(str(target))
+        if cached and cached[0] == stamp:
+            value = cached[1]
+        else:
+            email = _email_section(yaml.safe_load(read_user_text(target)))
+            value = email.get("require_approval", True) if email is not None else None
+            try:
+                # Read the way load_config reads it: "true", 'no', on...
+                value = TypeAdapter(bool).validate_python(value)
+            except ValidationError:
+                value = None
+            _mode_cache[str(target)] = (stamp, value)
+    except Exception:
+        return False
+    if not isinstance(value, bool) or value == config.channels.email.require_approval:
+        return False
+    config.channels.email.require_approval = value
+    return True
 
 
 def _find_config_file() -> str:
