@@ -22,7 +22,8 @@ The recipient's zone comes from what Harvey already knows, in this order:
 
 A country with several zones and nothing more specific gets its main zone
 (MAIN_ZONE: Sydney for Australia, Moscow for Russia), except the US, which
-has none. An empty location stays unresolved. Those recipients get the window in
+has none. A main zone is used but not stored, so coordinates or a country
+found later can still correct it. An empty location stays unresolved. Those recipients get the window in
 ``usage.quiet_hours.timezone``, which is what Harvey did before. A resolved
 zone is stored on the prospect, so it is worked out once (unless a country
 found later could still change it; see ``recipient_zone``).
@@ -283,6 +284,12 @@ def _country_zone(code: str, point=None) -> str:
     return MAIN_ZONE.get(code, "")
 
 
+def _main_zone_only(code: str, point=None) -> bool:
+    """True when _country_zone can only give MAIN_ZONE's answer."""
+    zones = pytz.country_timezones.get(code, [])
+    return not point and len(zones) > 1 and not _one_offset(zones)
+
+
 def _parts(location: str) -> list[str]:
     """Comma-separated parts, last first, with postcodes dropped."""
     parts = []
@@ -355,6 +362,8 @@ def _region(parts: list[str], text_country: str, hint: str) -> str:
         if text_country in ("", "US"):
             if name in us_names:
                 return us_names[name]
+            if name.replace(" ", "") == "dc":  # "D.C.", "d.c."
+                return US_STATES["DC"][1]
             for code in codes:
                 if code in US_STATES and not (
                         hint and hint != "US" and country_code(code) == hint):
@@ -395,11 +404,12 @@ def _resolve(location: str = "", country: str = "", point: str = "") -> tuple[st
     guessed = False
     code = "" if text_country else _ambiguous_code(parts)
     if code:
-        # "IN": Indiana or India? The country from elsewhere settles it,
+        # "IN": Indiana or India? A country from elsewhere (Precleared's is
+        # stronger evidence than a code) settles it, even when it is neither,
         # then the coordinates; otherwise a US state is read as the state
         # and a province or Australian state code as the country.
         home = REGION_COUNTRY[code]
-        if hint in (code, home):
+        if hint:
             text_country = hint
         elif coords:
             as_region = _region(parts, home, "")
@@ -420,7 +430,9 @@ def _resolve(location: str = "", country: str = "", point: str = "") -> tuple[st
         return zone, guessed
     named = text_country or hint
     if named:
-        return _country_zone(named, coords), guessed
+        # A country's main zone (no state, no coordinates) is a guess too.
+        zone = _country_zone(named, coords)
+        return zone, guessed or (bool(zone) and _main_zone_only(named, coords))
     if coords:
         return _nearest(coords, max_km=MAX_NEAREST_KM), False
     return "", False

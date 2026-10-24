@@ -161,6 +161,14 @@ class PreclearedClient:
             }))
         return result
 
+    async def known_country(self, to_email: str, state) -> str:
+        """The recipient's country from a cached verdict, or "". Never asks
+        Precleared."""
+        email = (to_email or "").strip().lower()
+        cached = _from_cache(await state.get_setting(SETTINGS_PREFIX + email),
+                             self._fingerprint())
+        return cached.country if cached is not None else ""
+
     async def _check(self, email: str) -> Clearance:
         payload = {
             "recipient_email": email,

@@ -27,7 +27,9 @@ from harvey.config import EmailChannelConfig, HarveyConfig, SendWindowConfig
 from harvey.integrations.precleared import SETTINGS_PREFIX, PreclearedClient
 from harvey.models.company import Company
 from harvey.models.prospect import Prospect
-from harvey.send_window import START_SPREAD, in_window, next_send_time, zone_for
+from harvey.send_window import (
+    START_SPREAD, in_window, next_send_time, recipient_zone, zone_for,
+)
 from harvey.state import MIGRATIONS, StateManager
 from tests.test_outbox_native import FakeProvider, make_sender, seed_campaign
 
@@ -146,6 +148,20 @@ def test_more_precise_than_the_main_zone_still_wins():
 
 def test_washington_dc_with_dots():
     assert zone_for("Washington, D.C.") == "America/New_York"
+    assert zone_for("Washington, d.c.") == "America/New_York"
+
+
+@pytest.mark.asyncio
+async def test_a_main_zone_is_used_but_not_stored(state):
+    cfg = SimpleNamespace(compliance=None)
+    pid = await seed_at(state, "Vancouver, Canada", "li@van.example")
+    prospect = await state.get_prospect(pid)
+    assert await recipient_zone(state, prospect, cfg) == "America/Toronto"
+    assert (await state.get_prospect(pid)).timezone == ""
+    # Coordinates cached later still correct it.
+    await state.set_setting("geo:vancouver, canada", "49.28,-123.12")
+    assert await recipient_zone(state, prospect, cfg) == "America/Vancouver"
+    assert (await state.get_prospect(pid)).timezone == "America/Vancouver"
 
 
 def test_country_from_elsewhere():
@@ -183,6 +199,7 @@ def test_two_letter_code_that_is_a_state_and_a_country():
     ("Riyadh, SA", "", "24.71,46.68", "Asia/Riyadh"),
     # So does a country from elsewhere (Precleared or prospect_country).
     ("Jakarta, ID", "ID", "", "Asia/Jakarta"),
+    ("Berlin, DE", "GB", "", "Europe/London"),       # it beats the code's guess
     ("Mumbai, IN", "IN", "", "Asia/Kolkata"),
     ("Indianapolis, IN", "US", "", "America/Indiana/Indianapolis"),
     ("St. John's, NL", "CA", "", "America/St_Johns"),
@@ -709,6 +726,60 @@ async def test_a_zone_that_cannot_be_worked_out_doesnt_stop_the_drain(state, mon
     pin_now(monkeypatch, WED_0200)  # 11:00 in Tokyo, the fallback zone too
     await sender._drain_due()
     assert sorted(m["to"] for m in provider.sent) == ["aiko@tokyo.example", "bob@ny-asked.example"]
+
+
+@pytest.mark.asyncio
+async def test_quiet_hours_send_cold_email_queued_behind_many_replies(state, monkeypatch):
+    tokyo = await seed_at(state, "Tokyo, Japan", "aiko@tokyo.example")
+    cold = await approved(state, tokyo, "aiko@tokyo.example")
+    earlier = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=1)).isoformat()
+    for n in range(30):
+        pid = await seed_at(state, "New York, NY", f"r{n}@replies{n}.example", status="replied")
+        item = await approved(state, pid, f"r{n}@replies{n}.example", kind="reply")
+        await state.update_outbox_item(item, send_at=earlier)
+    provider = FakeProvider()
+    sender = window_sender(state, provider, monkeypatch)
+    sender.cold_only = True
+    pin_now(monkeypatch, WED_0200)  # 11:00 in Tokyo
+    assert await sender.cold_due_in_window()
+    await sender._drain_due()
+    assert [m["to"] for m in provider.sent] == ["aiko@tokyo.example"]
+    assert (await outbox_row(state, cold))["status"] == "sent"
+
+
+@pytest.mark.asyncio
+async def test_quiet_hours_dont_wake_under_the_warmup_cap(state, monkeypatch):
+    from harvey.config import WarmupConfig
+    pid = await seed_at(state, "Tokyo, Japan", "aiko@tokyo.example")
+    await approved(state, pid, "aiko@tokyo.example")
+    sender = window_sender(state, FakeProvider(), monkeypatch)
+    pin_now(monkeypatch, WED_0200)
+    assert await sender.cold_due_in_window()
+    monkeypatch.setattr(sender.config.channels.email, "warmup",
+                        WarmupConfig(start_date=date.today().isoformat()), raising=False)
+    assert not await sender.cold_due_in_window()  # day one: warmup only, no cold email
+
+
+@pytest.mark.asyncio
+async def test_precleared_main_zone_is_used_on_every_check(state, monkeypatch):
+    # Precleared says Australia, which gives a main zone that isn't stored.
+    # Every later check must still use it, not the operator's zone: the two
+    # windows don't overlap, so needing both would hold the email for good.
+    pid = await seed_at(state, "", "mia@au-acme.example")
+    item = await approved(state, pid, "mia@au-acme.example")
+    calls, provider = [], FakeProvider()
+    sender = window_sender(state, provider, monkeypatch, operator_zone="America/New_York")
+    ok_au = {**OK_GB, "facts": {"recipient_country": "AU"}}
+    sender.precleared = PreclearedClient(sender_country="GB", transport=precleared_mock(calls, ok_au))
+    pin_now(monkeypatch, datetime(2026, 10, 21, 14, 0))  # 10:00 New York, 01:00 Sydney
+    await sender._drain_due()
+    assert provider.sent == [] and len(calls) == 1
+    moved = datetime.fromisoformat((await outbox_row(state, item))["send_at"])
+    assert_office_hours(moved, "Australia/Sydney")
+    pin_now(monkeypatch, moved + timedelta(minutes=1))
+    await state.update_outbox_item(item, send_at=(moved - timedelta(days=3)).isoformat())
+    await sender._drain_due()
+    assert [m["to"] for m in provider.sent] == ["mia@au-acme.example"]
 
 
 def _utc_now_iso():

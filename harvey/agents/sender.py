@@ -107,6 +107,10 @@ class Sender:
         usage.quiet_hours, as before."""
         window = send_window_of(self.config)
         if window is not None and window.recipient_timezone:
+            if not country and self.precleared is not None and prospect is not None:
+                # A country Precleared already found counts on every check,
+                # not only on the one that asked it.
+                country = await self.precleared.known_country(prospect.email, self.state)
             zone = await recipient_zone(self.state, prospect, self.config, country)
             if zone:
                 return zone
@@ -145,7 +149,7 @@ class Sender:
         now = _utcnow()
         due = await self.state.get_outbox(
             status="approved", due_before=datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
-            limit=QUIET_HOURS_SCAN, skip_unready_follow_ups=True,
+            limit=QUIET_HOURS_SCAN, skip_unready_follow_ups=True, kind="sequence",
         )
         for item in due:
             if item["kind"] != "sequence":
@@ -715,9 +719,11 @@ class Sender:
             since=midnight.astimezone(timezone.utc).replace(tzinfo=None).isoformat())
 
         now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        # In quiet hours only cold email can go, so only cold email is
+        # fetched: replies due ahead of it can't fill the page.
         due = await self.state.get_outbox(
             status="approved", due_before=now, limit=budget * 3,
-            skip_unready_follow_ups=True,
+            skip_unready_follow_ups=True, kind="sequence" if self.cold_only else None,
         )
         # Cold emails held (by an unavailable compliance check, the cold
         # cap, a follow-up's spacing) stay approved and could fill the

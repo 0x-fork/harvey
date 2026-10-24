@@ -1036,10 +1036,15 @@ class StateManager:
         limit: int = 200,
         exclude_kind: str | None = None,
         skip_unready_follow_ups: bool = False,
+        kind: str | None = None,
     ) -> list[dict]:
         """skip_unready_follow_ups: leave out sequence follow-ups whose
-        previous step hasn't gone out yet, so they can't fill the page."""
+        previous step hasn't gone out yet, so they can't fill the page.
+        kind: only that kind ("sequence" for cold email)."""
         where, params = [], []
+        if kind:
+            where.append("kind = ?")
+            params.append(kind)
         if status:
             where.append("status = ?")
             params.append(status)

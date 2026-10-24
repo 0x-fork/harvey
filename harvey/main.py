@@ -71,8 +71,10 @@ def sends_through_quiet_hours(config: HarveyConfig) -> bool:
     replies wait for the operator's hours as before. A heartbeat wakes only
     when a cold email can go now (Sender.cold_due_in_window): it reads and
     handles replies first (so stop-on-reply has run; reading a reply is what
-    consumes it, so it can't be left for the morning), then sends only cold
-    email. Otherwise it does nothing. Native mail providers only.
+    consumes it, so it can't be left for the morning), then runs the sender,
+    which stages any draft campaign into the outbox (no model call, nothing
+    sent) and sends only cold email. Otherwise it does nothing. Native mail
+    providers only.
     """
     email = config.channels.email
     window = send_window_of(config)
