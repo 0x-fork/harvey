@@ -44,6 +44,14 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- **Gmail: nothing sends until the whole inbox has been read** (from #62 by
+  xiaoheiai4719-collab). A failed or partial inbox read used to look like
+  an empty inbox, so a follow-up could go out before an opt-out on page two
+  was handled. Gmail now reads every page of the last week, and raises on
+  any failure so the heartbeat holds sending, the same as Microsoft 365. A
+  send whose outcome is unknown (a dropped connection, a 5xx, an unreadable
+  answer) is recorded as maybe-sent and never retried, so nobody gets it
+  twice. Messages already read aren't downloaded again on later cycles.
 - **Autopilot can't be steered by text from outside** (#66, reported by
   Yaaaannnn435). Websites Harvey researches and the replies people send
   reach the model, and either can carry planted instructions. That text is

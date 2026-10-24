@@ -40,6 +40,11 @@ TOKEN_URL = "https://oauth2.googleapis.com/token"
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 SCOPE = "https://www.googleapis.com/auth/gmail.modify"
 LOOPBACK_PORT = 8765
+MAX_INBOX_PAGES = 40
+
+class GmailError(RuntimeError):
+    pass
+
 
 TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0)
 
@@ -73,6 +78,10 @@ class GmailProvider(MailProvider):
         self.client_secret = getattr(env, "gmail_client_secret", "")
         self._access_token = ""
         self._access_expires = 0.0
+        # Messages already read, by Gmail id (None: not a reply we use).
+        # A Gmail message's content never changes, so each cycle's complete
+        # read only downloads what's new. Memory only.
+        self._read_cache: dict[str, InboundMessage | None] = {}
 
     def is_configured(self) -> bool:
         return bool(self.client_id and self.client_secret and _load_token())
@@ -102,12 +111,27 @@ class GmailProvider(MailProvider):
                 "Re-run 'harvey gmail auth'."
             )
             return None
-        data = resp.json()
-        self._access_token = data.get("access_token", "")
-        self._access_expires = time.time() + float(data.get("expires_in", 3600))
+        # A garbled answer is no token, not an exception: one raised here
+        # would escape a send and be recorded as "maybe sent".
+        try:
+            data = resp.json()
+        except ValueError:
+            data = None
+        token = data.get("access_token") if isinstance(data, dict) else None
+        if not isinstance(token, str) or not token:
+            logger.error("Gmail token refresh returned no access token.")
+            return None
+        try:
+            expires_in = float(data.get("expires_in") or 3600)
+        except (TypeError, ValueError):
+            expires_in = 3600.0
+        self._access_token = token
+        self._access_expires = time.time() + expires_in
         return self._access_token or None
 
-    async def _request(self, method: str, path: str, **kwargs):
+    async def _request(
+        self, method: str, path: str, *, sending: bool = False, **kwargs
+    ):
         token = await self._token()
         if not token:
             return None
@@ -119,14 +143,28 @@ class GmailProvider(MailProvider):
                 )
         except httpx.HTTPError as e:
             logger.error(f"Gmail request failed ({path}): {e}")
+            if sending:
+                # The request may have reached Gmail before the connection failed.
+                raise RuntimeError("Gmail send outcome is unknown") from e
             return None
+        if sending and not (200 <= resp.status_code < 300
+                            or 400 <= resp.status_code < 500):
+            raise RuntimeError("Gmail send outcome is unknown")
         if resp.status_code >= 400:
             logger.error(f"Gmail API {resp.status_code} on {path}: {resp.text[:200]}")
             return None
         try:
-            return resp.json()
-        except ValueError:
-            return {}
+            data = resp.json()
+            if sending and (not isinstance(data, dict)
+                            or not isinstance(data.get("id"), str)
+                            or not data["id"].strip()):
+                raise ValueError("Missing Gmail send message ID")
+            return data
+        except ValueError as e:
+            logger.error(f"Gmail returned malformed JSON ({path})")
+            if sending:
+                raise RuntimeError("Gmail send returned an unreadable response") from e
+            return None
 
     async def send_email(
         self,
@@ -151,7 +189,7 @@ class GmailProvider(MailProvider):
         if thread_ref:
             payload["threadId"] = thread_ref
 
-        data = await self._request("POST", "/messages/send", json=payload)
+        data = await self._request("POST", "/messages/send", sending=True, json=payload)
         if data is None:
             return SendResult(ok=False, error="gmail send failed")
 
@@ -159,37 +197,82 @@ class GmailProvider(MailProvider):
         message_id = ""
         gmail_id = data.get("id", "")
         if gmail_id:
-            meta = await self._request(
-                "GET", f"/messages/{gmail_id}",
-                params={"format": "metadata", "metadataHeaders": "Message-ID"},
-            )
-            for h in ((meta or {}).get("payload") or {}).get("headers", []):
-                if h.get("name", "").lower() == "message-id":
-                    message_id = h.get("value", "")
+            try:
+                meta = await self._request(
+                    "GET", f"/messages/{gmail_id}",
+                    params={"format": "metadata", "metadataHeaders": "Message-ID"},
+                )
+            except Exception:
+                # Sending already succeeded; optional metadata cannot undo it.
+                logger.warning("Gmail sent message metadata could not be read")
+                meta = None
+            metadata = meta.get("payload") if isinstance(meta, dict) else None
+            headers = metadata.get("headers") if isinstance(metadata, dict) else None
+            for h in headers if isinstance(headers, list) else []:
+                if (isinstance(h, dict) and isinstance(h.get("name"), str)
+                        and h["name"].lower() == "message-id"
+                        and isinstance(h.get("value"), str)):
+                    message_id = h["value"]
         return SendResult(
             ok=True,
             message_id=message_id or gmail_id,
-            thread_ref=data.get("threadId", ""),
+            thread_ref=(data.get("threadId", "")
+                        if isinstance(data.get("threadId", ""), str) else ""),
         )
 
-    async def get_replies(self, limit: int = 50) -> list[InboundMessage]:
-        listing = await self._request(
-            "GET", "/messages",
-            params={"q": "in:inbox -from:me newer_than:7d", "maxResults": limit},
-        )
-        if not listing:
-            return []
+    async def get_replies(self, limit: int = 500) -> list[InboundMessage]:
+        """Read the complete recent inbox or raise, so sends wait on failure.
+
+        ``limit`` is a page size, not a cap on replies: a reply beyond the
+        first page must still stop its queued follow-ups. Like the Graph
+        provider, bound pagination and never return a partial inbox. Pages
+        are Gmail's largest (a listing is ids only), so the bound is
+        MAX_INBOX_PAGES x 500 messages a week before sending is held.
+        """
+        params = {"q": "in:inbox -from:me newer_than:7d",
+                  "maxResults": max(1, min(500, int(limit)))}
         out = []
-        for stub in listing.get("messages", [])[:limit]:
-            data = await self._request(
-                "GET", f"/messages/{stub['id']}", params={"format": "full"}
-            )
-            if not data:
-                continue
-            msg = self._parse_message(data)
-            if msg:
-                out.append(msg)
-        return out
+        seen_ids = set()
+        seen_tokens = set()
+        for page in range(1, MAX_INBOX_PAGES + 1):
+            listing = await self._request("GET", "/messages", params=dict(params))
+            if not isinstance(listing, dict):
+                raise GmailError(f"inbox page {page}: could not read messages")
+            # Gmail omits 'messages' when a successful query has no matches.
+            messages = listing.get("messages", [])
+            if not isinstance(messages, list):
+                raise GmailError(f"inbox page {page}: messages is not a list")
+            for stub in messages:
+                msg_id = stub.get("id") if isinstance(stub, dict) else None
+                if not isinstance(msg_id, str) or not msg_id:
+                    raise GmailError(f"inbox page {page}: message has no id")
+                if msg_id in seen_ids:
+                    continue
+                if msg_id in self._read_cache:
+                    msg = self._read_cache[msg_id]
+                else:
+                    data = await self._request(
+                        "GET", f"/messages/{msg_id}", params={"format": "full"}
+                    )
+                    if not isinstance(data, dict) or data.get("id") != msg_id:
+                        raise GmailError(f"inbox page {page}: could not read message {msg_id}")
+                    msg = self._parse_message(data)
+                    self._read_cache[msg_id] = msg
+                seen_ids.add(msg_id)
+                if msg:
+                    out.append(msg)
+            token = listing.get("nextPageToken")
+            if token is None:
+                # A complete read: forget what has left the week's window.
+                self._read_cache = {k: v for k, v in self._read_cache.items() if k in seen_ids}
+                return out
+            if not isinstance(token, str) or not token or token in seen_tokens:
+                raise GmailError(f"inbox page {page}: invalid or repeated nextPageToken")
+            seen_tokens.add(token)
+            params["pageToken"] = token
+        raise GmailError(
+            f"inbox has more than {MAX_INBOX_PAGES} pages; refusing a partial read"
+        )
 
     @staticmethod
     def _parse_message(data: dict) -> InboundMessage | None:
