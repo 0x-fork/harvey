@@ -111,3 +111,21 @@ def test_parse_message_preserves_decoded_reply():
     assert message.body == text
     assert message.from_email == "reader@example.invalid"
     assert message.thread_ref == "thread-1"
+
+
+@pytest.mark.parametrize("headers", [
+    ["not a header", {"name": "Content-Type", "value": "text/plain; charset=iso-8859-1"}],
+    [{"name": None, "value": 3}, {"name": "Content-Type", "value": "text/plain; charset=iso-8859-1"}],
+    "Content-Type: text/plain",
+    None,
+])
+def test_malformed_part_headers_never_lose_the_reply(headers):
+    """An unsubscribe must survive odd headers: before #58 nothing here could
+    fail, so a failure must not turn into an empty body."""
+    import base64
+    from harvey.integrations.gmail import GmailProvider
+    raw = "Please unsubscribe me. Merci, très bien.".encode("iso-8859-1")
+    part = {"mimeType": "text/plain", "headers": headers,
+            "body": {"data": base64.urlsafe_b64encode(raw).decode()}}
+    text = GmailProvider._extract_text(part)
+    assert "unsubscribe" in text

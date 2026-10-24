@@ -482,19 +482,28 @@ class GmailProvider(MailProvider):
                 return ""
             try:
                 raw = base64.urlsafe_b64decode(data + "===")
-                mime = Message()
-                for header in part.get("headers", []):
-                    if header.get("name", "").lower() == "content-type":
-                        mime["Content-Type"] = header.get("value", "")
-                        break
-                charset = mime.get_content_charset() or "utf-8"
-                try:
-                    return raw.decode(charset, errors="replace")
-                except (LookupError, ValueError):
-                    # Unknown or invalid charsets keep the existing UTF-8 fallback.
-                    return raw.decode("utf-8", errors="replace")
             except Exception:
                 return ""
+            # Finding the charset must never cost the text: odd headers mean
+            # UTF-8, as before, not an empty body (an unsubscribe in it would
+            # be lost).
+            charset = "utf-8"
+            try:
+                headers = part.get("headers")
+                for header in headers if isinstance(headers, list) else []:
+                    if (isinstance(header, dict) and isinstance(header.get("value"), str)
+                            and str(header.get("name") or "").lower() == "content-type"):
+                        mime = Message()
+                        mime["Content-Type"] = header["value"]
+                        charset = mime.get_content_charset() or "utf-8"
+                        break
+            except Exception:
+                charset = "utf-8"
+            try:
+                return raw.decode(charset, errors="replace")
+            except (LookupError, ValueError):
+                # Unknown or invalid charsets keep the existing UTF-8 fallback.
+                return raw.decode("utf-8", errors="replace")
 
         if payload.get("mimeType", "").startswith("text/plain"):
             return decode(payload)
