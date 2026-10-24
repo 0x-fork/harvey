@@ -27,8 +27,8 @@ from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provide
 from harvey.integrations.precleared import PreclearedClient
 from harvey.sending_mode import sync_sending_mode
 from harvey.state import (
-    AUTOPILOT_OFF_REASON, HAND_SENT_REASON, HELD_FOR_REVIEW, MANUAL_SEND_KEY,
-    MAYBE_SENT_PREFIX, StateManager,
+    AUTOPILOT_OFF_REASON, COLLEAGUE_REPLIED, HAND_SENT_REASON, HELD_FOR_REVIEW,
+    MANUAL_SEND_KEY, MAYBE_SENT_PREFIX, StateManager,
 )
 
 # A follow-up waits at least this long after the email it follows went out,
@@ -449,6 +449,9 @@ class Sender:
             if (prospect.email_status or "guess") not in sendable_email:
                 skipped += 1
                 continue
+            if await self.state.colleague_who_replied(prospect.id):
+                skipped += 1      # their company already answered
+                continue
             seen_emails.add(email)
 
             cumulative_days = 0
@@ -563,6 +566,11 @@ class Sender:
             # A first email to someone already contacted is always a duplicate.
             if item["step"] == 1 and prospect.status == "contacted":
                 return "cancelled", "already contacted"
+            # Someone else at their company answered: the rest of the
+            # company gets no more cold email.
+            colleague = await self.state.colleague_who_replied(prospect.id)
+            if colleague:
+                return "cancelled", f"{COLLEAGUE_REPLIED} ({colleague})"
         gate = pre_send_check(
             item["to_email"], item["subject"], self._outgoing_body(item),
             prospect=prospect, allow_risky=allow_risky, kind=item["kind"],

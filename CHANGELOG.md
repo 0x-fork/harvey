@@ -64,6 +64,15 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- **A reply stops the cold email to the whole company.** Stop-on-reply was
+  per person, so when an owner wrote back "not interested" the office
+  manager still got the follow-up. Now any reply (not a bounce) cancels the
+  sequence emails queued for everyone else at that company, the sender
+  won't send or stage one to them later, and the Outbox says which
+  colleague replied. Colleagues are the same company, or the same email
+  domain when Harvey has no company for them; never a shared one like
+  gmail.com. Replies Harvey owes a colleague who wrote in are untouched.
+
 - **Gmail reads replies in the charset they were written in** (from #58 by
   xiaoheiai4719-collab). Every reply was decoded as UTF-8, so a reply sent
   as ISO-8859-1 or Windows-1252 ("Je préfère mardi") reached the model

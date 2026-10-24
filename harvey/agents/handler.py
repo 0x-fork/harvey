@@ -23,7 +23,7 @@ from harvey.integrations.mail_provider import (
     NATIVE_PROVIDERS, get_mail_provider, strip_quoted_reply,
 )
 from harvey.models.conversation import Conversation, Message
-from harvey.state import REVIEW_NEXT_REPLY_KEY, StateManager
+from harvey.state import COLLEAGUE_REPLIED, REVIEW_NEXT_REPLY_KEY, StateManager
 from harvey.sending_mode import sync_sending_mode
 from harvey.untrusted import UNTRUSTED_RULE, fence
 
@@ -312,6 +312,21 @@ class Handler:
             compliance.postal_address, compliance.opt_out_line, DEFAULT_OPT_OUT_LINE,
         ])
 
+    async def _stop_colleagues(self, prospect):
+        """A reply from anyone at a company stops the cold sequence to
+        everyone else there: the owner said no, the office manager doesn't
+        get the follow-up. A bounce doesn't come here; it's one address."""
+        try:
+            cancelled = await self.state.cancel_pending_outbox_for_colleagues(prospect.id)
+        except Exception as e:
+            logger.warning(f"Handler: couldn't stop colleagues' emails: {e}")
+            return
+        if cancelled:
+            logger.info(
+                f"Handler: cancelled {cancelled} queued email(s) to colleagues of "
+                f"{prospect.email} ({COLLEAGUE_REPLIED})."
+            )
+
     async def _record_after_opt_out(
         self, prospect, reply_text: str, campaign_id: str = "", escalate: bool = False,
     ):
@@ -328,6 +343,7 @@ class Handler:
             await self.state.cancel_pending_outbox_for_prospect(prospect.id)
         except Exception as e:
             logger.debug(f"Handler: outbox cancel failed: {e}")
+        await self._stop_colleagues(prospect)
         await self.state.add_conversation(Conversation(
             id="",
             prospect_id=prospect.id,
@@ -402,6 +418,7 @@ class Handler:
                 )
         except Exception as e:
             logger.debug(f"Handler: outbox cancel failed: {e}")
+        await self._stop_colleagues(prospect)
 
         # 1. Classify intent. Hard keyword checks run FIRST and override
         # the LLM — opt-outs and legal threats must never be missed.

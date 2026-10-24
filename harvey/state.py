@@ -47,6 +47,20 @@ HELD_FOR_REVIEW = "held for your review: "
 # Set while the heartbeat holds sending because replies couldn't all be read
 # (JSON: since, last_seen, reason), so Today and `harvey status` can say so.
 SENDS_HELD_KEY = "sends_held"
+# Outbox error on a sequence email cancelled because someone else at the
+# company replied: one answer from a company stops the cold email to all of it.
+COLLEAGUE_REPLIED = "a colleague replied"
+# A colleague in one of these has answered or been closed.
+COMPANY_STOP_STATUSES = frozenset({"replied", "opted_out", "lost", "meeting", "closed"})
+# Shared mailbox providers: two people on one aren't colleagues.
+FREE_MAIL_DOMAINS = frozenset({
+    "gmail.com", "googlemail.com", "yahoo.com", "ymail.com", "hotmail.com",
+    "outlook.com", "live.com", "msn.com", "aol.com", "icloud.com", "me.com",
+    "mac.com", "proton.me", "protonmail.com", "gmx.com", "gmx.de", "web.de",
+    "mail.com", "zoho.com", "yandex.com", "yandex.ru", "qq.com", "163.com",
+    "comcast.net", "att.net", "verizon.net", "sbcglobal.net", "bellsouth.net",
+    "cox.net", "charter.net", "hey.com", "fastmail.com",
+})
 # Outbox error on what autopilot had approved when it was turned off.
 AUTOPILOT_OFF_REASON = "waiting for you: autopilot was turned off before it went out"
 # Outbox errors starting with this: the send was cut off and the email may
@@ -1237,6 +1251,58 @@ class StateManager:
             )
             await db.commit()
             return cursor.rowcount
+
+    # Who counts as a colleague: the same company, or, for someone Harvey
+    # has no company for, the same email domain unless it's a shared one.
+    _COLLEAGUE_SQL = (
+        "c.id != p.id AND ("
+        "(p.company_id != '' AND c.company_id = p.company_id) OR "
+        "(lower(substr(p.email, instr(p.email, '@') + 1)) NOT IN ({free}) "
+        "AND instr(p.email, '@') > 0 "
+        "AND lower(substr(c.email, instr(c.email, '@') + 1)) = "
+        "lower(substr(p.email, instr(p.email, '@') + 1))))"
+    ).format(free=", ".join(f"'{d}'" for d in sorted(FREE_MAIL_DOMAINS)))
+
+    async def cancel_pending_outbox_for_colleagues(self, prospect_id: str) -> int:
+        """Someone replied: cancel the sequence emails queued for everyone
+        else at their company. Replies Harvey owes a colleague who wrote in
+        themselves are not touched."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT first_name, last_name, email FROM prospects WHERE id = ?",
+                (prospect_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                return 0
+            who = " ".join(x for x in (row["first_name"], row["last_name"]) if x) or row["email"]
+            cursor = await db.execute(
+                "UPDATE outbox SET status = 'cancelled', error = ?, updated_at = ? "
+                "WHERE kind = 'sequence' AND status IN ('pending_review', 'approved') "
+                "AND prospect_id IN (SELECT c.id FROM prospects c, prospects p "
+                f"WHERE p.id = ? AND {self._COLLEAGUE_SQL})",
+                (f"{COLLEAGUE_REPLIED} ({who})", _utcnow().isoformat(), prospect_id),
+            )
+            await db.commit()
+            return cursor.rowcount
+
+    async def colleague_who_replied(self, prospect_id: str) -> str | None:
+        """The name of someone at this prospect's company who has already
+        replied or been closed, or None. A cold email to them is no longer
+        cold: the company has answered."""
+        stop = ", ".join(f"'{s}'" for s in sorted(COMPANY_STOP_STATUSES))
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT c.first_name, c.last_name, c.email FROM prospects c, prospects p "
+                f"WHERE p.id = ? AND c.status IN ({stop}) AND {self._COLLEAGUE_SQL} LIMIT 1",
+                (prospect_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+        if row is None:
+            return None
+        return " ".join(x for x in (row["first_name"], row["last_name"]) if x) or row["email"]
 
     async def count_outbox_sent(self) -> int:
         async with self._connect() as db:
