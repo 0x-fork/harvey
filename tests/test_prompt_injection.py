@@ -309,7 +309,7 @@ async def _async(v):
 
 def test_outbox_rows_remember_who_approved_them():
     from harvey.state import MIGRATIONS
-    assert "approved_by" in MIGRATIONS[-1]
+    assert "approved_by" in MIGRATIONS[12]  # v13
 
 
 @pytest.mark.asyncio
