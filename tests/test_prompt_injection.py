@@ -213,12 +213,12 @@ def test_a_link_elsewhere_is_held(body, host):
 
 
 @pytest.mark.parametrize("body", [
-    "Saw joesroofing.com, the gallery is great. Who handles the phones?",
-    "I emailed info@joesroofing.com last week.",
+    "Saw joesroofing.example, the gallery is great. Who handles the phones?",
+    "I emailed info@joesroofing.example last week.",
     "Read it here.Then let me know, approx.half of teams do. Google.Maps too.",
 ])
 def test_their_own_site_and_ordinary_prose_pass(body):
-    assert autopilot_review("hi", body, _cfg(), recipient="joe@joesroofing.com") == []
+    assert autopilot_review("hi", body, _cfg(), recipient="joe@joesroofing.example") == []
 
 
 def test_the_subject_is_checked_too():
