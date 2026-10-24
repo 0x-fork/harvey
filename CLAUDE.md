@@ -147,7 +147,7 @@ Ask the user these questions and build `harvey.yaml` and `skills/product_knowled
 
 ### Step 4: Confirm Signals
 
-Harvey ships a catalog of ~26 signals it knows how to collect, all **proposed** and
+Harvey ships a catalog of 29 signals it knows how to collect, all **proposed** and
 none active. Nothing is prospected against until the user confirms them.
 
 Send them to `harvey dashboard` → **Signals**, where each one shows a
@@ -157,7 +157,7 @@ it. Or from the terminal:
 ```bash
 harvey signals                      # review the catalog
 harvey signals --confirm free       # turn on everything that costs nothing
-harvey signals --confirm SERP_RANK  # the one paid discovery signal
+harvey signals --confirm SERP_RANK,MAPS_RANK  # the paid rank signals
 ```
 
 Most signals are free (they read pages a business already publishes). Only
