@@ -364,6 +364,19 @@ minor versions can still change behaviour.
   go out. One check per address, cached for 30 days; changing the sender
   country, address source or product description triggers a fresh check. The
   receipt id is logged with each send. Native providers only. Off by default.
+- **`harvey setup` offers the Precleared check** (from #46 by
+  gabrielaoimevbore-beep). A new optional last step
+  asks whether to turn the check on, where your business is based (GB or US)
+  and, if your prospects are all in one country, which one (answering "no"
+  there asks before saving it as Norway's code). It then offers a
+  free `PRECLEARED_API_KEY` (hidden input, saved to `.env`; 25 checks a day
+  instead of 10). Off unless you say yes. Re-running setup offers your saved
+  answers as the defaults, so pressing Enter never switches the check off. The
+  Claude-guided setup in CLAUDE.md offers the same step. Setup now reads and
+  saves `harvey.local.yaml` when it exists (it's what `harvey train` writes,
+  and the file Harvey reads), not the `harvey.yaml` it shadows, so its answers
+  take effect; if it can't save the file it says so instead of ticking the
+  summary.
 - **Cohort builder pagination and CSV export.** The cohort table on the
   Signals tab used to stop at the first 50 matches with no way to see the
   rest. It now pages with Prev / Next ("Showing 51–100 of 147"), and an
