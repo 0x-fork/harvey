@@ -15,11 +15,12 @@ import re
 from datetime import datetime, timezone
 
 from harvey.brain import Brain
-from harvey.config import HarveyConfig, refresh_sending_mode
+from harvey.config import HarveyConfig
 from harvey.humanize import humanize, humanizer_enabled
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS
 from harvey.models.campaign import Campaign, EmailStep
 from harvey.state import WRITABLE_EMAIL_STATUSES, StateManager
+from harvey.sending_mode import sync_sending_mode
 from harvey.untrusted import UNTRUSTED_RULE, fence
 
 logger = logging.getLogger("harvey.writer")
@@ -186,7 +187,7 @@ class Writer:
         (campaign, prospect, step 1) slot. If a draft fails, the slot stays
         empty and the sender falls back to the campaign template.
         """
-        refresh_sending_mode(self.config)
+        await sync_sending_mode(self.config, self.state)
         require_approval = getattr(
             self.config.channels.email, "require_approval", True
         )

@@ -10,7 +10,9 @@ import yaml
 
 from harvey.textio import read_user_text
 from dotenv import load_dotenv
-from pydantic import BaseModel, PrivateAttr, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel, PrivateAttr, TypeAdapter, ValidationError, field_validator, model_validator,
+)
 
 from harvey.paths import PROJECT_ROOT
 
@@ -734,7 +736,7 @@ def set_require_approval(value: bool, path=None) -> Path:
                       f"Set channels.email.require_approval: {word} there by hand.")
 
 
-_mode_cache: dict[str, tuple[int, object]] = {}
+_mode_cache: dict[str, tuple[tuple, object]] = {}
 
 
 def refresh_sending_mode(config, path=None) -> bool:
@@ -749,13 +751,20 @@ def refresh_sending_mode(config, path=None) -> bool:
         return False
     try:
         target = Path(path).resolve()
-        stamp = target.stat().st_mtime_ns
+        st = target.stat()
+        # Not the mtime alone: a restore or `cp -p` keeps it while the file changes.
+        stamp = (st.st_mtime_ns, st.st_size, st.st_ino, st.st_ctime_ns)
         cached = _mode_cache.get(str(target))
         if cached and cached[0] == stamp:
             value = cached[1]
         else:
             email = _email_section(yaml.safe_load(read_user_text(target)))
             value = email.get("require_approval", True) if email is not None else None
+            try:
+                # Read the way load_config reads it: "true", 'no', on...
+                value = TypeAdapter(bool).validate_python(value)
+            except ValidationError:
+                value = None
             _mode_cache[str(target)] = (stamp, value)
     except Exception:
         return False

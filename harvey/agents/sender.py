@@ -19,12 +19,13 @@ from datetime import date, datetime, timedelta, timezone
 from harvey.brain import Brain
 from harvey.config import (
     HarveyConfig, EnvConfig, cold_daily_cap, compliance_footer_lines, compliance_notice,
-    compliance_of, refresh_sending_mode,
+    compliance_of,
 )
 from harvey.gate import autopilot_review, pre_send_check
 from harvey.integrations.instantly import InstantlyClient
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
 from harvey.integrations.precleared import PreclearedClient
+from harvey.sending_mode import sync_sending_mode
 from harvey.state import (
     AUTOPILOT_OFF_REASON, HAND_SENT_REASON, HELD_FOR_REVIEW, MANUAL_SEND_KEY,
     MAYBE_SENT_PREFIX, StateManager,
@@ -152,7 +153,7 @@ class Sender:
         # Instantly owns campaign scheduling and has no per-message outbox
         # approval here. Fail closed rather than silently bypass the setting,
         # including retries of an already-created remote campaign.
-        refresh_sending_mode(self.config)
+        await sync_sending_mode(self.config, self.state)
         if getattr(self.config.channels.email, "require_approval", True):
             logger.warning(
                 "Sender: Instantly campaign held because require_approval is true. "
@@ -420,7 +421,7 @@ class Sender:
             await self.state.update_campaign(campaign.id, status="failed")
             return
 
-        refresh_sending_mode(self.config)
+        await sync_sending_mode(self.config, self.state)
         require_approval = getattr(
             self.config.channels.email, "require_approval", True
         )
@@ -548,7 +549,7 @@ class Sender:
 
     async def _blocked(self, item: dict, prospect, allow_risky: bool) -> tuple[str, str] | None:
         """Why this email must not go out, as (status, error), or None."""
-        refresh_sending_mode(self.config)   # "Turn off autopilot" counts at once
+        await sync_sending_mode(self.config, self.state)   # "Turn off autopilot" counts at once
         if prospect is None:
             return "failed", "prospect missing"
         if item["kind"] == "sequence":

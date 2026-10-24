@@ -9,9 +9,9 @@ from datetime import datetime, time, timedelta
 import pytz
 
 from harvey.brain import Brain
+from harvey.sending_mode import sync_sending_mode
 from harvey.config import (
-    ConfigError, load_config, load_env, HarveyConfig, legacy_sending_held, refresh_sending_mode,
-    sending_notice,
+    ConfigError, load_config, load_env, HarveyConfig, legacy_sending_held, sending_notice,
     compliance_notice,
 )
 from harvey.pipeline import run_profile_stage
@@ -196,23 +196,6 @@ async def _interruptible_sleep(seconds: float, stop_event: asyncio.Event) -> boo
         return True
     except asyncio.TimeoutError:
         return False
-
-
-async def sync_sending_mode(config, state) -> bool:
-    """Pick up a sending-mode change made while running (the dashboard
-    switch, or the config edited by hand). Going back to approval also
-    brings what autopilot approved, and hasn't sent, back to the Outbox.
-    True when the mode changed."""
-    if not refresh_sending_mode(config):
-        return False
-    if config.channels.email.require_approval:
-        back = await state.requeue_autopilot_approved()
-        logger.warning("Sending mode is now APPROVAL: every email waits in the Outbox for you."
-                       + (f" {back} queued by autopilot came back to the Outbox." if back else ""))
-    else:
-        logger.warning("Sending mode is now AUTOPILOT: Harvey sends on its own "
-                       "(emails it holds still wait for you).")
-    return True
 
 
 async def heartbeat(stop_event: asyncio.Event | None = None):

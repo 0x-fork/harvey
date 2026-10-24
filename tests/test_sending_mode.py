@@ -296,7 +296,7 @@ async def test_off_also_brings_back_rows_from_before_the_upgrade(state):
 
 @pytest.mark.asyncio
 async def test_the_loop_noticing_off_brings_autopilot_rows_back(state, yaml_file):
-    from harvey.main import sync_sending_mode
+    from harvey.sending_mode import sync_sending_mode
     set_require_approval(False, yaml_file)
     config = load_config(str(yaml_file))
     row = await _row(state, "approved")
@@ -329,3 +329,42 @@ def test_a_byte_order_mark_is_kept(tmp_path, yaml_file):
     path.write_bytes(b"\xef\xbb\xbf" + yaml_file.read_bytes())
     set_require_approval(False, path)
     assert path.read_bytes().startswith(b"\xef\xbb\xbf")
+
+
+@pytest.mark.asyncio
+async def test_a_hand_edit_back_to_approval_noticed_by_the_sender_still_holds_everything(state, yaml_file):
+    """Third review: the sender noticed the change first, so the loop never
+    requeued and a pre-upgrade row went out."""
+    from tests.test_outbox_native import Env, FakeProvider
+    from harvey.agents.sender import Sender
+    set_require_approval(False, yaml_file)
+    config = load_config(str(yaml_file))
+    row = await _row(state, "approved")
+    with sqlite3.connect(state.db_path) as db:
+        db.execute("UPDATE outbox SET approved_by = 'earlier' WHERE id = ?", (row,))
+    yaml_file.write_text(yaml_file.read_text().replace("require_approval: false", "require_approval: true"))
+    sender = Sender(brain=None, state=state, config=config, env=Env())
+    sender.provider, sender.send_pacing = FakeProvider(), False
+    await sender._drain_due()
+    assert sender.provider.sent == []
+    assert (await state.get_outbox_item(row))["status"] == "pending_review"
+
+
+def test_a_change_that_keeps_the_old_timestamp_is_still_seen(yaml_file):
+    import os
+    set_require_approval(False, yaml_file)
+    config = load_config(str(yaml_file))
+    refresh_sending_mode(config)                                  # cached
+    before = os.stat(yaml_file)
+    yaml_file.write_text(yaml_file.read_text().replace("require_approval: false", "require_approval: true"))
+    os.utime(yaml_file, ns=(before.st_atime_ns, before.st_mtime_ns))   # cp -p, a restore
+    assert refresh_sending_mode(config) is True and config.channels.email.require_approval is True
+
+
+@pytest.mark.parametrize("written,expected", [('"true"', True), ("'false'", False), ("no", False), ("on", True)])
+def test_quoted_and_spelled_values_count_as_they_do_at_startup(yaml_file, written, expected):
+    yaml_file.write_text(yaml_file.read_text().replace("require_approval: true", f"require_approval: {written}"))
+    assert load_config(str(yaml_file)).channels.email.require_approval is expected
+    config = load_config(str(yaml_file))
+    config.channels.email.require_approval = not expected
+    assert refresh_sending_mode(config) is True and config.channels.email.require_approval is expected
