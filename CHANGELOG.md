@@ -33,6 +33,33 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- **Opted-out contacts are no longer in the prospect CSV.** Someone who
+  replied "unsubscribe" stayed in `harvey export` and the dashboard's Export
+  button, so taking the list to another sequencer could email them again.
+  They're now left out even when `--status` or `--email-status` is given;
+  `harvey export --all` (and `?all=true`) is still the raw, unfiltered dump.
+  From #64 by hifzabuildsai.
+- **An opt-out now stays an opt-out.** Any later message from someone who
+  opted out (an out-of-office, a "thanks") set them back to *replied* or
+  *lost*, which put them back in the export, and a question from them got a
+  drafted answer in the Outbox. Now their message is kept in a closed
+  conversation for you to read, nothing is drafted, and no code path can
+  move a prospect off *opted out*. A complaint from them still comes to you.
+- **See why someone opted out, and undo it.** Each opt-out now records the
+  rule that fired (an opt-out phrase, "no thanks", a one-word reply, or the
+  model's judgement), the words it matched and their message. **Why?** on
+  their row in Contacts (or on the conversation) shows it, and **Undo
+  opt-out** reverses a mistaken one after a confirm: they become *replied*,
+  so nothing is sent on its own, and Harvey's answer to their next reply
+  waits for your approval even with `require_approval: false` (on
+  Instantly, which can't hold a reply, that conversation comes to you). Opt-outs from before this show their last message instead, and
+  every undo is logged.
+- **`aiosmtplib` is now 5.1.3 or later** (was `>=3.0.1,<4`). Older versions
+  wrote a CR/LF inside an address straight to the SMTP server, so an address
+  scraped from a website could add commands of its own
+  (GHSA-v3q9-hj7j-63hq), and kept plaintext bytes across STARTTLS
+  (GHSA-vxj7-4xrp-5vr4). Harvey passes scraped addresses to it when sending
+  over SMTP and when probing a mailbox. Reported in #66.
 - A follow-up no longer goes out before, or right after, the email it
   follows. Each step now waits until the previous one has actually been sent
   and its gap (at least a day) has passed. Before, approving a batch of drafts

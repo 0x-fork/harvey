@@ -38,6 +38,9 @@ WRITABLE_EMAIL_STATUSES = ("verified", "risky")
 MANUAL_SEND_KEY = "manual_send:"
 # Outbox cancel reason for mail the user sent by hand instead; undo restores it.
 HAND_SENT_REASON = "sent_by_hand"
+# Set when you undo someone's opt-out: Harvey's first reply to them after
+# that waits for your approval, even on autopilot. Cleared once it has.
+REVIEW_NEXT_REPLY_KEY = "review_next_reply:"
 # Outbox errors starting with this: the send was cut off and the email may
 # have reached them. Never retried, and counted as Harvey's mail, so the
 # dashboard never offers a second one by hand.
@@ -435,6 +438,10 @@ MIGRATIONS: list[str] = [
     -- so one subscription's budget never consumes the other's.
     ALTER TABLE usage_log ADD COLUMN codex_calls INTEGER DEFAULT 0;
     """,
+    # ── v12: look actions up by type (opt-out history, undone opt-outs) ──
+    """
+    CREATE INDEX IF NOT EXISTS idx_actions_type_created ON actions(action_type, created_at);
+    """,
 ]
 
 BRAIN_PROVIDERS = ("claude", "codex")
@@ -741,12 +748,62 @@ class StateManager:
                 return [self._prospect_from_row(r) for r in rows]
 
     async def update_prospect_status(self, prospect_id: str, status: str):
+        # An opt-out is permanent: nothing Harvey does later (a reply, a
+        # send, a retry) may move someone off it and back into outreach.
         async with self._connect() as db:
             await db.execute(
-                "UPDATE prospects SET status = ?, updated_at = ? WHERE id = ?",
+                "UPDATE prospects SET status = ?, updated_at = ? "
+                "WHERE id = ? AND status IS NOT 'opted_out'",
                 (status, _utcnow().isoformat(), prospect_id),
             )
             await db.commit()
+
+    async def undo_opt_out(self, prospect_id: str, details: dict | None = None) -> bool:
+        """A human's undo of an opt-out: the one way off 'opted_out'.
+
+        They go to 'replied', not back into the sequence: Harvey sends
+        nothing new on its own (the sender never stages 'replied'), and what
+        the opt-out cancelled stays cancelled. Harvey's first reply to them
+        after this waits for approval even on autopilot (REVIEW_NEXT_REPLY_KEY).
+        The status, that flag and the opt_out_undone log entry are one write.
+        False, and nothing written, when they weren't opted out."""
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE prospects SET status = 'replied', updated_at = ? "
+                "WHERE id = ? AND status = 'opted_out'",
+                (_utcnow().isoformat(), prospect_id),
+            )
+            if cursor.rowcount != 1:
+                await db.rollback()
+                return False
+            await db.execute(
+                """INSERT INTO settings (key, value, updated_at)
+                   VALUES (?, '1', CURRENT_TIMESTAMP)
+                   ON CONFLICT(key) DO UPDATE SET
+                       value = excluded.value, updated_at = CURRENT_TIMESTAMP""",
+                (REVIEW_NEXT_REPLY_KEY + prospect_id,),
+            )
+            await db.execute(
+                "INSERT INTO actions (id, action_type, agent, details_json) VALUES (?, ?, ?, ?)",
+                (_new_id(), "opt_out_undone", "dashboard",
+                 json.dumps({"prospect_id": prospect_id, **(details or {})})),
+            )
+            await db.commit()
+            return True
+
+    async def opt_out_history(self, prospect_id: str) -> list[dict]:
+        """Every opt-out and undo recorded for this person, oldest first."""
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT action_type, details_json, created_at FROM actions "
+                "WHERE action_type IN ('opt_out', 'opt_out_undone') "
+                "AND json_valid(details_json) "
+                "AND json_extract(details_json, '$.prospect_id') = ? "
+                "ORDER BY created_at, rowid",
+                (prospect_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        return [{**json.loads(d), "action": a, "at": str(at or "")} for a, d, at in rows]
 
     async def queue_prospect_if_unsent(self, prospect_id: str) -> bool:
         """Mark a prospect 'queued' unless something moved them on meanwhile.

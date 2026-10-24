@@ -990,3 +990,14 @@ table.clip td { max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
 .more-fields { margin-bottom: var(--sp-3); }
 .more-fields summary { cursor: pointer; font-size: var(--fs-ui); color: var(--text-2); margin-bottom: var(--sp-3); }
 .check-line { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-ui); color: var(--text-2); cursor: pointer; }
+
+/* Contacts: why someone is opted out, under their row. */
+.detail-row > td { white-space: normal; background: var(--surface-2); }
+.optout-panel { display: flex; flex-direction: column; gap: var(--sp-2); max-width: 72ch; padding: var(--sp-2) 0; }
+.optout-panel h4 { margin: 0; font-size: var(--fs-ui); }
+.optout-panel p { margin: 0; font-size: var(--fs-ui); line-height: 1.55; }
+.optout-panel .optout-meta { font-size: var(--fs-caption); color: var(--text-2); }
+.optout-panel .thread-msg.received { background: var(--surface); }
+.optout-panel .convo-actions { margin-top: var(--sp-2); }
+.optout-panel .convo-actions .muted { white-space: normal; }
+.optout-panel .convo-actions .btn-ghost { margin-left: 0; }
