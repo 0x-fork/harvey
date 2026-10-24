@@ -253,3 +253,79 @@ def test_settings_explains_both_and_asks_for_the_word():
     assert 'id="autopilot-confirm"' in armed and 'id="autopilot-go" disabled' in armed
     auto = _render("sendingModeCard", {**MODE, "mode": "autopilot"})
     assert "Turn off autopilot" in auto and "works at once" in auto
+
+
+# ── review of the switch: no autopilot email after "off" ──
+
+
+@pytest.mark.asyncio
+async def test_off_mid_cycle_stops_what_this_cycle_queues_and_sends(state, yaml_file):
+    """The running loop loaded autopilot. The switch goes off mid-cycle:
+    the drain and the next row queued both see it, without waiting a cycle."""
+    from tests.test_outbox_native import FakeProvider
+    from harvey.agents.sender import Sender
+    set_require_approval(False, yaml_file)
+    config = load_config(str(yaml_file))                 # what `harvey run` holds
+    assert config.channels.email.require_approval is False
+    row = await _row(state, "approved")                  # queued on autopilot
+    set_require_approval(True, yaml_file)                # the click, mid-cycle
+    from tests.test_outbox_native import Env
+    sender = Sender(brain=None, state=state, config=config, env=Env())
+    sender.provider, sender.send_pacing = FakeProvider(), False
+    await sender._drain_due()
+    assert sender.provider.sent == []
+    assert (await state.get_outbox_item(row))["status"] == "pending_review"
+    assert config.channels.email.require_approval is True
+
+
+def test_a_config_not_loaded_from_a_file_is_never_refreshed(monkeypatch):
+    from tests.test_outbox_native import Cfg
+    monkeypatch.setattr(Cfg.channels.email, "require_approval", False)
+    cfg = Cfg()                     # the repo's harvey.yaml says true: must not be read
+    assert refresh_sending_mode(cfg) is False
+    assert cfg.channels.email.require_approval is False
+
+
+@pytest.mark.asyncio
+async def test_off_also_brings_back_rows_from_before_the_upgrade(state):
+    row = await _row(state, "approved")
+    with sqlite3.connect(state.db_path) as db:
+        db.execute("UPDATE outbox SET approved_by = 'earlier' WHERE id = ?", (row,))
+    assert await state.requeue_autopilot_approved() == 1
+
+
+@pytest.mark.asyncio
+async def test_the_loop_noticing_off_brings_autopilot_rows_back(state, yaml_file):
+    from harvey.main import sync_sending_mode
+    set_require_approval(False, yaml_file)
+    config = load_config(str(yaml_file))
+    row = await _row(state, "approved")
+    set_require_approval(True, yaml_file)                 # edited by hand, say
+    assert await sync_sending_mode(config, state) is True
+    assert (await state.get_outbox_item(row))["status"] == "pending_review"
+
+
+def test_the_writer_keeps_a_symlinked_config_a_symlink(tmp_path, yaml_file):
+    real = tmp_path / "real.yaml"
+    real.write_bytes(yaml_file.read_bytes())
+    link = tmp_path / "harvey.local.yaml"
+    link.symlink_to(real)
+    set_require_approval(False, link)
+    assert link.is_symlink()
+    assert load_config(str(real)).channels.email.require_approval is False
+
+
+def test_a_file_that_isnt_utf8_is_refused_not_mangled(tmp_path, yaml_file):
+    path = tmp_path / "latin.yaml"
+    path.write_bytes(yaml_file.read_bytes().replace(b"# native", "# café native".encode("latin-1")))
+    before = path.read_bytes()
+    with pytest.raises(ConfigError):
+        set_require_approval(False, path)
+    assert path.read_bytes() == before
+
+
+def test_a_byte_order_mark_is_kept(tmp_path, yaml_file):
+    path = tmp_path / "bom.yaml"
+    path.write_bytes(b"\xef\xbb\xbf" + yaml_file.read_bytes())
+    set_require_approval(False, path)
+    assert path.read_bytes().startswith(b"\xef\xbb\xbf")

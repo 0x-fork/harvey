@@ -13,8 +13,9 @@ minor versions can still change behaviour.
   which sending mode you're in, and Settings → Sending explains both,
   lists the domains counted as yours and switches them. Turning autopilot
   on takes typing `autopilot`; turning it off is one click and works at
-  once: emails autopilot approved that haven't gone out come back to the
-  Outbox, and the sender won't send one while approval is on. Only the
+  once, mid-cycle too (every step that queues or sends re-reads the mode):
+  emails autopilot approved that haven't gone out come back to the Outbox,
+  and the sender won't send one while approval is on. Only the
   `require_approval` line of your config changes (comments kept), and a
   running Harvey picks it up next cycle. Each outbox row records who
   approved it (`approved_by`: you, autopilot, or earlier for rows from

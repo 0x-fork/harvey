@@ -1679,14 +1679,16 @@ function sendingModeCard(m) {
       '. Add others under <code>channels.email.link_domains</code> in <code>' + escHtml(m.file) + '</code>.</p>';
   if (auto) {
     html += '<div class="convo-actions"><span class="muted">Turning it off works at once: emails autopilot ' +
-      'approved that haven’t gone out come back to the Outbox.</span>' +
+      'approved that haven’t gone out come back to the Outbox.' +
+      (instantly ? ' Campaigns already on Instantly keep running until you pause them there.' : '') + '</span>' +
       '<button class="btn btn-primary btn-sm" onclick="setSendingMode(\'approval\')"' +
         (_modeBusy ? ' disabled' : '') + '>Turn off autopilot</button></div>';
   } else if (_autopilotArmed) {
     html += '<div class="convo-actions mode-confirm"><span class="muted">Approve a batch or two by hand first ' +
       'and read what Harvey writes. Type <b>autopilot</b> to turn it on. It starts from Harvey’s next cycle.</span>' +
       '<input class="form-input" id="autopilot-confirm" autocomplete="off" aria-label="Type autopilot to confirm" ' +
-        'oninput="document.getElementById(\'autopilot-go\').disabled = this.value.trim().toLowerCase() !== \'autopilot\'">' +
+        'oninput="document.getElementById(\'autopilot-go\').disabled = this.value.trim().toLowerCase() !== \'autopilot\'" ' +
+        'onkeydown="if (event.key === \'Enter\' && this.value.trim().toLowerCase() === \'autopilot\') setSendingMode(\'autopilot\')">' +
       '<button class="btn btn-primary btn-sm" id="autopilot-go" disabled onclick="setSendingMode(\'autopilot\')">Turn on autopilot</button>' +
       '<button class="btn btn-ghost btn-sm" onclick="_autopilotArmed=false;renderSendingModeCard()">Cancel</button></div>';
   } else {
@@ -1717,6 +1719,7 @@ async function setSendingMode(mode) {
     body.confirm = input ? input.value.trim().toLowerCase() : '';
   }
   _modeBusy = true;
+  document.querySelectorAll('.mode-banner button, .mode-card button').forEach(b => { b.disabled = true; });
   try {
     const res = await api('/api/sending-mode', {
       method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
@@ -1726,7 +1729,9 @@ async function setSendingMode(mode) {
       showToast(mode === 'autopilot'
         ? 'Autopilot is on from Harvey’s next cycle. Held emails still wait for you.'
         : 'Autopilot is off. Every email waits for you' +
-          (res.requeued ? '; ' + res.requeued + ' queued by autopilot came back to the Outbox.' : '.'), 'success');
+          (res.requeued ? '; ' + res.requeued + ' queued by autopilot came back to the Outbox.' : '.') +
+          (_sendingMode && _sendingMode.provider === 'instantly'
+            ? ' Campaigns already on Instantly keep running: pause them in Instantly.' : ''), 'success');
     } else {
       showToast(failMsg(res, 'Couldn’t change the sending mode.'), 'error');
     }

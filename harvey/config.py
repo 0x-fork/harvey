@@ -10,7 +10,7 @@ import yaml
 
 from harvey.textio import read_user_text
 from dotenv import load_dotenv
-from pydantic import BaseModel, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, PrivateAttr, ValidationError, field_validator, model_validator
 
 from harvey.paths import PROJECT_ROOT
 
@@ -502,6 +502,9 @@ class HarveyConfig(BaseModel):
     brain: BrainConfig = BrainConfig()
     compliance: ComplianceConfig = ComplianceConfig()
     writer: WriterConfig = WriterConfig()
+    # The file it was loaded from, so a running Harvey can re-read the
+    # sending mode from that same file (refresh_sending_mode).
+    _source_path: str | None = PrivateAttr(default=None)
 
 
 class EnvConfig(BaseModel):
@@ -572,7 +575,9 @@ def load_config(config_path: str | None = None) -> HarveyConfig:
         )
 
     try:
-        return HarveyConfig(**data)
+        config = HarveyConfig(**data)
+        config._source_path = str(config_path)
+        return config
     except ValidationError as e:
         # Log a friendly, actionable summary, then re-raise the original
         # ValidationError so callers (and tests) keep the pydantic type.
@@ -689,7 +694,14 @@ def set_require_approval(value: bool, path=None) -> Path:
     import copy
     import shutil
     path = Path(path or _find_config_file())
-    raw = read_user_text(path)
+    target = path.resolve()          # a symlinked config stays a symlink
+    data_bytes = target.read_bytes()
+    bom = data_bytes.startswith(b"\xef\xbb\xbf")
+    try:
+        raw = data_bytes.decode("utf-8-sig").replace("\r\n", "\n")
+    except UnicodeDecodeError:
+        raise ConfigError(f"{path.name} isn't UTF-8, so it isn't rewritten. Set "
+                          f"channels.email.require_approval there by hand.")
     try:
         data = yaml.safe_load(raw)
     except yaml.YAMLError as e:
@@ -707,30 +719,46 @@ def set_require_approval(value: bool, path=None) -> Path:
         except yaml.YAMLError:
             continue
         HarveyConfig(**expected)          # still a valid config
-        if b"\r\n" in path.read_bytes():
+        if b"\r\n" in data_bytes:
             new = new.replace("\n", "\r\n")
-        tmp = path.with_name(path.name + ".tmp")
+        tmp = target.with_name(target.name + ".tmp")
         try:
-            tmp.write_bytes(new.encode("utf-8"))
-            shutil.copymode(path, tmp)
-            os.replace(tmp, path)
+            tmp.write_bytes((b"\xef\xbb\xbf" if bom else b"") + new.encode("utf-8"))
+            shutil.copymode(target, tmp)
+            os.replace(tmp, target)
         finally:
             tmp.unlink(missing_ok=True)
+        _mode_cache.pop(str(target), None)
         return path
     raise ConfigError(f"Couldn't change require_approval in {path.name} safely. "
                       f"Set channels.email.require_approval: {word} there by hand.")
 
 
+_mode_cache: dict[str, tuple[int, object]] = {}
+
+
 def refresh_sending_mode(config, path=None) -> bool:
-    """Bring a running config's require_approval in line with the file, so a
-    switch made while Harvey runs counts from its next cycle. True when it
-    changed. A file that can't be read leaves the running value alone."""
+    """Bring a running config's require_approval in line with the file it was
+    loaded from, so a switch made while Harvey runs counts at once: the
+    sender, writer and handler call this before they queue or send. Cheap:
+    the file is only read again when it changed. True when the value
+    changed. A config not loaded from a file, or a file that can't be read,
+    leaves the running value alone."""
+    path = path or getattr(config, "_source_path", None)
+    if not path:
+        return False
     try:
-        data = yaml.safe_load(read_user_text(Path(path or _find_config_file())))
+        target = Path(path).resolve()
+        stamp = target.stat().st_mtime_ns
+        cached = _mode_cache.get(str(target))
+        if cached and cached[0] == stamp:
+            value = cached[1]
+        else:
+            email = _email_section(yaml.safe_load(read_user_text(target)))
+            value = email.get("require_approval", True) if email is not None else None
+            _mode_cache[str(target)] = (stamp, value)
     except Exception:
         return False
-    email = _email_section(data)
-    value = email.get("require_approval", True) if email is not None else None
     if not isinstance(value, bool) or value == config.channels.email.require_approval:
         return False
     config.channels.email.require_approval = value

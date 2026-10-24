@@ -1176,11 +1176,14 @@ class StateManager:
 
     async def requeue_autopilot_approved(self) -> int:
         """Autopilot was turned off: everything it approved that hasn't gone
-        out waits for you instead. Yours stays approved. Returns how many."""
+        out waits for you instead, and so does what was approved before
+        Harvey recorded who approved ('earlier'; it can't tell). Yours stays
+        approved. Returns how many."""
         async with self._connect() as db:
             cursor = await db.execute(
                 "UPDATE outbox SET status = 'pending_review', approved_by = '', "
-                "error = ?, updated_at = ? WHERE status = 'approved' AND approved_by = 'autopilot'",
+                "error = ?, updated_at = ? WHERE status = 'approved' "
+                "AND approved_by IN ('autopilot', 'earlier')",
                 (AUTOPILOT_OFF_REASON, _utcnow().isoformat()),
             )
             await db.commit()

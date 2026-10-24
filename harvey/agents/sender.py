@@ -19,7 +19,7 @@ from datetime import date, datetime, timedelta, timezone
 from harvey.brain import Brain
 from harvey.config import (
     HarveyConfig, EnvConfig, cold_daily_cap, compliance_footer_lines, compliance_notice,
-    compliance_of,
+    compliance_of, refresh_sending_mode,
 )
 from harvey.gate import autopilot_review, pre_send_check
 from harvey.integrations.instantly import InstantlyClient
@@ -152,6 +152,7 @@ class Sender:
         # Instantly owns campaign scheduling and has no per-message outbox
         # approval here. Fail closed rather than silently bypass the setting,
         # including retries of an already-created remote campaign.
+        refresh_sending_mode(self.config)
         if getattr(self.config.channels.email, "require_approval", True):
             logger.warning(
                 "Sender: Instantly campaign held because require_approval is true. "
@@ -419,6 +420,7 @@ class Sender:
             await self.state.update_campaign(campaign.id, status="failed")
             return
 
+        refresh_sending_mode(self.config)
         require_approval = getattr(
             self.config.channels.email, "require_approval", True
         )
@@ -546,6 +548,7 @@ class Sender:
 
     async def _blocked(self, item: dict, prospect, allow_risky: bool) -> tuple[str, str] | None:
         """Why this email must not go out, as (status, error), or None."""
+        refresh_sending_mode(self.config)   # "Turn off autopilot" counts at once
         if prospect is None:
             return "failed", "prospect missing"
         if item["kind"] == "sequence":

@@ -354,9 +354,12 @@ type `autopilot`, or set `channels.email.require_approval: false` in your config
 Harvey picks it up from its next cycle, with no restart.
 
 **Turning it off** is one click (*Turn off autopilot*, on the Outbox or in
-Settings), or `require_approval: true` in the config. It works at once: emails
-autopilot approved that haven't gone out come back to the Outbox, and nothing
-it approved is sent after that. Emails you approved yourself stay approved.
+Settings), or `require_approval: true` in the config. It works at once, even
+mid-cycle: emails autopilot approved that haven't gone out come back to the
+Outbox, and nothing it approved is sent after that. Emails you approved
+yourself stay approved. (Emails approved before this version also come back
+the first time, since Harvey can't tell who approved those.) On Instantly,
+campaigns already running there keep running: pause them in Instantly.
 
 **What autopilot still holds for you.** Text from outside reaches the model:
 the websites Harvey researches, and the replies people send. Either can carry

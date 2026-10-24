@@ -198,6 +198,23 @@ async def _interruptible_sleep(seconds: float, stop_event: asyncio.Event) -> boo
         return False
 
 
+async def sync_sending_mode(config, state) -> bool:
+    """Pick up a sending-mode change made while running (the dashboard
+    switch, or the config edited by hand). Going back to approval also
+    brings what autopilot approved, and hasn't sent, back to the Outbox.
+    True when the mode changed."""
+    if not refresh_sending_mode(config):
+        return False
+    if config.channels.email.require_approval:
+        back = await state.requeue_autopilot_approved()
+        logger.warning("Sending mode is now APPROVAL: every email waits in the Outbox for you."
+                       + (f" {back} queued by autopilot came back to the Outbox." if back else ""))
+    else:
+        logger.warning("Sending mode is now AUTOPILOT: Harvey sends on its own "
+                       "(emails it holds still wait for you).")
+    return True
+
+
 async def heartbeat(stop_event: asyncio.Event | None = None):
     """Harvey's main loop. Wakes up, decides, acts, sleeps. Repeat."""
     if stop_event is None:
@@ -252,13 +269,7 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
         try:
             # 0. Approval or autopilot, as the config file says now: the
             # dashboard can switch it while Harvey runs.
-            if refresh_sending_mode(config):
-                logger.warning(
-                    "Sending mode is now "
-                    + ("APPROVAL: every email waits in the Outbox for you."
-                       if config.channels.email.require_approval
-                       else "AUTOPILOT: Harvey sends on its own (held emails still wait for you).")
-                )
+            await sync_sending_mode(config, state)
 
             # 1. Check quiet hours
             if in_quiet_hours(config):

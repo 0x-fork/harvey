@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from harvey.brain import Brain, BrainUnavailable
 from harvey.config import (
     DEFAULT_OPT_OUT_LINE, HarveyConfig, EnvConfig, compliance_of, legacy_sending_held,
+    refresh_sending_mode,
 )
 from harvey.gate import autopilot_review, pre_send_check
 from harvey.humanize import humanize, humanizer_enabled
@@ -440,6 +441,7 @@ class Handler:
 
         # 2b. Draft the reply now, while nothing is stored yet. A held
         # Instantly setup can't send it, so don't spend a model call on it.
+        refresh_sending_mode(self.config)
         held = not self.is_native and legacy_sending_held(self.config)
         response = ""
         if intent in AUTO_REPLY_INTENTS and not held:
@@ -697,6 +699,7 @@ class Handler:
         self, response: str, prospect, convo, reply_meta: dict, intent: str
     ):
         """Route Harvey's reply through the outbox (approval ladder applies)."""
+        refresh_sending_mode(self.config)
         require_approval = getattr(
             self.config.channels.email, "require_approval", True
         )
