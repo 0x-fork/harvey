@@ -48,6 +48,20 @@ minor versions can still change behaviour.
   playbook has rank-based angles, worded as "when we searched from downtown
   Denver", never as an absolute position.
 
+- **Cold email in each recipient's office hours** (from #59 by
+  gabrielaoimevbore-beep; `channels.email.send_window`, #53). Cold email goes out only between `start` and `end` (08:00 to 17:00 on
+  weekdays by default) in the recipient's own time zone. The zone is worked
+  out once and stored on the prospect, from the company's location (US
+  states, Canadian provinces, Australian states, countries with one zone,
+  and the coordinates discovery already cached), the country Precleared
+  returns when that check is on, or `prospect_country`. Anyone Harvey can't
+  place gets the window in `usage.quiet_hours.timezone`. Follow-ups keep
+  their `delay_days` and move into the window, an email approved after hours
+  waits for the next one, and replies are never held. With
+  `recipient_timezone` on, quiet hours pause prospecting and writing but not
+  email that's due: a heartbeat with something due reads replies, then
+  sends. Off unless set; Gmail, Microsoft and SMTP only.
+
 - **A built-in skill for selling to YC startups.** The `yc` discovery preset
   (`harvey discover --preset yc`, or *Look for: YC startups* on Discover)
   searches your industries, through Serper or DataForSEO SERP, for companies
