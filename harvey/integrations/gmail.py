@@ -284,7 +284,7 @@ class GmailProvider(MailProvider):
                     # be in neither read. A cycle later the index has caught
                     # up, so the first history read lists the week once more.
                     have = {m.provider_id for m in messages}
-                    messages = messages + [m for m in await self._read_week(limit)
+                    messages = messages + [m for m in await self._read_week(limit, prune=False)
                                            if m.provider_id not in have]
                     verified = True
                 self._pending = (marker, False, verified)
@@ -351,14 +351,17 @@ class GmailProvider(MailProvider):
         marker = None
         for page in range(1, MAX_INBOX_PAGES + 1):
             data = await self._request("GET", "/history", params=dict(params), not_found=_GONE)
-            if page == 1 and isinstance(data, dict) and isinstance(data.get("historyId"), (str, int)):
-                # The first page's marker: anything recorded while paging is
-                # read again next time (deduplicated) rather than skipped.
-                marker = data["historyId"]
             if data is _GONE:
                 return None
             if not isinstance(data, dict) or not isinstance(data.get("history", []), list):
                 raise GmailError(f"history page {page}: could not read changes")
+            if page == 1:
+                # The first page's marker: anything recorded while paging is
+                # read again next time (deduplicated) rather than skipped.
+                # Without one there's no safe marker, so fail closed.
+                marker = data.get("historyId") if isinstance(data, dict) else None
+                if not isinstance(marker, (str, int)) or not str(marker):
+                    raise GmailError("history page 1: no historyId")
             for record in data.get("history", []):
                 if not isinstance(record, dict):
                     raise GmailError(f"history page {page}: a record is not an object")
@@ -369,9 +372,6 @@ class GmailProvider(MailProvider):
                         wanted.append((_entry_id(entry, page), True))
             token = data.get("nextPageToken")
             if token is None:
-                marker = marker if marker is not None else data.get("historyId")
-                if not isinstance(marker, (str, int)) or not str(marker):
-                    raise GmailError(f"history page {page}: no historyId")
                 break
             if not isinstance(token, str) or not token or token in seen_tokens:
                 raise GmailError(f"history page {page}: invalid or repeated nextPageToken")
@@ -402,7 +402,7 @@ class GmailProvider(MailProvider):
                 out.append(msg)
         return out, str(marker)
 
-    async def _read_week(self, limit: int) -> list[InboundMessage]:
+    async def _read_week(self, limit: int, prune: bool = True) -> list[InboundMessage]:
         """The complete 7-day inbox, or raise. ``limit`` is a page size,
         not a cap: a reply beyond the first page must still stop its
         follow-ups. Bounded like the Graph provider (MAX_INBOX_PAGES of
@@ -434,9 +434,11 @@ class GmailProvider(MailProvider):
                     out.append(got[0])
             token = listing.get("nextPageToken")
             if token is None:
-                # A complete read: forget what has left the week's window.
-                self._read_cache = {k: v for k, v in self._read_cache.items() if k in seen_ids}
-                self._label_cache = {k: v for k, v in self._label_cache.items() if k in seen_ids}
+                # A complete read: forget what has left the week's window
+                # (not on a recheck, which shouldn't drop what history fetched).
+                if prune:
+                    self._read_cache = {k: v for k, v in self._read_cache.items() if k in seen_ids}
+                    self._label_cache = {k: v for k, v in self._label_cache.items() if k in seen_ids}
                 return out
             if not isinstance(token, str) or not token or token in seen_tokens:
                 raise GmailError(f"inbox page {page}: invalid or repeated nextPageToken")

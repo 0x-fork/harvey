@@ -330,3 +330,63 @@ async def test_the_handler_doesnt_confirm_when_a_reply_wasnt_handled(tmp_path, m
     monkeypatch.setattr(handler, "_process_reply", boom)
     assert await handler._run_native() is False
     assert confirmed == []
+
+
+@pytest.mark.asyncio
+async def test_a_first_history_page_without_a_marker_is_an_error():
+    fake = FakeGmail()
+    p = provider(fake)
+    await p.get_replies()
+    p.confirm_read()
+    fake.history = {"100": [{"history": [], "nextPageToken": "1"}, {"history": [], "historyId": "999"}]}
+    with pytest.raises(GmailError):
+        await p.get_replies()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_recheck_keeps_the_marker_and_tries_again():
+    fake = FakeGmail()
+    p = provider(fake)
+    await p.get_replies()
+    p.confirm_read()                                          # marker 100, recheck due
+    fake.history = {"100": [{"historyId": "100"}]}
+    original = fake.__call__
+
+    async def week_down(method, path, **kw):
+        if path == "/messages":
+            return None
+        return await original(method, path, **kw)
+    p._request = week_down
+    with pytest.raises(GmailError):
+        await p.get_replies()
+    p.confirm_read()                                          # nothing to confirm
+    assert p._history_id == "100" and p._verify_week is True
+    p._request = fake
+    fake.calls.clear()
+    await p.get_replies()
+    assert fake.paths() == ["/history", "/messages"]          # the recheck runs again
+
+
+@pytest.mark.asyncio
+async def test_an_expired_marker_during_the_recheck_reads_the_week_and_rechecks_after():
+    fake = FakeGmail()
+    p = provider(fake)
+    await p.get_replies()
+    p.confirm_read()
+    fake.history = {"100": 404}
+    fake.profile_history = "200"
+    await p.get_replies()
+    p.confirm_read()
+    assert p._history_id == "200" and p._verify_week is True
+
+
+@pytest.mark.asyncio
+async def test_the_recheck_keeps_what_history_just_fetched_cached():
+    fake = FakeGmail()
+    fake.messages = {"old": message("old")}                   # moved in, older than the week
+    p = provider(fake)
+    await p.get_replies()
+    p.confirm_read()
+    fake.history = {"100": [{"history": [added("old", key="labelsAdded")], "historyId": "101"}]}
+    await p.get_replies()
+    assert "old" in p._read_cache
