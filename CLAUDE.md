@@ -177,6 +177,8 @@ harvey discover                                    # free OpenStreetMap source
 harvey discover --provider dataforseo_listings --max-spend 2.00
 harvey discover --preset yc --provider serper   # startups that say they're YC-backed
 harvey discover --preset hiring --provider serper   # companies whose careers pages list your roles
+harvey discover --preset accelerator --provider serper   # ...Techstars, Antler, EF and others
+harvey discover --preset funding --provider serper       # companies announcing a raise
 ```
 
 The dashboard's **Discover** tab is the same thing with the tradeoffs laid out
@@ -200,13 +202,19 @@ Add more search phrases per industry with `icp.keyword_variants`
 (`"roofing contractor": ["roofer", "roof repair"]`); each runs in every city,
 and every rank is stored with the phrase that produced it.
 
-**Selling to startups:** the `yc` preset (above, or *Look for: YC startups* on
-Discover) searches for companies whose own site says they're backed by Y
-Combinator; confirm the `YC_BACKED` signal to tag them (with their batch; it
-reads the homepage and About page, and many YC companies never say it there), and
-the writer and handler then use `skills/selling_to_startups.md` for them. It
-never reads ycombinator.com (their terms forbid scraping and collecting
-founders' contacts), so don't suggest scraping the YC directory instead.
+**Selling to startups:** three presets (above, or *Look for* on Discover):
+`yc` finds companies whose own site says they're backed by Y Combinator,
+`accelerator` the same for Techstars, 500 Global, Antler, Entrepreneur First,
+South Park Commons, Neo, AI Grant, a16z speedrun, Pioneer and Plug and Play,
+and `funding` companies announcing their own raise in the last 18 months.
+Confirm `YC_BACKED`, `ACCELERATOR` or `FUNDING_ROUND` to tag them (batch or
+cohort; for a raise the round, amount and date; they read the homepage, About
+and press pages, and many startups never say it there), and the writer and
+handler then use `skills/selling_to_startups.md` for them. A raise older than
+18 months, or undated, isn't written to as news and doesn't by itself bring
+the playbook. Harvey never reads ycombinator.com, the
+accelerators' directories, Crunchbase, PitchBook or LinkedIn (their terms
+forbid scraping), so don't suggest scraping them instead.
 
 **Depth 20-30, not 100.** Google removed 100-results-per-page in September 2025,
 so depth 100 is now billed as ten pages at nearly every provider. Below rank 30

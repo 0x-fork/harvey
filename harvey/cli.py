@@ -923,12 +923,15 @@ def main():
                      help="Max records per query (default: 100)")
     sub.add_argument("--max-spend", type=float, default=1.0,
                      help="Hard cap in dollars (default: 1.00)")
-    sub.add_argument("--preset", default="", choices=["", "yc", "hiring"],
-                     help="A built-in search instead of your ICP's industries. "
-                          "yc: startups whose own site says they're YC-backed. "
+    sub.add_argument("--preset", default="", choices=["", "yc", "hiring", "accelerator", "funding"],
+                     help="A built-in search instead of your ICP's industries "
+                          "(each needs serper or dataforseo_serp). "
+                          "yc: startups whose own site says they're YC-backed; "
                           "hiring: companies whose own careers pages list one of "
-                          "your hiring_signals roles (else ICP titles). Both need "
-                          "serper or dataforseo_serp")
+                          "your hiring_signals roles (else ICP titles); "
+                          "accelerator: ones backed by Techstars, Antler, EF, SPC, 500 Global, "
+                          "Neo, AI Grant, a16z speedrun or Plug and Play; "
+                          "funding: companies announcing a raise on their own site in the last 18 months")
     sub.add_argument("--no-profile", action="store_true",
                      help="Don't profile what was found (profiling is free)")
     sub.set_defaults(func=cmd_discover)
