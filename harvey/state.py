@@ -1100,6 +1100,21 @@ class StateManager:
                 continue
         return texts
 
+    async def count_due_cold_outbox(self, due_before: str) -> int:
+        """Approved cold email due by ``due_before``, leaving out follow-ups
+        whose previous step hasn't gone out yet (as get_outbox's
+        skip_unready_follow_ups does)."""
+        sql = ("SELECT COUNT(*) FROM outbox o WHERE o.status = 'approved' "
+               "AND o.kind = 'sequence' AND (o.send_at IS NULL OR o.send_at <= ?) "
+               "AND NOT (o.step > 1 AND EXISTS ("
+               "SELECT 1 FROM outbox p WHERE p.prospect_id = o.prospect_id "
+               "AND p.campaign_id = o.campaign_id AND p.kind = 'sequence' "
+               "AND p.step = o.step - 1 "
+               "AND p.status IN ('pending_review', 'approved', 'sending')))")
+        async with self._connect() as db:
+            async with db.execute(sql, (due_before,)) as cursor:
+                return (await cursor.fetchone())[0]
+
     async def get_outbox_item(self, item_id: str) -> dict | None:
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row

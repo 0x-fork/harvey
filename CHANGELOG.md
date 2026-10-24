@@ -127,6 +127,16 @@ minor versions can still change behaviour.
   off), cold email still sends, and `harvey run`, `harvey status` and the
   Outbox tab warn until it's set. The opt-out line must ask for a reply
   Harvey recognises and can't contain a link. Based on #13 by Camilo Cruz.
+- **The Today page and `harvey status` say when Precleared is holding cold
+  email.** When the check can't be made (its free checks for the day are used
+  up, the key is out of checks or was rejected, or Precleared can't be
+  reached), cold email still waits and replies still go out, but this used to
+  reach only the log, so cold email just went out slower. Harvey now records
+  the hold, and the Today page and `harvey status` say how many cold emails
+  are waiting and what fixes it: a free key, a pack for that key (the checkout
+  link from Precleared's answer), or nothing but time. The next fresh answer
+  clears it, a hold not seen for a day is ignored, and switching the check
+  off clears it. (from #57 by gabrielaoimevbore-beep)
 
 ### Changed
 
@@ -159,6 +169,15 @@ minor versions can still change behaviour.
   Gmail's history marker has expired, and once a day as a backstop.
 
 ### Fixed
+
+- **LinkedIn-profile web searches run only when LinkedIn prospecting is on**
+  (from #60 by FreemanGT). Searching `site:linkedin.com/in` for your titles
+  found names with no company and no email, which Harvey can never verify
+  or write to, and they counted toward the "no usable emails" check that
+  pauses prospecting for the day. It also ran first and could use up the
+  cycle's three searches before company discovery, which finds people you
+  can email, got any. That search now runs only when LinkedIn prospecting
+  is on (`channels.linkedin.enabled`, off by default) with a LinkedIn login.
 
 - **Dashboard actions work in Safari and Firefox** (from #80 by 0SansNom).
   Confirming signals, approving the Outbox and saving settings all failed
@@ -373,6 +392,19 @@ minor versions can still change behaviour.
   go out. One check per address, cached for 30 days; changing the sender
   country, address source or product description triggers a fresh check. The
   receipt id is logged with each send. Native providers only. Off by default.
+- **`harvey setup` offers the Precleared check** (from #46 by
+  gabrielaoimevbore-beep). A new optional last step
+  asks whether to turn the check on, where your business is based (GB or US)
+  and, if your prospects are all in one country, which one (answering "no"
+  there asks before saving it as Norway's code). It then offers a
+  free `PRECLEARED_API_KEY` (hidden input, saved to `.env`; 25 checks a day
+  instead of 10). Off unless you say yes. Re-running setup offers your saved
+  answers as the defaults, so pressing Enter never switches the check off. The
+  Claude-guided setup in CLAUDE.md offers the same step. Setup now reads and
+  saves `harvey.local.yaml` when it exists (it's what `harvey train` writes,
+  and the file Harvey reads), not the `harvey.yaml` it shadows, so its answers
+  take effect; if it can't save the file it says so instead of ticking the
+  summary.
 - **Cohort builder pagination and CSV export.** The cohort table on the
   Signals tab used to stop at the first 50 matches with no way to see the
   rest. It now pages with Prev / Next ("Showing 51–100 of 147"), and an
