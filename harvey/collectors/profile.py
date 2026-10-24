@@ -14,7 +14,7 @@ import logging
 from html import unescape as html_unescape
 import random
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -281,9 +281,11 @@ class _ProgramClaims:
     follow "a <program>" ("a YC company"), ``programs`` its own events and
     pages that are mentions, not backing (Startup School, Demo Day)."""
 
-    def __init__(self, prog: str, batch: str, nouns: str, programs: str, extra: str = ""):
+    def __init__(self, prog: str, batch: str, nouns: str, programs: str, extra: str = "",
+                 strict: bool = False):
         self.mention = re.compile(rf"\b{prog}\b", re.I)
         self.extra = extra          # more shapes after the subject (accelerators only)
+        self.strict = strict        # an event is never backing, even with a year ("Startup Weekend 2019")
         # a whole line that is a badge: backing words or a batch, not a bare name
         self.badge = re.compile(
             rf"^\(?\s*(?:(?:backed|funded|supported)\s+by\s+{prog}(?:\s*[\(\[]?\s*{batch}\s*[\)\]]?)?"
@@ -331,7 +333,7 @@ class _ProgramClaims:
                 match = None
             ok = bool(self.badge.match(sentence) or match or self.investors.search(sentence)
                       or self.leading.search(sentence))
-            if ok and not found and self.programs.search(sentence):
+            if ok and (not found or self.strict) and self.programs.search(sentence):
                 ok = False      # Startup School, Demo Day, a YC blog: a program, not backing
             if ok:
                 found_in.append(found)
@@ -423,12 +425,15 @@ def yc_backed(html: str, domain: str = "") -> tuple[str, float] | None:
 # not "Neo4j" or "Neo Capital"; "AI Grant" but not "an AI grant"; "500
 # Startups" but not "500 startups". Their own sites are never prospects
 # (discover.JUNK_DOMAIN_PATTERNS).
-_NOT_NAMED = r"(?![\w-]|\.\w|\s+(?-i:[A-Z]))"     # not Neo4j, Neo.js, Neo Capital
+# Not Neo4j, Neo.js, Neo Capital, Antler Homes, "the Pioneer of", "the
+# Pioneer dealer network": only a few words may follow the bare name.
+_NOT_NAMED = (r"(?![\w-]|\.\w|\s+(?!(?:and|or|in|as|with|since|from|to|alongside|plus|batch|cohort|company"
+              r"|startup|portfolio|alumni|alums?|backed|funded|residency|program)\b)[\w])")
 ACCELERATORS = (
     ("Techstars", r"Techstars"),
-    ("500 Global", r"(?:500\s+Global|(?-i:500\s+Startups))"),
-    ("Antler", r"(?-i:Antler)(?![\w-])"),
-    ("Entrepreneur First", r"Entrepreneur\s+First"),
+    ("500 Global", r"(?-i:500\s+(?:Global(?!\s+[a-z]+s\b)|Startups))"),     # not "500 Global retailers"
+    ("Antler", rf"(?-i:Antler){_NOT_NAMED}"),
+    ("Entrepreneur First", r"(?-i:Entrepreneur\s+First)"),
     ("South Park Commons", r"South\s+Park\s+Commons"),
     ("Neo", rf"(?-i:Neo){_NOT_NAMED}"),
     ("AI Grant", r"(?-i:AI\s+Grant)"),
@@ -440,7 +445,8 @@ _ACC_BATCH = r"(?:['’]?\d{2}|20\d{2}|(?-i:SR)\s*\d{1,3})"
 _ACC_NOUNS = r"company|startup|portfolio company|alumn(?:us|i|a)"
 _ACC_EVENTS = (r"startup weekend|startup week|startup digest|summit|expo|events?|conference|podcast|blog"
                r"|news|newsletter|jobs|applications?|mentors?|demo day|office hours")
-_CITY = r"(?:\s+(?-i:[A-Z][a-z]+)){0,2}"           # "Techstars Boulder", "Techstars Anywhere Fall"
+# "Techstars Boulder", "Techstars Anywhere Fall"; never one of its events.
+_CITY = r"(?:\s+(?!(?:Startup|Demo|Summit|Expo|Weekend|Week|Day|Conference|Podcast)\b)(?-i:[A-Z][a-z]+)){0,2}"
 
 
 def _cohort_finder(prog: str):
@@ -479,7 +485,8 @@ _ACC_EXTRA = (
     r"(?:alumni|alums?|graduates)\s+of\s+(?:the\s+)?{prog}\b"
     r"|(?:\s+founded,?)?\s+(?:joins|enters|graduates from)\s+(?:the\s+)?{prog}\b"
 )
-_ACC_CLAIMS = tuple((name, _ProgramClaims(prog, _ACC_BATCH, _ACC_NOUNS, _ACC_EVENTS, _ACC_EXTRA.format(prog=prog)),
+_ACC_CLAIMS = tuple((name, _ProgramClaims(prog, _ACC_BATCH, _ACC_NOUNS, _ACC_EVENTS, _ACC_EXTRA.format(prog=prog),
+                                           strict=True),
                      _cohort_finder(prog))
                     for name, prog in ACCELERATORS)
 # A logo wall: a "Backed by" / "Investors" label, then the program's logo
@@ -491,6 +498,7 @@ _WALL_LABEL_RE = re.compile(
     r"""(?:\s+(?:and|&)\s+partners?)?(?:\s+logos?)?)\s*:?\s*(?:<|["'])""", re.I)
 _WALL_SPAN, _WALL_TEXT = 4000, 300
 _SECTION_END_RE = re.compile(r"(?i)<h[1-6]\b|</section>")
+_OTHER_WALL_RE = re.compile(r"(?i)\b(?:customers?|clients?|partners?|trusted by|used by|featured in|as seen)\b")
 
 
 def _on_logo_wall(html: str, prog: str) -> bool:
@@ -499,7 +507,8 @@ def _on_logo_wall(html: str, prog: str) -> bool:
         end = label.end() + _WALL_SPAN
         stop = _SECTION_END_RE.search(html, label.end(), end)
         m = logo.search(html, label.end(), stop.start() if stop else end)
-        if m and len(_text(html[label.end():m.start()]).strip()) <= _WALL_TEXT:
+        between = _text(html[label.end():m.start()]).strip() if m else ""
+        if m and len(between) <= _WALL_TEXT and not _OTHER_WALL_RE.search(between):
             return True
     return False
 
@@ -532,13 +541,17 @@ def accelerators(html: str, domain: str = "") -> list[tuple[str, str, float]]:
 _ROUND = (r"(pre[\s-]?seed|seed(?=[\s-]+(?:round|funding|financing|investment|extension|capital)\b"
           r"|\s*(?:[,.;:)]|$|\s+(?:led|from|with|in|on|by|to|and)\b))"
           r"|series\s+[a-h](?![\w-])|bridge(?=\s+round)|growth(?=\s+round))")
-_AMOUNT = r"([$€£])\s?(\d[\d,]*(?:\.\d+)?)\s?(k|mm|mn|m|bn|b|million|billion|thousand)?(?!\w)"
-_MULTIPLIER = {"k": 1e3, "thousand": 1e3, "m": 1e6, "mm": 1e6, "mn": 1e6, "million": 1e6,
+_AMOUNT = r"([$€£])\s?(\d[\d,]*(?:\.\d+)?)\s?(k|mm|mn|mio|m|bn|b|million|billion|thousand)?(?!\w)"
+# "1,2 Mio Euro", "5 million dollars": the currency after the number.
+_AMOUNT_WORD = (r"(\d[\d,]*(?:\.\d+)?)\s?(k|mm|mn|mio|m|bn|b|million|billion|thousand)\s+"
+                r"(euros?|eur|usd|dollars?|gbp|pounds?)\b")
+_CURRENCY = {"eur": "€", "euro": "€", "euros": "€", "usd": "$", "dollar": "$", "dollars": "$",
+             "gbp": "£", "pound": "£", "pounds": "£"}
+_MULTIPLIER = {"k": 1e3, "thousand": 1e3, "m": 1e6, "mm": 1e6, "mn": 1e6, "mio": 1e6, "million": 1e6,
                "b": 1e9, "bn": 1e9, "billion": 1e9}
 _ROUND_RANK = {"Pre-seed": 1, "Seed": 2, "Bridge": 3}
-_FUNDING_WORDS = re.compile(rf"\b(?:funding|financing|investment round|round)\b|\b{_ROUND}", re.I)
 _CLAUSE = r"(?:[^.!?]|\.(?=\d))"     # the rest of the sentence; "$4.5M" isn't its end
-_RAISE_VERB = (r"(?:raised|raises|closed|closes|secured|secures|landed|lands|completed|completes"
+_RAISE_VERB = (r"(?P<verb>raised|raises|closed|closes|secured|secures|landed|lands|completed|completes"
                r"|announced|announces)")
 _ANNOUNCE = (r"(?:(?:today,?\s+)?we(?:['’]re|\s+are)\s+(?:\w+\s+)?(?:excited|thrilled|proud|happy|delighted|pleased)"
              r"\s+to\s+(?:announce|share)(?:\s+that)?\s+)")
@@ -548,9 +561,24 @@ _LEAD_IN = (r"(?:(?:today|update|news|announcement)\s*[,:]?\s+"
 _NOT_THEIR_RAISE = re.compile(
     r"\b(?:for|on behalf of|across)\s+(?:our\s+|their\s+|its\s+)?(?:clients?|customers?|founders?|startups?"
     r"|companies|portfolio|charity|charities|nonprofits?|members?|users?|causes?|families)\b"
-    r"|(?<!\bto )\bfund\b(?!\s+(?:our|the|its|their)\b)|\bto invest\b|\bthe bar\b", re.I)
+    r"|(?<!\bto )\bfund\b(?!\s+(?:our|the|its|their)\b)|\bto invest\b|\bthe bar\b"
+    # an investor's site: "our Series A investment in Acme", "a seed round for Acme"
+    r"|\b(?:investment|round|funding|stake)\s+(?:in|into|for)\s+(?!our\b|us\b)(?-i:[A-Z])"
+    r"|\bportfolio compan", re.I)
+# With no round named, money is a raise only when the sentence says so
+# (funding, investors, led by) or "we raised $XM" says it plainly; never
+# loans, verdicts, deals or donations (law firms, brokers and builders
+# are Harvey's prospects too), or money raised for someone.
 _NOT_FUNDING_MONEY = re.compile(
-    r"\b(?:arr|mrr|revenue|sales|bookings|pipeline|contracts?|deals?|orders?|savings|grants?)\b", re.I)
+    r"\b(?:arr|mrr|revenue|sales|bookings|pipeline|contracts?|deals?|orders?|savings|grants?|loans?|mortgages?"
+    r"|verdicts?|settlements?|judgments?|transactions?|projects?|volume|worth|donations?|donated|charity"
+    r"|charities|gala|auction|fundraiser|scholarships?|claims?|recover(?:ed|ies|y)|properties|homes|listings"
+    r"|awards?|for)\b", re.I)
+_FUNDING_EVIDENCE = re.compile(
+    r"\b(?:funding|investment|financing|led by|co-led by|investors?|venture|backed by)\b", re.I)
+# A date in another clause ("..., and in March 2025 we launched") isn't the raise's.
+_CLAUSE_END_RE = re.compile(r",\s+(?:and|but|while|then|before|after|since)\b|;|\s+and\s+(?:in|on|then|later)\b",
+                            re.I)
 _MONTHS = {m: i for i, m in enumerate(
     ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), 1)}
 _MONTH_DATE_RE = re.compile(
@@ -582,10 +610,27 @@ def _sentence_date(sentence: str) -> str:
     return m.group(1) if m else ""
 
 
+_ARTICLE_PATH_RE = re.compile(
+    r"/(?:press|news|newsroom|blog|posts?|announc\w*|stories|updates|articles?|insights)(?:[/-]|$)", re.I)
+_ARTICLE_TYPE_RE = re.compile(
+    r'"@type"\s*:\s*\[?\s*"(?:NewsArticle|BlogPosting|Article|PressRelease|ReportageNewsArticle|TechArticle)"')
+
+
+def _not_future(when: str) -> str:
+    """A date after today isn't when a raise happened ("to expand in 2027")."""
+    return "" if when and when > date.today().isoformat()[:len(when)] else when
+
+
 def _page_date(html: str, url: str) -> str:
     """When the page itself was published: its structured data, its article
     meta tag, a date in its URL, or its one <time> (a listing page full of
-    dates says nothing about any one claim)."""
+    dates says nothing about any one claim). Only for an article: a press,
+    news or blog URL, or an article type in its structured data. A homepage,
+    About or careers page carries dates that aren't any raise's."""
+    path = urlparse(url or "").path
+    if not (_ARTICLE_PATH_RE.search(path) or _ARTICLE_TYPE_RE.search(html)
+            or any(r.search(path) for r in _URL_DATE_RES)):
+        return ""
     m = _JSONLD_DATE_RE.search(html)
     if m:
         return m.group(1)
@@ -601,16 +646,27 @@ def _page_date(html: str, url: str) -> str:
     return times.pop() if len(times) == 1 else ""
 
 
-def _amount(match) -> str:
-    """"$2,500,000" → "$2.5M", "€8m" → "€8M"."""
+def _amount(symbol: str, number: str, suffix: str) -> str:
+    """"$2,500,000" → "$2.5M", "€8m" → "€8M", "€1,2M" → "€1.2M"."""
+    suffix = (suffix or "").lower()
+    if suffix and re.fullmatch(r"\d{1,3},\d{1,2}", number):
+        number = number.replace(",", ".")       # a decimal comma before a unit
     try:
-        value = float(match.group(2).replace(",", "")) * _MULTIPLIER.get((match.group(3) or "").lower(), 1)
+        value = float(number.replace(",", "")) * _MULTIPLIER.get(suffix, 1)
     except ValueError:
         return ""
     for div, unit in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
         if value >= div:
-            return f"{match.group(1)}{round(value / div, 2):g}{unit}"
-    return f"{match.group(1)}{value:g}"
+            return f"{symbol}{round(value / div, 2):g}{unit}"
+    return f"{symbol}{value:g}"
+
+
+def _amount_in(text: str) -> str:
+    m = re.search(_AMOUNT, text, re.I)
+    if m:
+        return _amount(m.group(1), m.group(2), m.group(3))
+    m = re.search(_AMOUNT_WORD, text, re.I)
+    return _amount(_CURRENCY[m.group(3).lower()], m.group(1), m.group(2)) if m else ""
 
 
 def _round_name(text: str) -> str:
@@ -648,24 +704,24 @@ def funding_round(html: str, domain: str = "", url: str = "") -> dict | None:
         if not m:
             continue
         rest = m.group("rest")
+        end = _CLAUSE_END_RE.search(rest)
+        rest = rest[:end.start()] if end else rest
         if _NOT_THEIR_RAISE.search(rest):
             continue
         rnd = re.search(rf"\b{_ROUND}", rest, re.I)
-        amt = re.search(_AMOUNT, rest, re.I)
-        amount = _amount(amt) if amt else ""
-        # A big number with no round named is a raise, unless it's revenue
-        # ("we closed $5M in ARR").
-        big = amount[-1:] in ("M", "B") and not _NOT_FUNDING_MONEY.search(rest)
-        if not (rnd or big or (amount and _FUNDING_WORDS.search(rest))):
-            continue
-        claims.append({"round": _round_name(rnd.group(1)) if rnd else "", "amount": amount,
-                       "date": _sentence_date(sentence)})
+        amount = _amount_in(rest)
+        if not rnd:
+            plain = (m.groupdict().get("verb") or "").lower().startswith("rais") and amount[-1:] in ("M", "B")
+            if not amount or _NOT_FUNDING_MONEY.search(rest) or not (plain or _FUNDING_EVIDENCE.search(rest)):
+                continue
+        when = _not_future(_sentence_date(sentence[:m.start("rest")] + rest))
+        claims.append({"round": _round_name(rnd.group(1)) if rnd else "", "amount": amount, "date": when})
     if not claims:
         return None
     # The page's own date belongs to what the page announces: its only raise,
     # or the one its title names. A seed post that links to the later Series
     # A doesn't date the Series A.
-    page_date = _page_date(html, url)
+    page_date = _not_future(_page_date(html, url))
     if page_date:
         undated = [c for c in claims if not c["date"]]
         title = _page_title(html)
@@ -1010,20 +1066,20 @@ class ProfileCollector:
                 add("YC_BACKED", num=1 if yc else 0, text=yc[0] if yc else "",
                     conf=yc[1] if yc else 1.0, url=where if yc else site)
 
-        # Another accelerator, the same way and with the same rule for a
-        # preset's search hit.
+        # Another accelerator, the same way. Unlike YC, a preset's search hit
+        # doesn't outlast a profile that finds nothing: the search phrases
+        # name programs that are also ordinary words ("backed by Neo" matches
+        # "backed by Neo Capital"), so the hit alone is weaker evidence.
         if self.wants("ACCELERATOR"):
             programs, where = accelerators(home, domain), site
             if not programs:
                 about_url, about_html = await about()
                 if about_html:
                     programs, where = accelerators(about_html, domain), about_url
-            searched = not programs and await self._search_hit(company_id, "ACCELERATOR")
-            if programs or not searched:
-                add("ACCELERATOR", num=1 if programs else 0,
-                    text="; ".join(f"{p} {c}".strip() for p, c, _ in programs),
-                    conf=max(c for _, _, c in programs) if programs else 1.0,
-                    url=where if programs else site)
+            add("ACCELERATOR", num=1 if programs else 0,
+                text="; ".join(f"{p} {c}".strip() for p, c, _ in programs),
+                conf=max(c for _, _, c in programs) if programs else 1.0,
+                url=where if programs else site)
 
         # A raise they announced: the homepage, the page a search found on
         # their own site (a funding-preset hit is usually the announcement),

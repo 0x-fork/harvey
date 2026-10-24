@@ -85,7 +85,7 @@ JUNK_DOMAIN_PATTERNS = tuple(re.compile(p, re.I) for p in (
     r"^(jobs|careers)\.((co|com|org|net|ac)\.)?[a-z]{2,}$",
     # accelerators' own sites (the accelerator preset's noise)
     r"(^|\.)(techstars|antler|joinef|southparkcommons|aigrant|a16z|pioneer|plugandplaytechcenter|plugandplay)\.",
-    r"(^|\.)500\.co$",
+    r"(^|\.)(500\.co|neo\.com)$",
     # funding news, wires and round trackers (the funding preset's noise)
     r"(^|\.)(prnewswire|businesswire|globenewswire|accesswire|einpresswire|newswire|finsmes|axios)\.",
     r"(^|\.)(venturebeat|siliconangle|eu-startups|sifted|geekwire|thesaasnews|fortune|bloomberg)\.",
@@ -1061,9 +1061,11 @@ PRESETS = {
             '{industry} ("backed by Techstars" OR "backed by Antler" OR "backed by Entrepreneur First" '
             'OR "backed by South Park Commons" OR "backed by 500 Global") '
             "-site:linkedin.com -site:crunchbase.com",
+            # Not "backed by Pioneer": it finds Pioneer Square Labs and Pioneer
+            # Fund (the profile still reads a Pioneer claim on the page).
             '{industry} ("backed by Neo" OR "backed by AI Grant" OR "a16z speedrun" '
-            'OR "backed by Pioneer" OR "backed by Plug and Play") '
-            "-site:linkedin.com -site:crunchbase.com -site:a16z.com",
+            'OR "backed by Plug and Play") '
+            "-site:linkedin.com -site:crunchbase.com -site:a16z.com -site:neo.com",
         ),
         "local": False,
     },

@@ -225,7 +225,7 @@ parts:
   | Preset | Finds | Signal |
   |---|---|---|
   | `yc` (*YC startups*) | Companies whose own site says they're backed by Y Combinator | `YC_BACKED`, with the batch (W24, S23) |
-  | `accelerator` (*Accelerator startups*) | Ones backed by Techstars, 500 Global, Antler, Entrepreneur First, South Park Commons, Neo, AI Grant, a16z speedrun, Pioneer or Plug and Play (two searches per industry) | `ACCELERATOR`, with the program and cohort ("Techstars 2024") |
+  | `accelerator` (*Accelerator startups*) | Ones backed by Techstars, 500 Global, Antler, Entrepreneur First, South Park Commons, Neo, AI Grant, a16z speedrun or Plug and Play (two searches per industry; the signal also reads Pioneer) | `ACCELERATOR`, with the program and cohort ("Techstars 2024") |
   | `funding` (*Recently funded*) | Companies announcing their own raise ("we raised", "announces $X Series A") in the last 18 months, news sites and funding databases excluded | `FUNDING_ROUND`: round, amount and date |
 
   `harvey discover --preset accelerator --provider serper`, or the *Look for*
@@ -238,11 +238,16 @@ parts:
   and audience lines ("trusted by YC-backed startups", "we help founders raise
   their seed round") don't count. Many startups never say it on their site, so
   these find the ones that do; a YC or accelerator preset hit counts as a yes too.
-  A raise's date comes from the sentence or the page's publish date; older than
-  18 months, the writer is told it isn't news.
-- **The writing:** for those prospects the writer and reply handler use
-  `skills/selling_to_startups.md`, a playbook for writing to founders, with a
-  section on writing to companies that just raised.
+  A raise's date comes from its own clause, or from the publish date of a
+  press, news or blog post. Money that isn't a raise (loans closed, verdicts
+  won, money raised for a charity, an investor's round in another company)
+  doesn't count.
+- **The writing:** the writer and reply handler use
+  `skills/selling_to_startups.md`, a playbook for writing to founders with a
+  section on companies that just raised, for YC- and accelerator-backed
+  companies and for raises dated within the last 18 months. An older or
+  undated raise alone doesn't bring the playbook, and is never written to as
+  news.
 
 Harvey never reads ycombinator.com, the accelerators' directories, Crunchbase,
 PitchBook or LinkedIn, whose terms forbid scraping them; everything comes from

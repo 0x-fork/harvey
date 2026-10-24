@@ -930,7 +930,7 @@ def main():
                           "hiring: companies whose own careers pages list one of "
                           "your hiring_signals roles (else ICP titles); "
                           "accelerator: ones backed by Techstars, Antler, EF, SPC, 500 Global, "
-                          "Neo, AI Grant, a16z speedrun, Pioneer or Plug and Play; "
+                          "Neo, AI Grant, a16z speedrun or Plug and Play; "
                           "funding: companies announcing a raise on their own site in the last 18 months")
     sub.add_argument("--no-profile", action="store_true",
                      help="Don't profile what was found (profiling is free)")

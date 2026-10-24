@@ -2,8 +2,8 @@
 
 Used when a prospect's company says on its own site that it is backed by
 Y Combinator (YC_BACKED) or another accelerator such as Techstars, Antler or
-Entrepreneur First (ACCELERATOR), or that it has raised a round
-(FUNDING_ROUND), and for replies from those founders. Everything here sits
+Entrepreneur First (ACCELERATOR), or that it raised a round in the last 18
+months (FUNDING_ROUND), and for replies from those founders. Everything here sits
 under the strict email rules: those still win.
 
 ## Who is reading

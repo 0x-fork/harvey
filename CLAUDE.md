@@ -211,7 +211,8 @@ Confirm `YC_BACKED`, `ACCELERATOR` or `FUNDING_ROUND` to tag them (batch or
 cohort; for a raise the round, amount and date; they read the homepage, About
 and press pages, and many startups never say it there), and the writer and
 handler then use `skills/selling_to_startups.md` for them. A raise older than
-18 months isn't written to as news. Harvey never reads ycombinator.com, the
+18 months, or undated, isn't written to as news and doesn't by itself bring
+the playbook. Harvey never reads ycombinator.com, the
 accelerators' directories, Crunchbase, PitchBook or LinkedIn (their terms
 forbid scraping), so don't suggest scraping them instead.
 

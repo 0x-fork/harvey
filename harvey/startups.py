@@ -1,10 +1,12 @@
 """What Harvey knows about a prospect's company as a startup.
 
-Three profile signals mark one: YC_BACKED, ACCELERATOR and FUNDING_ROUND,
-each read off the company's own site. The writer and the reply handler use
-the founder playbook (skills/selling_to_startups.md) for any of them, and
-these facts go into the writer's prompt as they are. A raise carries its
-date, because "just raised" is only an angle while it's true.
+Three profile signals mark one, each read off the company's own site:
+YC_BACKED, ACCELERATOR, and a FUNDING_ROUND dated within the last 18
+months. The writer and the reply handler use the founder playbook
+(skills/selling_to_startups.md) for those, and these facts go into the
+writer's prompt as they are. An old or undated raise alone doesn't make a
+startup (a 2013 Series A, or a law firm's misread "$100M"), and "just
+raised" is only an angle while it's true.
 """
 
 import re
@@ -72,8 +74,9 @@ def _funding_fact(found: dict, today: date | None) -> str:
 
 async def startup_facts(state, company_id: str, today: date | None = None) -> list[str] | None:
     """Fact lines for the writer's prompt when the company is a startup
-    (YC, another accelerator, or a raise it announced), else None. A failed
-    read is just "not known to be one", never a reason not to write."""
+    (YC, another accelerator, or a raise it announced in the last 18
+    months), else None. A failed read is just "not known to be one", never
+    a reason not to write."""
     if not company_id or state is None:
         return None
     facts: list[str] = []
@@ -95,6 +98,9 @@ async def startup_facts(state, company_id: str, today: date | None = None) -> li
         facts.append(f"- Went through an accelerator: {program}, as their own site says" if program
                      else "- Went through a startup accelerator (a search matched it on their own site)")
     funding = await read("funding_round")
+    recent = funding is not None and funding_recency(funding["date"], today) == "recent"
+    if not (facts or recent):
+        return None
     if funding is not None:
         facts.append(_funding_fact(funding, today))
-    return facts or None
+    return facts

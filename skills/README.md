@@ -23,7 +23,7 @@ When an agent runs, it calls `brain.load_skills_for_agent("agent_name")` which c
 | `competitive_intel.md` | | x | x | | |
 | `selling_to_startups.md` | | x* | x* | | |
 
-\* Only for prospects whose company is a startup by its own site's account (the `YC_BACKED`, `ACCELERATOR` or `FUNDING_ROUND` signal), not loaded for everyone.
+\* Only for prospects whose company is a startup by its own site's account (the `YC_BACKED` or `ACCELERATOR` signal, or a `FUNDING_ROUND` from the last 18 months), not loaded for everyone.
 
 ## Built-in Skills
 
