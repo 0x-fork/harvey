@@ -244,27 +244,60 @@ _YC_BATCH_RES = (
     re.compile(rf"\b{_YC}(?:['’]s)?\s+{_SEASON_WORD}\s+(?:batch\s+)?(\d{{4}})\b", re.I),
     re.compile(rf"\b{_SEASON_WORD}\s+(\d{{4}})\s+batch\s+(?:of|at)\s+{_YC}\b", re.I),
     re.compile(rf"\b{_YC}\s+(?:in|during)\s+(?:the\s+)?{_SEASON_WORD}\s+(?:of\s+)?(\d{{4}})\b", re.I),
+    re.compile(rf"\b{_YC}\s+demo day\s*[\(\[]\s*(W|S|F|X)\s*'?(\d{{2}})\b", re.I),
 )
-_YC_BACKING_RE = re.compile(
-    rf"\b(?:backed by|funded by|supported by|part of|member of|graduated from|alumni of|"
-    rf"alums? of|participated in|went through|accepted into)\s+(?:the\s+)?{_YC}\b"
-    rf"|\b{_YC}[\s-]+(?:backed|funded|alumni|alums?|alumnus)\b"
-    rf"|\b(?:a|an)\s+{_YC}\s+(?:company|startup)\b"
-    rf"|\binvestors?\s*(?:include|including|:)[^.]{{0,80}}\b{_YC}\b",
+# What a claim looks like. Anchored at the start of a sentence, so the
+# company is the one being described, not a customer, a team member or an
+# audience ("trusted by YC-backed startups", "we sponsored the YC dinner").
+_BATCH = r"(?:W|S|F|X)\s*'?\d{2}"
+_BADGE_RE = re.compile(  # a whole line that is a badge: backing words or a batch, not a bare "YC"
+    rf"^\(?\s*(?:(?:backed|funded|supported)\s+by\s+{_YC}(?:\s*[\(\[]?\s*{_BATCH}\s*[\)\]]?)?"
+    rf"|{_YC}[\s-]+(?:backed|funded)(?:\s*[\(\[]?\s*{_BATCH}\s*[\)\]]?)?"
+    rf"|{_YC}\s*[\(\[]?\s*{_BATCH}\s*[\)\]]?)\s*\)?\.?$", re.I)
+_FILLER = r"(?:\s+(?:proudly|also|now|officially|recently|originally|first|both|all|so|were|was|are|is|been|have|has|had|very))*"
+_CLAIM_BODY = (
+    rf"{_FILLER}\s+(?:backed by|funded by|supported by|part of|a member of|members of|graduated from|"
+    rf"alumni of|alums? of|went through|joined|hatched (?:in|at)|incubated (?:in|at|by)|accepted into|"
+    rf"participated in|launched at|in)\s+(?:the\s+)?{_YC}\b"
+    rf"|{_FILLER}\s+in\s+the\s+{_SEASON_WORD}\s+\d{{4}}\s+batch\s+of\s+{_YC}\b"
+    rf"|{_FILLER}\s+(?:a|an)\s+{_YC}(?:\s+{_BATCH})?[\s-]+(?:(?:backed|funded)\s+)?"
+    rf"(?:company|startup|platform|product|business|team|tool)\b"
+    rf"|{_FILLER}\s+{_YC}[\s-]+(?:backed|funded|alumni|alums?|alumnus)\b"
+    rf"|\s*[\(\[]\s*{_YC}\s*{_BATCH}\s*[\)\]]"
+)
+# "in YC" only after a form of be ("we were in YC"), not "believe in YC".
+_IN_NEEDS_BE = re.compile(rf"(?<!\bwere)(?<!\bwas)(?<!\bare)(?<!\bis)(?<!\bbeen)\s+in\s+(?:the\s+)?{_YC}\b", re.I)
+_SELF_SUBJECT = (r"(?:we|we're|we are|we were|we've been|proud(?:ly)? to be|excited to be|honou?red to be"
+                 r"|the company|our company)")
+_FOUNDED_PREFIX = r"(?:founded in \d{4},?\s+)?"
+# "<subject> ... and is backed by YC", but not "...companies that are backed by YC".
+_LATER_BACKING = (rf"[^.]{{0,80}}?(?<!\bthat)(?<!\bwhich)(?<!\bwho)\s+(?:is|are|was|were|has been|have been)"
+                  rf"\s+(?:proudly\s+)?(?:backed|funded|supported)\s+by\s+{_YC}\b")
+_INVESTORS_RE = re.compile(rf"^(?:our\s+)?investors?\s*(?:include|including|are|:)[^.]{{0,80}}\b{_YC}\b", re.I)
+_LEADING_BACKING_RE = re.compile(rf"^(?:backed|funded|supported)\s+by\s+{_YC}\b", re.I)
+# A YC program right after the mention, with no batch: not backing.
+_YC_PROGRAM_RE = re.compile(
+    rf"\b{_YC}(?:['’]s)?\s+(?:startup school|demo day|application|interview|events?|podcast|blog|news|jobs|deals?|perks?)\b",
     re.I)
-# Not a claim about the company itself.
-_YC_NOT_ABOUT_US_RE = re.compile(
-    r"startup school|demo day|\bapply\b|\bapplying\b|application|portfolio|"
-    r"trusted by|used by|loved by|built for|designed for|made for|for (?:a |an )?(?:other )?"
-    rf"{_YC}|like yours|every {_YC}|\b{_YC}[\s-]+(?:backed\s+)?"
-    r"(?:startups|companies|teams|founders|customers|alumni at|alums at)\b|\bdeal for\b|\bperks?\b",
-    re.I)
-_FIRST_PERSON_RE = re.compile(
-    r"\b(?:we|we're|we've|we were|our|us)\b|\b(?:proud|excited|thrilled|honou?red) to\b", re.I)
 _ATTR_TEXT_RE = re.compile(r"""\b(?:alt|title|aria-label)=["']([^"']{0,200})["']""", re.I)
+_BLOCK_TAG_RE = re.compile(r"(?i)</?(?:p|div|h[1-6]|li|ul|ol|br|section|footer|header|nav|article|td|tr|table|blockquote|figcaption|dt|dd)\b[^>]*>")
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|\s*[|•·]\s*|\n")
-_AFFIXES = re.compile(r"^(?:get|try|use|join|go|hey|with)|(?:hq|app|ai|io|labs|inc|team)$")
+_PREFIXES = re.compile(r"^(?:get|try|use|join)(?=\w{4})")
+_SUFFIXES = re.compile(r"(?<=\w{4})hq$")
 _SECOND_LEVEL = {"co", "com", "org", "net", "ac", "gov", "edu"}
+
+
+def _lines(html: str) -> list[str]:
+    """Readable sentences, with block boundaries kept (a badge isn't run into
+    the next paragraph) and entities decoded ("Y Combinator&#x27;s W20")."""
+    text = _BLOCK_TAG_RE.sub("\n", _strip_code(html))
+    text = html_unescape(re.sub(r"(?s)<[^>]+>", " ", text))
+    text += "\n" + "\n".join(html_unescape(a) for a in _ATTR_TEXT_RE.findall(html))
+    out = []
+    for line in text.split("\n"):
+        line = re.sub(r"\s+", " ", line).strip()
+        out.extend(p.strip() for p in _SENTENCE_RE.split(line) if p.strip())
+    return out
 
 
 def _alnum(text: str) -> str:
@@ -287,8 +320,9 @@ def _is_their_yc_page(slug: str, domain: str) -> bool:
         return False
     if name == label:
         return True
-    core_name, core_label = _AFFIXES.sub("", name) or name, _AFFIXES.sub("", label) or label
-    return min(len(core_name), len(core_label)) >= 4 and core_name == core_label
+    # getacme.com / acmehq.com and the slug "acme", nothing looser.
+    core = lambda t: _SUFFIXES.sub("", _PREFIXES.sub("", t))
+    return min(len(core(name)), len(core(label))) >= 4 and core(name) == core(label)
 
 
 def _yc_batch(match) -> str:
@@ -301,26 +335,30 @@ def yc_backed(html: str, domain: str = "") -> tuple[str, float] | None:
     itself is YC-backed, else None."""
     if not html:
         return None
-    if any(_is_their_yc_page(m.group(1), domain) for m in _YC_LINK_RE.finditer(html)):
-        link = True
-    else:
-        link = False
-    # Entities decoded: "Y Combinator&#x27;s W20" must read as the batch W20.
-    readable = html_unescape(" ".join([_text(html), *_ATTR_TEXT_RE.findall(html)]))
+    link = any(_is_their_yc_page(m.group(1), domain) for m in _YC_LINK_RE.finditer(html))
     name = _domain_name(domain) if domain else ""
+    # The name as written on the page may have spaces or hyphens ("Acme Corp"
+    # for acmecorp.com): any separators between its letters.
+    spelled = r"[\s.-]?".join(re.escape(ch) for ch in _alnum(name)) if len(_alnum(name)) >= 3 else ""
+    subject = rf"(?:{_SELF_SUBJECT}" + (rf"|{spelled}\b" if spelled else "") + r")"
+    claim_re = re.compile(rf"^{_FOUNDED_PREFIX}{subject},?(?:{_CLAIM_BODY}|{_LATER_BACKING})", re.I)
     batch, claimed = "", False
-    for sentence in _SENTENCE_RE.split(readable):
-        if not re.search(rf"\b{_YC}\b", sentence, re.I) or _YC_NOT_ABOUT_US_RE.search(sentence):
-            continue
-        about_us = (len(sentence.split()) <= 6 or _FIRST_PERSON_RE.search(sentence)
-                    or (len(name) >= 3 and name in _alnum(sentence)))
-        if not about_us:
+    for sentence in _lines(html):
+        if not re.search(rf"\b{_YC}\b", sentence, re.I):
             continue
         found = next((m for r in _YC_BATCH_RES for m in [r.search(sentence)] if m), None)
-        if found and not batch:
-            batch = _yc_batch(found)
-        if found or _YC_BACKING_RE.search(sentence):
+        match = claim_re.search(sentence)
+        if match and _IN_NEEDS_BE.search(match.group(0)) and not re.search(
+                r"\bin\s+the\s+\w+\s+\d{4}\s+batch|hatched in|incubated in|participated in", match.group(0), re.I):
+            match = None
+        ok = bool(_BADGE_RE.match(sentence) or match or _INVESTORS_RE.search(sentence)
+                  or _LEADING_BACKING_RE.search(sentence))
+        if ok and not found and _YC_PROGRAM_RE.search(sentence):
+            ok = False      # Startup School, Demo Day, a YC blog: a program, not backing
+        if ok:
             claimed = True
+            if found and not batch:
+                batch = _yc_batch(found)
     if link:
         return batch, 0.95
     if claimed:

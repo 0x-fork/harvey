@@ -35,7 +35,7 @@ async def state():
 
 @pytest.mark.parametrize("html,batch", [
     ("<p>Acme is backed by Y Combinator.</p>", ""),
-    ("<span>YC-backed</span> analytics for teams", ""),
+    ("<div>YC-backed</div><p>Analytics for teams</p>", ""),
     ("<h2>Acme (YC W24)</h2>", "W24"),
     ("<p>Proud to be part of Y Combinator's Summer 2023 batch</p>", "S23"),
     ("<footer>Y Combinator S21</footer>", "S21"),
@@ -459,3 +459,56 @@ async def test_a_mixed_batch_doesnt_get_founder_framing(state):
     w.skills = ""
     await w._write_sequence([yc, plain])
     assert "SELLING TO STARTUP FOUNDERS" not in brain.prompts[0]
+
+
+
+# ── second review: anchored claims ──
+
+
+@pytest.mark.parametrize("html,domain", [
+    ("<p>Smart, independent teams love it, backed by Y Combinator alumni.</p>", "art.com"),
+    ("<p>Most went through Y Combinator and use it every day.</p>", "ever.com"),
+    ("<p>Teams at Linear and Ramp are YC alumni.</p>", "linear.app"),
+    ("<p>Notion is backed by Y Combinator? No, but Stripe is.</p>", "stripe.com"),
+    ("<p>We sponsored the YC W24 batch dinner.</p>", "acme.com"),
+    ("<p>Our team previously founded a YC-funded startup.</p>", "acme.com"),
+    ("<p>We're hiring ex-YC alumni.</p>", "acme.com"),
+    ("<h3>YC W24 recap</h3>", "acme.com"),
+    ("<h3>YC-backed jobs</h3>", "acme.com"),
+    ("<h3>YC alumni</h3>", "acme.com"),
+    ("<p>Our podcast with YC alumni</p>", "acme.com"),
+    ("<p>We believe in Y Combinator's mission.</p>", "acme.com"),
+])
+def test_mentions_that_arent_the_company_saying_it(html, domain):
+    assert yc_backed(html, domain=domain) is None
+
+
+@pytest.mark.parametrize("html,batch", [
+    ("<p>Acme (YC S23) builds application security tools.</p>", "S23"),
+    ("<p>Acme is backed by Y Combinator and used by 1,000 clinics.</p>", ""),
+    ("<p>We're YC-backed and offer great perks.</p>", ""),
+    ("<p>Acme is a YC-backed platform built for dentists.</p>", ""),
+    ("<p>Backed by Y Combinator and trusted by 500 teams.</p>", ""),
+    ("<p>We launched at YC Demo Day (W24).</p>", "W24"),
+    ("<p>We were incubated at Y Combinator.</p>", ""),
+])
+def test_claims_with_other_words_nearby_still_count(html, batch):
+    got = yc_backed(html, domain="acme.com")
+    assert got is not None and got[0] == batch
+
+
+@pytest.mark.parametrize("slug,domain", [("open", "openapp.com"), ("labs", "labsinc.com")])
+def test_generic_slugs_dont_match_by_stripping_affixes(slug, domain):
+    from harvey.collectors.profile import _is_their_yc_page
+    assert _is_their_yc_page(slug, domain) is False
+
+
+@pytest.mark.parametrize("html,domain,yes", [
+    ("<p>Acme Corp was founded in 2021 and is backed by Y Combinator, General Catalyst and others.</p>",
+     "acmecorp.com", True),
+    ("<p>Founded in 2021, the company is backed by Y Combinator and General Catalyst.</p>", "acme.com", True),
+    ("<p>Acme helps teams at companies that are backed by Y Combinator.</p>", "acme.com", False),
+    ("<p>Acme works with startups which are funded by YC.</p>", "acme.com", False),
+])
+def test_third_person_claims_about_the_company(html, domain, yes):
+    assert (yc_backed(html, domain=domain) is not None) is yes
