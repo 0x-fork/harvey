@@ -161,7 +161,7 @@ class SendWindowConfig(BaseModel):
 
     start: str = "08:00"
     end: str = "17:00"
-    weekdays_only: bool = True
+    weekdays_only: bool = True     # Monday to Friday, in every country
     recipient_timezone: bool = True
 
     @field_validator("start", "end", mode="before")

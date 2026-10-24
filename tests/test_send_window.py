@@ -115,9 +115,37 @@ def test_zone_from_location(location, zone):
     assert zone_for(location) == zone
 
 
-@pytest.mark.parametrize("location", ["", "Remote", "United States", "Australia"])
+@pytest.mark.parametrize("location", ["", "Remote", "United States", "Houston"])
 def test_location_that_cannot_settle_a_zone(location):
     assert zone_for(location) == ""
+
+
+@pytest.mark.parametrize("location, country, zone", [
+    # Countries with several zones and nothing more precise: the main one.
+    ("Melbourne, Australia", "", "Australia/Sydney"),
+    ("Jakarta, Indonesia", "", "Asia/Jakarta"),
+    ("Moscow, Russia", "", "Europe/Moscow"),
+    ("Toronto, Canada", "", "America/Toronto"),
+    ("Recife, Brazil", "", "America/Sao_Paulo"),
+    ("Monterrey, Mexico", "", "America/Mexico_City"),
+    ("", "AU", "Australia/Sydney"),
+    ("", "ID", "Asia/Jakarta"),
+    ("", "RU", "Europe/Moscow"),
+    # The US is left to the operator's zone: no single main one.
+    ("", "US", ""),
+])
+def test_main_zone_of_a_country_with_several(location, country, zone):
+    assert zone_for(location, country=country) == zone
+
+
+def test_more_precise_than_the_main_zone_still_wins():
+    assert zone_for("Perth, WA, Australia") == "Australia/Perth"
+    assert zone_for("Vancouver, BC") == "America/Vancouver"
+    assert zone_for("Novosibirsk, Russia", point="55.03,82.92") == "Asia/Novosibirsk"
+
+
+def test_washington_dc_with_dots():
+    assert zone_for("Washington, D.C.") == "America/New_York"
 
 
 def test_country_from_elsewhere():
@@ -141,6 +169,33 @@ def test_two_letter_code_that_is_a_state_and_a_country():
     assert zone_for("Perth, WA", point="-31.95,115.86") == "Australia/Perth"
     # A state written out wins over a country from elsewhere.
     assert zone_for("Austin, TX", country="GB") == "America/Chicago"
+
+
+@pytest.mark.parametrize("location, country, point, zone", [
+    # Coordinates settle a code that is a region and a country, either way.
+    ("Jakarta, ID", "", "-6.21,106.85", "Asia/Jakarta"),
+    ("Boise, ID", "", "43.62,-116.20", "America/Boise"),
+    ("Mumbai, IN", "", "19.08,72.88", "Asia/Kolkata"),
+    ("Tel Aviv, IL", "", "32.09,34.78", "Asia/Jerusalem"),
+    ("St. John's, NL", "", "47.56,-52.71", "America/St_Johns"),
+    ("Amsterdam, NL", "", "52.37,4.90", "Europe/Amsterdam"),
+    ("Adelaide, SA", "", "-34.93,138.60", "Australia/Adelaide"),
+    ("Riyadh, SA", "", "24.71,46.68", "Asia/Riyadh"),
+    # So does a country from elsewhere (Precleared or prospect_country).
+    ("Jakarta, ID", "ID", "", "Asia/Jakarta"),
+    ("Mumbai, IN", "IN", "", "Asia/Kolkata"),
+    ("Indianapolis, IN", "US", "", "America/Indiana/Indianapolis"),
+    ("St. John's, NL", "CA", "", "America/St_Johns"),
+    ("Adelaide, SA", "AU", "", "Australia/Adelaide"),
+    ("Lima, PE", "PE", "", "America/Lima"),
+    ("Charlottetown, PE", "CA", "", "America/Halifax"),
+    # With nothing else, the reading stays as before: US state first.
+    ("Tel Aviv, IL", "", "", "America/Chicago"),
+    ("Amsterdam, NL", "", "", "Europe/Amsterdam"),
+])
+def test_code_that_is_a_region_and_a_country_is_settled_by_what_else_is_known(
+        location, country, point, zone):
+    assert zone_for(location, country=country, point=point) == zone
 
 
 # ── The window ──
@@ -512,6 +567,9 @@ def _patch_heartbeat(monkeypatch, cfg, state, calls, stop):
                 if name == "send":
                     stop.set()
                 return True
+
+            async def cold_due_in_window(self):  # the real check has its own tests
+                return bool(await state.get_outbox(status="approved", limit=1))
         return Agent
 
     async def stop_instead_of_sleeping(seconds, event):
@@ -561,6 +619,100 @@ async def test_without_recipient_zones_quiet_hours_hold_everything(state, monkey
     main_mod = _patch_heartbeat(monkeypatch, cfg, state, calls, stop)
     await asyncio.wait_for(main_mod.heartbeat(stop), timeout=30)
     assert calls == []
+
+
+def _patch_heartbeat_real_sender(monkeypatch, cfg, state, calls, stop, provider):
+    """The heartbeat with the real Sender on a FakeProvider; other agents stubbed."""
+    real_sender = sender_mod.Sender
+    main_mod = _patch_heartbeat(monkeypatch, cfg, state, calls, stop)
+    monkeypatch.setattr(sender_mod, "Sender", real_sender)
+    monkeypatch.setattr(sender_mod, "get_mail_provider", lambda c, e: provider)
+    monkeypatch.setattr(sender_mod, "SEND_JITTER_SECONDS", (0, 0))
+    monkeypatch.setattr(main_mod, "load_env", lambda: SimpleNamespace(instantly_api_key=""))
+    return main_mod
+
+
+def _quiet_cfg(**email):
+    return HarveyConfig(**BASE, channels={"email": {
+        "provider": "gmail", "require_approval": False, "send_window": {}, **email}})
+
+
+@pytest.mark.asyncio
+async def test_quiet_hours_send_cold_email_in_its_window_but_hold_replies(state, monkeypatch):
+    tokyo = await seed_at(state, "Tokyo, Japan", "aiko@tokyo.example")
+    asked = await seed_at(state, "New York, NY", "bob@ny-asked.example", status="replied")
+    await approved(state, tokyo, "aiko@tokyo.example")
+    reply = await approved(state, asked, "bob@ny-asked.example", kind="reply")
+    provider, calls, stop = FakeProvider(), [], asyncio.Event()
+    main_mod = _patch_heartbeat_real_sender(monkeypatch, _quiet_cfg(), state, calls, stop, provider)
+    pin_now(monkeypatch, WED_0200)  # 11:00 in Tokyo
+    await asyncio.wait_for(main_mod.heartbeat(stop), timeout=30)
+
+    assert [m["to"] for m in provider.sent] == ["aiko@tokyo.example"]
+    assert (await outbox_row(state, reply))["status"] == "approved"  # waits for your hours
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("held_by", ["reply_only", "outside_window", "paused", "daily_cap"])
+async def test_quiet_hours_dont_wake_for_mail_that_cannot_go(state, monkeypatch, held_by):
+    tokyo = await seed_at(state, "Tokyo, Japan", "aiko@tokyo.example")
+    ny = await seed_at(state, "New York, NY", "jane@ny.example", status="replied")
+    email = {}
+    if held_by == "reply_only":
+        await approved(state, ny, "jane@ny.example", kind="reply")
+    elif held_by == "outside_window":
+        await state.update_prospect_status(ny, "queued")
+        await approved(state, ny, "jane@ny.example")  # 22:00 in New York
+    else:
+        await approved(state, tokyo, "aiko@tokyo.example")
+    if held_by == "paused":
+        await state.set_setting(sender_mod.KILL_SWITCH_KEY, "test pause")
+    if held_by == "daily_cap":
+        email = {"max_daily_sends": 1}
+        done = await approved(state, ny, "jane@ny.example", kind="reply")
+        await state.update_outbox_item(done, status="sent", sent_at=_utc_now_iso())
+    provider, calls, stop = FakeProvider(), [], asyncio.Event()
+    main_mod = _patch_heartbeat_real_sender(
+        monkeypatch, _quiet_cfg(**email), state, calls, stop, provider)
+    pin_now(monkeypatch, WED_0200)
+    await asyncio.wait_for(main_mod.heartbeat(stop), timeout=30)
+    assert calls == [] and provider.sent == []  # no reading mail, no Claude
+
+
+@pytest.mark.asyncio
+async def test_quiet_hours_dont_wake_after_a_compliance_hold(state, monkeypatch):
+    pid = await seed_at(state, "Tokyo, Japan", "aiko@tokyo.example")
+    await approved(state, pid, "aiko@tokyo.example")
+    provider = FakeProvider()
+    sender = window_sender(state, provider, monkeypatch)
+    down = httpx.MockTransport(lambda request: httpx.Response(503))
+    sender.precleared = PreclearedClient(sender_country="GB", transport=down)
+    pin_now(monkeypatch, WED_0200)  # 11:00 in Tokyo
+    assert await sender.cold_due_in_window()
+    await sender._drain_due()
+    assert provider.sent == []
+    assert not await sender.cold_due_in_window()  # until a drain outside quiet hours
+
+
+@pytest.mark.asyncio
+async def test_a_zone_that_cannot_be_worked_out_doesnt_stop_the_drain(state, monkeypatch):
+    broken = await seed_at(state, "Tokyo, Japan", "aiko@tokyo.example")
+    asked = await seed_at(state, "New York, NY", "bob@ny-asked.example", status="replied")
+    await approved(state, broken, "aiko@tokyo.example")
+    await approved(state, asked, "bob@ny-asked.example", kind="reply")
+    provider = FakeProvider()
+    sender = window_sender(state, provider, monkeypatch, operator_zone="Asia/Tokyo")
+
+    async def boom(prospect, country=""):
+        raise RuntimeError("zone lookup failed")
+    monkeypatch.setattr(sender, "_send_zone", boom)
+    pin_now(monkeypatch, WED_0200)  # 11:00 in Tokyo, the fallback zone too
+    await sender._drain_due()
+    assert sorted(m["to"] for m in provider.sent) == ["aiko@tokyo.example", "bob@ny-asked.example"]
+
+
+def _utc_now_iso():
+    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
 
 
 # ── Storage ──

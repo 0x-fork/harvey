@@ -3,7 +3,9 @@
 With ``channels.email.send_window`` set, a cold email goes out only inside
 that window (08:00 to 17:00 on weekdays by default) in the recipient's local
 time, so a campaign that reaches New York and Oslo lands in office hours in
-both. Replies are never held.
+both. Replies are never held by the window; in quiet hours they wait for
+the operator's own hours, as before. ``weekdays_only`` means Monday to
+Friday everywhere.
 
 The recipient's zone comes from what Harvey already knows, in this order:
 
@@ -18,15 +20,19 @@ The recipient's zone comes from what Harvey already knows, in this order:
    check is on;
 4. ``compliance.precleared.prospect_country``.
 
-A country with several zones and nothing more specific stays unresolved, as
-does an empty location. Those recipients get the window in
+A country with several zones and nothing more specific gets its main zone
+(MAIN_ZONE: Sydney for Australia, Moscow for Russia), except the US, which
+has none. An empty location stays unresolved. Those recipients get the window in
 ``usage.quiet_hours.timezone``, which is what Harvey did before. A resolved
 zone is stored on the prospect, so it is worked out once (unless a country
 found later could still change it; see ``recipient_zone``).
 
-Two-letter codes follow the US convention: "Berlin, DE" reads as Delaware
-unless the cached coordinates or Precleared's country say Germany. Writing
-the country out ("Berlin, Germany") always works.
+A code that is a state or province and a country too ("Berlin, DE",
+"Mumbai, IN", "St. John's, NL", "Adelaide, SA") is settled by Precleared's
+country, the cached coordinates or ``prospect_country``. With none of
+those, a US state code reads as the state and any other as the country, and
+that guess isn't stored. Writing the country out ("Berlin, Germany") always
+works.
 """
 
 import math
@@ -140,7 +146,11 @@ CA_CODES_ALONE = {"AB", "BC", "MB", "NB", "NS", "ON", "QC"}
 AU_CODES_ALONE = {"NSW", "VIC", "QLD", "TAS", "ACT"}
 
 # Countries whose other zones are only small islands or regions: the
-# mainland zone is the sensible answer for a company there.
+# mainland zone is the sensible answer for a company there. Below them,
+# countries with several zones where most people and businesses share one:
+# used only when nothing more precise (a state, coordinates) is known. The
+# US has no such zone (Eastern is under half), so it stays with the
+# operator's own zone.
 MAIN_ZONE = {
     "CL": "America/Santiago",
     "CN": "Asia/Shanghai",
@@ -149,6 +159,12 @@ MAIN_ZONE = {
     "NZ": "Pacific/Auckland",
     "PT": "Europe/Lisbon",
     "UA": "Europe/Kyiv",
+    "AU": "Australia/Sydney",
+    "BR": "America/Sao_Paulo",
+    "CA": "America/Toronto",
+    "ID": "Asia/Jakarta",
+    "MX": "America/Mexico_City",
+    "RU": "Europe/Moscow",
 }
 
 COUNTRY_ALIASES = {
@@ -278,18 +294,48 @@ def _parts(location: str) -> list[str]:
     return parts
 
 
+# Region codes by the country they're in. Some are a country's code too
+# ("DE", "IN", "NL", "SA"): see _ambiguous_code.
+REGION_COUNTRY = {
+    **{code: "US" for code in US_STATES},
+    **{code: "CA" for code in CA_PROVINCES},
+    **{code: "AU" for code in AU_STATES},
+}
+
+
+def _codes(part: str) -> list[str]:
+    """Upper-case words in a part, dots dropped: "D.C." -> "DC"."""
+    return [w.replace(".", "") for w in part.split() if w.isupper()]
+
+
 def _country_in(parts: list[str]) -> str:
+    """A country the location names without doubt, or ""."""
     names = _country_names()
     for part in parts:
         name = _clean(part)
         if name in names:
             return names[name]
-        # A bare two-letter code is a US state first ("Wilmington, DE").
-        if len(part) == 2 and part.isupper() and part not in US_STATES:
+        # A code that is also a state or province is left to _ambiguous_code.
+        if len(part) == 2 and part.isupper() and part not in REGION_COUNTRY:
             found = country_code(part)
             if found:
                 return found
     return ""
+
+
+def _ambiguous_code(parts: list[str]) -> str:
+    """The first code in the location that is a state or province and a
+    country too ("Berlin, DE", "St. John's, NL"), or ""."""
+    for part in parts:
+        for code in _codes(part):
+            if code in REGION_COUNTRY and country_code(code):
+                return code
+    return ""
+
+
+def _ref_km(point, zone: str) -> float:
+    ref = _zone_points().get(zone)
+    return _km(point, ref) if ref else math.inf
 
 
 def _region(parts: list[str], text_country: str, hint: str) -> str:
@@ -305,7 +351,7 @@ def _region(parts: list[str], text_country: str, hint: str) -> str:
     us_names = {name: zone for name, zone in US_STATES.values()}
     for part in parts:
         name = _clean(part)
-        codes = [w for w in part.split() if w.isupper()]
+        codes = _codes(part)
         if text_country in ("", "US"):
             if name in us_names:
                 return us_names[name]
@@ -335,10 +381,34 @@ def zone_for(location: str = "", country: str = "", point: str = "") -> str:
     cached for the location. A state or country written in the location
     wins over ``country``.
     """
+    return _resolve(location, country, point)[0]
+
+
+def _resolve(location: str = "", country: str = "", point: str = "") -> tuple[str, bool]:
+    """zone_for, plus whether the answer was a guess: a code that is a
+    region and a country, read by the US-first convention because nothing
+    else said which."""
     parts = _parts(location)
     coords = _point(point)
     text_country = _country_in(parts)
     hint = country_code(country)
+    guessed = False
+    code = "" if text_country else _ambiguous_code(parts)
+    if code:
+        # "IN": Indiana or India? The country from elsewhere settles it,
+        # then the coordinates; otherwise a US state is read as the state
+        # and a province or Australian state code as the country.
+        home = REGION_COUNTRY[code]
+        if hint in (code, home):
+            text_country = hint
+        elif coords:
+            as_region = _region(parts, home, "")
+            as_country = _country_zone(code, coords)
+            text_country = (home if as_region and _ref_km(coords, as_region)
+                            <= _ref_km(coords, as_country) else code)
+        else:
+            text_country = home if home == "US" else code
+            guessed = True
     zone = _region(parts, text_country, hint)
     if zone and coords and _km(coords, _zone_points().get(zone, coords)) > MAX_REGION_KM:
         # The coordinates put it on another continent ("Perth, WA" in
@@ -347,19 +417,13 @@ def zone_for(location: str = "", country: str = "", point: str = "") -> str:
         if text_country == "US":
             text_country = ""
     if zone:
-        return zone
+        return zone, guessed
     named = text_country or hint
     if named:
-        return _country_zone(named, coords)
+        return _country_zone(named, coords), guessed
     if coords:
-        return _nearest(coords, max_km=MAX_NEAREST_KM)
-    return ""
-
-
-def _state_and_country_codes(location: str) -> list[str]:
-    """Two-letter codes in the location that are a US state and a country too."""
-    return [code for part in _parts(location) for code in part.split()
-            if code in US_STATES and country_code(code)]
+        return _nearest(coords, max_km=MAX_NEAREST_KM), False
+    return "", False
 
 
 # ── The window itself ──
@@ -442,18 +506,15 @@ async def recipient_zone(state, prospect, config, country: str = "") -> str:
     if location.strip():
         cached = await state.get_setting("geo:" + location.strip().lower())
         point = "" if not cached or cached == "-" else cached
-    known = country_code(country)
-    hint = known or _prospect_country(config)
-    zone = zone_for(location, country=hint, point=point)
-    # Not stored while a country found later could still change it: when
-    # only the configured prospect_country settled it, or when a code in
-    # the location is a US state and a country ("Berlin, DE") and nothing
-    # has said which. Precleared's country then still takes its place.
-    settled = zone and (hint == known or zone_for(location, country=known, point=point) == zone)
-    if settled and not known:
-        settled = all(zone_for(location, country=code, point=point) == zone
-                      for code in _state_and_country_codes(location))
-    if settled:
+    zone, guessed = _resolve(location, country_code(country), point)
+    if zone and not guessed:
         prospect.timezone = zone
         await state.set_prospect_timezone(prospect.id, zone)
+        return zone
+    # Not stored while a country found later (Precleared's) could still
+    # change it: a zone only the configured prospect_country settles, or a
+    # code that is a state and a country ("Berlin, DE") read by convention.
+    fallback = _prospect_country(config)
+    if fallback and not country_code(country):
+        return _resolve(location, fallback, point)[0] or zone
     return zone

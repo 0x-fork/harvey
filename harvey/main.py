@@ -4,7 +4,7 @@ import asyncio
 import logging
 import signal
 import sys
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, time, timedelta
 
 import pytz
 
@@ -47,11 +47,6 @@ QUIET_HOURS_POLL_SECONDS = 300
 REPLY_READERS = ("handle_replies", "read_replies")
 
 
-def _utc_iso() -> str:
-    """Naive UTC now in ISO form, as the outbox stores send_at."""
-    return datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
-
-
 def in_quiet_hours(config: HarveyConfig) -> bool:
     """Check if we're currently in quiet hours."""
     qh = config.usage.quiet_hours
@@ -68,14 +63,16 @@ def in_quiet_hours(config: HarveyConfig) -> bool:
 
 
 def sends_through_quiet_hours(config: HarveyConfig) -> bool:
-    """True when quiet hours pause Harvey's own work but not due emails.
+    """True when quiet hours pause Harvey's own work but not cold email
+    that is due in its recipient's window.
 
     With a send window in each recipient's time zone, the operator's night
-    can be a recipient's morning. Prospecting and writing still sleep, but
-    a heartbeat with an email due reads and handles replies first (so
-    stop-on-reply has run; reading a reply is what consumes it, so it can't
-    be left for the morning) and then sends what's due. With nothing due,
-    it does nothing. Native mail providers only.
+    can be a recipient's morning. Prospecting and writing still sleep, and
+    replies wait for the operator's hours as before. A heartbeat wakes only
+    when a cold email can go now (Sender.cold_due_in_window): it reads and
+    handles replies first (so stop-on-reply has run; reading a reply is what
+    consumes it, so it can't be left for the morning), then sends only cold
+    email. Otherwise it does nothing. Native mail providers only.
     """
     email = config.channels.email
     window = send_window_of(config)
@@ -323,11 +320,13 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
                 if shutting_down:
                     break
                 continue
-            if send_only and not await state.get_outbox(
-                    status="approved", due_before=_utc_iso(), limit=1,
-                    skip_unready_follow_ups=True):
+            # Quiet hours wake only for cold email that can go now: due,
+            # inside its recipient's window, not held by a cap or a pause.
+            # Replies wait for the operator's hours, as they always have.
+            sender.cold_only = send_only
+            if send_only and not await sender.cold_due_in_window():
                 logger.info(
-                    f"Quiet hours. Nothing due to send; checking again in "
+                    f"Quiet hours. No cold email can go now; checking again in "
                     f"{config.usage.heartbeat_interval_minutes} minutes."
                 )
                 if await _interruptible_sleep(interval, stop_event):
