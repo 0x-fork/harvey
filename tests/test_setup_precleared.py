@@ -258,3 +258,95 @@ def test_saving_the_key_keeps_other_env_lines_and_stays_private(files, monkeypat
     assert files.env.stat().st_mode & 0o777 == 0o600
     assert FAKE_KEY not in capsys.readouterr().out
     assert FAKE_KEY not in caplog.text
+
+
+# ── setup saves to the file Harvey reads, and says when it couldn't ──
+
+@pytest.fixture
+def trained(files):
+    """`harvey train` wrote harvey.local.yaml, which wins over harvey.yaml."""
+    local = files.config.with_name("harvey.local.yaml")
+    shutil.copy(files.config, local)
+    files.local = local
+    files.template = files.config.read_bytes()
+    return files
+
+
+def test_after_harvey_train_setup_saves_to_harvey_local_yaml(trained, monkeypatch):
+    script(monkeypatch, yes_no=[True], answers=["GB", "", ""])
+    wizard = setup.SetupWizard()
+    wizard._setup_compliance()
+    finish(wizard)
+
+    assert load_config(str(trained.local)).compliance.precleared.enabled is True
+    assert trained.config.read_bytes() == trained.template  # template untouched
+
+
+def test_rerunning_setup_after_harvey_train_offers_the_saved_answers(trained, monkeypatch):
+    set_precleared(trained.local, enabled=True, sender_country="US")
+    asked = script(monkeypatch, yes_no=[None], answers=["", "", ""])
+    wizard = setup.SetupWizard()
+    wizard._setup_compliance()
+
+    assert asked.yes_no[0][1] is True
+    assert asked.questions[0].default == "US"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_local", [False, True])
+async def test_setup_trains_into_the_file_harvey_reads(files, monkeypatch, has_local):
+    if has_local:
+        shutil.copy(files.config, files.config.with_name("harvey.local.yaml"))
+    outputs = []
+
+    class FakeTrainer:
+        def __init__(self, **kwargs):
+            pass
+
+        async def train(self, url, output_path):
+            outputs.append(output_path)
+            return {"persona": {}}
+
+    monkeypatch.setattr("harvey.trainer.Trainer", FakeTrainer)
+    script(monkeypatch, yes_no=[], answers=["url", "https://example.test"])
+    await setup.SetupWizard()._setup_product()
+
+    name = "harvey.local.yaml" if has_local else "harvey.yaml"
+    assert outputs == [str(files.config.with_name(name))]
+
+
+async def summary(wizard, monkeypatch, capsys) -> str:
+    monkeypatch.setattr(setup, "_check_claude_cli", lambda: True)
+    capsys.readouterr()
+    await wizard._print_summary()
+    return capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("turn_on", [True, False])
+async def test_summary_shows_whether_the_check_was_saved_on(files, monkeypatch, capsys, turn_on):
+    script(monkeypatch, yes_no=[turn_on], answers=["GB", "", ""])
+    wizard = setup.SetupWizard()
+    wizard._setup_compliance()
+    finish(wizard)
+
+    out = await summary(wizard, monkeypatch, capsys)
+    assert ("✓ Cold-email check (Precleared)" in out) is turn_on
+    assert ("– Cold-email check (Precleared)" in out) is not turn_on
+
+
+@pytest.mark.asyncio
+async def test_a_config_that_cannot_be_saved_is_reported_not_ticked(files, monkeypatch, capsys):
+    files.config.write_text("channels:\n")  # hand-edited: an empty channels section
+    script(monkeypatch, yes_no=[True], answers=["GB", "", ""])
+    wizard = setup.SetupWizard()
+    wizard._setup_compliance()
+    wizard.config = {"channels": {"email": {"max_daily_sends": 50}}}
+    wizard.env_vars["LINKEDIN_EMAIL"] = ""
+    wizard._write_env()
+    wizard._write_config()  # must not crash setup
+
+    assert "Couldn't save" in capsys.readouterr().out
+    assert files.config.read_text() == "channels:\n"
+    out = await summary(wizard, monkeypatch, capsys)
+    assert "– Cold-email check (Precleared)" in out

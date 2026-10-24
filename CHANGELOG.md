@@ -355,7 +355,11 @@ minor versions can still change behaviour.
   free `PRECLEARED_API_KEY` (hidden input, saved to `.env`; 25 checks a day
   instead of 10). Off unless you say yes. Re-running setup offers your saved
   answers as the defaults, so pressing Enter never switches the check off. The
-  Claude-guided setup in CLAUDE.md offers the same step.
+  Claude-guided setup in CLAUDE.md offers the same step. Setup now reads and
+  saves `harvey.local.yaml` when it exists (it's what `harvey train` writes,
+  and the file Harvey reads), not the `harvey.yaml` it shadows, so its answers
+  take effect; if it can't save the file it says so instead of ticking the
+  summary.
 - **Cohort builder pagination and CSV export.** The cohort table on the
   Signals tab used to stop at the first 50 matches with no way to see the
   rest. It now pages with Prev / Next ("Showing 51–100 of 147"), and an

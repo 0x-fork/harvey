@@ -81,10 +81,18 @@ def _read_env_file() -> dict[str, str]:
     return existing
 
 
+def _config_file() -> Path:
+    """The config Harvey loads: harvey.local.yaml (what `harvey train` writes)
+    wins over harvey.yaml when it exists, as in config._find_config_file.
+    Setup reads and writes this file, so its answers are the ones Harvey uses."""
+    local = CONFIG_FILE.with_name("harvey.local.yaml")
+    return local if local.exists() else CONFIG_FILE
+
+
 def _current_precleared() -> dict:
     """compliance.precleared in the file setup writes to, or {} if there is none."""
     try:
-        data = yaml.safe_load(read_user_text(CONFIG_FILE))
+        data = yaml.safe_load(read_user_text(_config_file()))
     except (OSError, yaml.YAMLError):
         return {}
     compliance = data.get("compliance") if isinstance(data, dict) else None
@@ -175,6 +183,8 @@ class SetupWizard:
         self.brain_config = BrainConfig()
         # compliance.precleared answers to save; None leaves the config alone.
         self.precleared: dict | None = None
+        # Whether _write_config saved the config, for the summary.
+        self.config_saved = False
 
     async def run(self):
         """Run the full interactive setup."""
@@ -425,7 +435,7 @@ class SetupWizard:
 
             from harvey.trainer import Trainer
             trainer = Trainer(brain_config=self.brain_config)
-            self.config = await trainer.train(url, str(CONFIG_FILE)) or {}
+            self.config = await trainer.train(url, str(_config_file())) or {}
 
             if self.config:
                 _print_harvey("Training complete! I've got a solid understanding")
@@ -656,7 +666,7 @@ class SetupWizard:
             # Only touch the config to switch off a check that was on.
             self.precleared = {"enabled": False} if was_on else None
             _print_harvey("No problem. You can turn it on later under")
-            _print_harvey("compliance.precleared in harvey.yaml.")
+            _print_harvey(f"compliance.precleared in {_config_file().name}.")
             return
 
         saved_country = str(current.get("sender_country") or "").strip().upper()
@@ -757,18 +767,20 @@ class SetupWizard:
         """Write harvey.yaml (only if we have manual config — trainer writes its own)."""
         from harvey.trainer import brain_section
 
+        config_file = _config_file()
         if self.config:
             self.config["brain"] = brain_section(self.brain_config)
-        if self.config and not CONFIG_FILE.exists():
+        if self.config and not config_file.exists():
             if self.precleared:
                 _save_precleared(self.config, self.precleared)
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            with open(config_file, "w", encoding="utf-8") as f:
                 yaml.dump(self.config, f, default_flow_style=False, sort_keys=False)
-            logger.info(f"Wrote {CONFIG_FILE}")
+            logger.info(f"Wrote {config_file}")
+            self.config_saved = True
         elif self.config:
             # Config already exists (from trainer), update behavior settings only
             try:
-                existing = yaml.safe_load(read_user_text(CONFIG_FILE)) or {}
+                existing = yaml.safe_load(read_user_text(config_file)) or {}
                 existing["usage"] = self.config.get("usage", existing.get("usage", {}))
                 existing["brain"] = self.config["brain"]
                 if "LINKEDIN_EMAIL" in self.env_vars:
@@ -784,10 +796,13 @@ class SetupWizard:
                         )
                 if self.precleared:
                     _save_precleared(existing, self.precleared)
-                with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                    yaml.dump(existing, f, default_flow_style=False, sort_keys=False)
-            except Exception:
-                pass
+                text = yaml.dump(existing, default_flow_style=False, sort_keys=False)
+                with open(config_file, "w", encoding="utf-8") as f:
+                    f.write(text)
+                self.config_saved = True
+            except Exception as e:
+                _print_harvey(f"Couldn't save your settings to {config_file.name} ({e}).")
+                _print_harvey("Nothing in it was changed. Fix the file and re-run setup.")
 
     async def _print_summary(self):
         """Print final summary and next steps."""
@@ -807,8 +822,9 @@ class SetupWizard:
             "Instantly API": bool(self.env_vars.get("INSTANTLY_API_KEY")),
             "LinkedIn": bool(self.env_vars.get("LINKEDIN_EMAIL")),
             "Cloudflare Crawl": bool(self.env_vars.get("CLOUDFLARE_ACCOUNT_ID")),
-            "Product trained": CONFIG_FILE.exists(),
-            "Cold-email check (Precleared)": bool(self.precleared and self.precleared.get("enabled")),
+            "Product trained": _config_file().exists(),
+            "Cold-email check (Precleared)": bool(
+                self.config_saved and self.precleared and self.precleared.get("enabled")),
         }
 
         for name, ok in checks.items():
@@ -818,7 +834,7 @@ class SetupWizard:
         print(f"""
   Files created:
     - .env (your credentials)
-    - harvey.yaml (your configuration)
+    - {_config_file().name} (your configuration)
 
   To start Harvey:
     harvey run          (or: python -m harvey)
