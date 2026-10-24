@@ -142,6 +142,14 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- **Dashboard actions work in Safari and Firefox** (from #80 by 0SansNom).
+  Confirming signals, approving the Outbox and saving settings all failed
+  with "Cross-origin requests are refused." The dashboard's requests asked the
+  browser to send no referrer, which per the Fetch spec makes a POST's Origin
+  `null`, and the guard rightly refused it. Safari and Firefox follow the
+  spec; Chrome didn't, so it worked there. Requests now send their origin to
+  the dashboard itself, and only to it.
+
 - **A reply stops the cold email to the whole company.** Stop-on-reply was
   per person, so when an owner wrote back "not interested" the office
   manager still got the follow-up. Now a reply (not a bounce, an
