@@ -346,17 +346,21 @@ email nobody approved goes back to the Outbox, marked **Held** with the
 reason, instead of out, when it:
 
 - links to, or gives an address at, a domain that isn't yours. Yours are the
-  sending address's domain, your booking link's, and any you list:
-  `channels.email.link_domains: ["mainsite.com"]` (handy when you send from a
-  secondary domain);
+  sending address's domain, the site you trained Harvey on, your own booking
+  page (`product.offer.booking_url`; only that page, since cal.com and Calendly
+  host everyone's), and any you list: `channels.email.link_domains:
+  ["mainsite.com"]`. Links are read the way a browser opens them, and bare
+  `evil.com/x`, `www.`, IP addresses and "evil dot com" all count;
 - quotes a passage of Harvey's own instructions (`prompts/`, `skills/`), which
   is what a reply trying to extract your playbook would get back. Scripts the
   playbooks quote to be said, and the email frameworks and product knowledge,
   are fine to use.
 
-Approving it yourself sends it. On Instantly, which sends at once, a reply
+Approving it yourself sends it. **Approve all** leaves held emails out, so
+each one gets read before it goes. On Instantly, which sends at once, a reply
 that would be held goes to you as an escalation instead (it also runs the
-pre-send gate now), and a campaign template that would be held isn't deployed.
+pre-send gate now), a campaign template that would be held isn't deployed,
+and a lead whose fields would be held isn't uploaded.
 
 **Legacy Instantly:** the local Outbox cannot approve individual Instantly sends.
 With `require_approval: true`, Harvey holds campaign deployment (including

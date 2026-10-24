@@ -928,7 +928,8 @@ async def outbox_approve_all():
         state = _state()
         await state.init_db()
         n = await state.approve_outbox()
-        return {"success": True, "approved": n}
+        # Held ones (possible planted link or leak) are approved one by one.
+        return {"success": True, "approved": n, "held": await state.count_held_for_review()}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 

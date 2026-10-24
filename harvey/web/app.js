@@ -1540,8 +1540,10 @@ async function loadOutbox() {
 
   actions.innerHTML =
     (pending.length && !data.paused
-      ? '<button class="btn btn-primary btn-sm" onclick="outboxApproveAll()">Approve all ' +
-        pending.length + '</button>' : '') +
+      ? (pending.length > pending.filter(p => heldReason(p)).length
+        ? '<button class="btn btn-primary btn-sm" onclick="outboxApproveAll()" ' +
+          'title="Emails Harvey held are left for you to approve one by one">Approve all ' +
+          (pending.length - pending.filter(p => heldReason(p)).length) + '</button>' : '') : '') +
     (data.paused
       ? '<button class="btn btn-secondary btn-sm" onclick="sendingToggle(\'resume\')">' +
         'Resume sending</button>'
@@ -1634,7 +1636,7 @@ function renderDeskContext(ctx) {
 }
 
 // Why autopilot sent this back for a human (sender: gate.autopilot_review).
-const HELD_PREFIX = 'held for your review: ';
+const HELD_PREFIX = 'held for your review: ';   // state.HELD_FOR_REVIEW
 function heldReason(item) {
   const e = String((item && item.error) || '');
   const why = e.startsWith(HELD_PREFIX) ? e.slice(HELD_PREFIX.length) : '';
@@ -1789,7 +1791,9 @@ async function outboxAct(id, action) {
 async function outboxApproveAll() {
   if (deskBusy()) return;
   const data = await api('/api/outbox/approve-all', {method: 'POST'});
-  if (data && data.success) showToast('Approved ' + data.approved + ' email(s).', 'success');
+  if (data && data.success) showToast('Approved ' + data.approved + ' email(s).' + (data.held
+    ? ' ' + data.held + ' Harvey held ' + (data.held === 1 ? 'is' : 'are') + ' left for you to read and approve one by one.'
+    : ''), 'success');
   else showToast(failMsg(data, 'Approve-all failed.'), 'error');
   loadOutbox();
 }

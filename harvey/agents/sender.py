@@ -26,7 +26,7 @@ from harvey.integrations.instantly import InstantlyClient
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
 from harvey.integrations.precleared import PreclearedClient
 from harvey.state import (
-    HAND_SENT_REASON, MANUAL_SEND_KEY, MAYBE_SENT_PREFIX, StateManager,
+    HAND_SENT_REASON, HELD_FOR_REVIEW, MANUAL_SEND_KEY, MAYBE_SENT_PREFIX, StateManager,
 )
 
 # A follow-up waits at least this long after the email it follows went out,
@@ -132,6 +132,19 @@ class Sender:
                 )
                 return False
         return True
+
+    def _reviewed_leads(self, prospects: list) -> list:
+        """The prospects whose merge fields pass the autopilot review."""
+        kept = []
+        for p in prospects:
+            fields = " \n".join(str(v or "") for v in (
+                p.first_name, p.last_name, p.company, p.title, p.personalization_notes))
+            held = autopilot_review("", fields, self.config)
+            if held:
+                logger.warning(f"Sender: left {p.email} out of the Instantly upload: {held}")
+            else:
+                kept.append(p)
+        return kept
 
     async def _deploy_campaign(self, campaign):
         """Deploy a single campaign to Instantly. Idempotent: safe to retry."""
@@ -283,6 +296,11 @@ class Sender:
             logger.info(f"Sender: Capping leads from {len(prospects)} to {remaining} (daily limit).")
             prospects = prospects[:remaining]
 
+        # Instantly fills these into the templates on its side, unseen:
+        # scraped text carrying a planted link keeps that lead out.
+        prospects = self._reviewed_leads(prospects)
+        if not prospects:
+            return
         leads = [
             {
                 "email": p.email.strip().lower(),
@@ -556,7 +574,7 @@ class Sender:
             held = autopilot_review(item["subject"], self._outgoing_body(item), self.config)
             if held:
                 logger.warning(f"Sender: holding email to {item['to_email']} for review: {held}")
-                return "pending_review", ("held for your review: " + "; ".join(held))[:300]
+                return "pending_review", (HELD_FOR_REVIEW + "; ".join(held))[:300]
         return None
 
     async def _drain_due(self):

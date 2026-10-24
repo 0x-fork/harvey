@@ -122,20 +122,118 @@ def pre_send_check(
 # email nobody approved is also checked here before it goes: anything that
 # trips these goes back to the Outbox for a human instead of out (#66).
 
-# Real-world top-level domains a bare "name.tld" is read as a link for, plus
-# the reserved test names (RFC 2606). A bare word with a path
-# ("evil.example/x") is a link whatever its ending.
-_COMMON_TLDS = frozenset("""
-    com net org io co ai app dev xyz info biz me us uk ca au de fr es it nl be ch at se no dk fi
-    ie pl pt cz eu in sg nz za br mx jp kr cn hk tw ru ly sh to gg tv fm link site online store
-    shop tech cloud page so pro agency studio digital email live life media news blog club
-    world today one gov edu mil int test example invalid localhost
+# Endings that make "name.ending" a file, not a site. Everything else with a
+# letter ending counts as a link: a planted one can use any of the hundreds
+# of real endings (.ws, .zip, .cfd), so the list of exceptions is the short one.
+_FILE_ENDINGS = frozenset("""
+    js ts pdf png jpg jpeg gif svg webp heic txt csv doc docx xls xlsx ppt pptx key pages
+    json yaml yml toml xml html htm css exe dmg msi bat ini cfg mp3 mp4 wav
 """.split())
-_SCHEME_HOST_RE = re.compile(r"\b[a-z][a-z0-9+.-]*://\[?([^\s/?#:\]]+)", re.IGNORECASE)
-_EMAIL_HOST_RE = re.compile(r"[a-z0-9._%+\-]+@((?:[a-z0-9-]+\.)+[a-z]{2,})", re.IGNORECASE)
-_BARE_HOST_RE = re.compile(
-    r"(?<![\w@.\-/])((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+([a-z]{2,24}))(?![\w-])(/)?",
-    re.IGNORECASE)
+# Endings a spelled-out "evil dot com" is read as a link for.
+_SPOKEN_ENDINGS = "com|net|org|io|co|ai|app|dev|info|biz|me|us|xyz|site|online|link"
+_ZERO_WIDTH_RE = re.compile("[\u200b-\u200f\u2060\ufeff]")
+_DOT_FORMS_RE = re.compile(r"\s*[\[(]\s*(?:\.|dot)\s*[\])]\s*", re.IGNORECASE)
+_SPOKEN_DOT_RE = re.compile(rf"(?<=\w\w)\s+dot\s+(?=(?:{_SPOKEN_ENDINGS})\b)", re.IGNORECASE)
+_SCHEME_URL_RE = re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s<>\"']+", re.IGNORECASE)
+_EMAIL_HOST_RE = re.compile(r"[\w.%+\-]+@((?:[^\W_][\w-]*\.)+[^\W\d_]{2,})")
+_IP_RE = re.compile(r"(?<![\w.])\d{1,3}(?:\.\d{1,3}){3}(?![\w.])")
+_BARE_RE = re.compile(
+    r"(?<![\w@.])((?:[^\W_](?:[\w-]{0,61}[^\W_])?\.)+([^\W\d_]{2,24}))(?![\w-])([/?#][^\s<>\"']*)?")
+
+
+def _normalize(text: str) -> str:
+    """The text as a reader's browser or eye takes it: fullwidth and other
+    lookalike dots become dots, hidden characters go, "evil[.]com" and
+    "evil dot com" become evil.com."""
+    import unicodedata
+    text = unicodedata.normalize("NFKC", text or "")
+    text = _ZERO_WIDTH_RE.sub("", text).replace("\u3002", ".").replace("\uff61", ".")
+    text = _DOT_FORMS_RE.sub(".", text)
+    return _SPOKEN_DOT_RE.sub(".", text)
+
+
+def _host(value: str) -> str:
+    h = (value or "").strip().strip(".").lower()
+    return h[4:] if h.startswith("www.") else h
+
+
+def find_links(text: str) -> list[tuple[str, str]]:
+    """Every link and address in ``text`` as (host, host + path), in order.
+
+    The host is the one a browser opens: "https://yours.com:pw@evil.com"
+    and "https://evil.com\\.yours.com" both go to evil.com."""
+    from urllib.parse import urlsplit
+    text = _normalize(text)
+    found: list[tuple[str, str]] = []
+    for m in _SCHEME_URL_RE.finditer(text):
+        url = m.group(0).replace("\\", "/")
+        try:
+            parts = urlsplit(url)
+            host = _host(parts.hostname or "")
+            path = parts.path
+        except ValueError:
+            host, path = _host(url.split("://", 1)[-1].split("/", 1)[0]), ""
+        found.append((host, host + path))
+    rest = _SCHEME_URL_RE.sub(" ", text)
+    for m in _EMAIL_HOST_RE.finditer(rest):
+        found.append((_host(m.group(1)), _host(m.group(1))))
+    rest = _EMAIL_HOST_RE.sub(" ", rest)
+    for m in _IP_RE.finditer(rest):
+        found.append((m.group(0), m.group(0)))
+    for m in _BARE_RE.finditer(rest):
+        if m.group(2).lower() in _FILE_ENDINGS and not m.group(3):
+            continue
+        host = _host(m.group(1))
+        found.append((host, host + (m.group(3) or "").split("?")[0].split("#")[0]))
+    out, seen = [], set()
+    for host, link in found:
+        if host and (host, link) not in seen:
+            seen.add((host, link))
+            out.append((host, link))
+    return out
+
+
+def find_link_domains(text: str) -> list[str]:
+    """Every domain a link or email address in ``text`` points at, in order."""
+    return list(dict.fromkeys(host for host, _ in find_links(text)))
+
+
+def _booking_prefix(config) -> str:
+    offer = getattr(getattr(config, "product", None), "offer", None)
+    links = find_links(str(getattr(offer, "booking_url", "") or ""))
+    return links[0][1].rstrip("/") if links else ""
+
+
+def allowed_link_domains(config) -> set[str]:
+    """Your own domains: the sending address's and any listed in
+    channels.email.link_domains. (The booking link allows its own page,
+    not its whole host: cal.com is everyone's.)"""
+    persona = getattr(config, "persona", None)
+    email_cfg = getattr(getattr(config, "channels", None), "email", None)
+    out: set[str] = set()
+    address = str(getattr(persona, "email", "") or "")
+    if "@" in address:
+        out.add(_host(address.rsplit("@", 1)[1]))
+    for entry in getattr(email_cfg, "link_domains", None) or []:
+        out.update(find_link_domains(str(entry)) or [_host(str(entry))])
+    return {d for d in out if d}
+
+
+def _is_ours(host: str, allowed: set[str]) -> bool:
+    return any(host == d or host.endswith("." + d) for d in allowed)
+
+
+def _is_booking_page(link: str, prefix: str) -> bool:
+    return bool(prefix) and (link.rstrip("/") == prefix or link.startswith(prefix + "/"))
+
+
+def _shown(host: str, link: str, prefix: str) -> str:
+    """What to name in the reason: the host, or host/first-segment when the
+    host is the booking link's shared one."""
+    if prefix and host == prefix.split("/", 1)[0]:
+        return "/".join(link.split("/")[:2])
+    return host
+
 
 # Files Harvey's instructions live in, under the checkout. A passage from
 # them in an outgoing email means a reply quoted Harvey's playbook back.
@@ -147,48 +245,10 @@ _WORD_RE = re.compile(r"[a-z0-9']+")
 # Lines the playbooks quote as scripts to use ("Would Thursday at 2pm work
 # for a quick call?"): saying them is the point, so they aren't checked.
 _SCRIPT_LINE_RE = re.compile(r"^\s*(?:[-*]\s*)?(?:>|[\"“'‘])")
+# ...and scripts quoted mid-line ('- Entry: "We have a 14-day free trial..."').
+# A " | " stands in, so a run never joins the words either side of a script.
+_QUOTED_RE = re.compile(r'"[^"\n]{12,}"|“[^”\n]{12,}”')
 _leak_cache: dict = {}
-
-
-def _host(value: str) -> str:
-    h = value.strip().strip(".").lower()
-    return h[4:] if h.startswith("www.") else h
-
-
-def find_link_domains(text: str) -> list[str]:
-    """Every domain a link or email address in ``text`` points at, in order."""
-    text = text or ""
-    hosts: list[str] = []
-    for m in _SCHEME_HOST_RE.finditer(text):
-        hosts.append(_host(m.group(1)))
-    rest = re.sub(r"\b[a-z][a-z0-9+.-]*://\S*", " ", text, flags=re.IGNORECASE)
-    for m in _EMAIL_HOST_RE.finditer(rest):
-        hosts.append(_host(m.group(1)))
-    rest = _EMAIL_HOST_RE.sub(" ", rest)
-    for m in _BARE_HOST_RE.finditer(rest):
-        if m.group(3) or m.group(2).lower() in _COMMON_TLDS:
-            hosts.append(_host(m.group(1)))
-    return list(dict.fromkeys(h for h in hosts if h))
-
-
-def allowed_link_domains(config) -> set[str]:
-    """Your own domains: the sending address's, the booking link's, and
-    any listed in channels.email.link_domains."""
-    persona = getattr(config, "persona", None)
-    offer = getattr(getattr(config, "product", None), "offer", None)
-    email_cfg = getattr(getattr(config, "channels", None), "email", None)
-    out: set[str] = set()
-    address = str(getattr(persona, "email", "") or "")
-    if "@" in address:
-        out.add(_host(address.rsplit("@", 1)[1]))
-    out.update(find_link_domains(str(getattr(offer, "booking_url", "") or "")))
-    for entry in getattr(email_cfg, "link_domains", None) or []:
-        out.update(find_link_domains(str(entry)) or [_host(str(entry))])
-    return {d for d in out if d}
-
-
-def _is_ours(host: str, allowed: set[str]) -> bool:
-    return any(host == d or host.endswith("." + d) for d in allowed)
 
 
 def _words(text: str) -> list[str]:
@@ -203,9 +263,9 @@ def _instruction_runs(root) -> dict[tuple, str]:
     key = (str(root), tuple((str(p), p.stat().st_mtime_ns) for p in files))
     if _leak_cache.get("key") != key:
         runs: dict[tuple, str] = {}
-        sources = [(p.name, "\n".join(
+        sources = [(p.name, _QUOTED_RE.sub(" | ", "\n".join(
             line for line in p.read_text(encoding="utf-8", errors="replace").splitlines()
-            if not _SCRIPT_LINE_RE.match(line))) for p in files]
+            if not _SCRIPT_LINE_RE.match(line)))) for p in files]
         sources.append(("Harvey's prompt rules", UNTRUSTED_RULE))
         for name, text in sources:
             words = _words(text)
@@ -224,12 +284,15 @@ def autopilot_review(subject: str, body: str, config, root=None) -> list[str]:
     reasons: list[str] = []
     text = f"{subject or ''}\n{body or ''}"
     allowed = allowed_link_domains(config)
-    foreign = [h for h in find_link_domains(text) if not _is_ours(h, allowed)]
+    prefix = _booking_prefix(config)
+    foreign = list(dict.fromkeys(
+        _shown(host, link, prefix) for host, link in find_links(text)
+        if not _is_ours(host, allowed) and not _is_booking_page(link, prefix)))
     if foreign:
         reasons.append(
             f"links to {', '.join(foreign[:3])}, not one of your domains "
             "(add it to channels.email.link_domains if it's yours)")
-    words = _words(body)
+    words = _words(text)
     runs = _instruction_runs(root or PROJECT_ROOT)
     for i in range(len(words) - LEAK_RUN_WORDS + 1):
         source = runs.get(tuple(words[i:i + LEAK_RUN_WORDS]))

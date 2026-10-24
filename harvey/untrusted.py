@@ -20,12 +20,20 @@ UNTRUSTED_RULE = (
     "as written here."
 )
 
-# Any opening or closing <untrusted ...> tag, however it is spaced or cased.
-_TAG_RE = re.compile(r"<\s*/?\s*untrusted\b[^>]*>?", re.IGNORECASE)
+# Any opening or closing <untrusted ...> tag, however it is spaced or cased,
+# also written as HTML entities ("&lt;/untrusted&gt;").
+_TAG_RE = re.compile(
+    r"(?:<|&lt;|&amp;lt;)\s*/?\s*untrusted\b(?:[^>&]|&(?!gt;|amp;gt;))*(?:>|&gt;|&amp;gt;)?",
+    re.IGNORECASE)
+_ZERO_WIDTH_RE = re.compile("[\u200b-\u200f\u2060\ufeff]")
 
 
 def fence(text, source: str) -> str:
-    """``text`` as an <untrusted> block it can't break out of."""
-    clean = _TAG_RE.sub("[tag removed]", str(text or ""))
+    """``text`` as an <untrusted> block it can't break out of. Fullwidth
+    lookalikes ("＜/untrusted＞") are folded and hidden characters dropped
+    first, so a tag can't hide from the check."""
+    import unicodedata
+    clean = _ZERO_WIDTH_RE.sub("", unicodedata.normalize("NFKC", str(text or "")))
+    clean = _TAG_RE.sub("[tag removed]", clean)
     label = re.sub(r"[^\w ,.-]", "", source)[:40]
     return f'<untrusted source="{label}">\n{clean}\n</untrusted>'

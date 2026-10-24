@@ -41,6 +41,9 @@ HAND_SENT_REASON = "sent_by_hand"
 # Set when you undo someone's opt-out: Harvey's first reply to them after
 # that waits for your approval, even on autopilot. Cleared once it has.
 REVIEW_NEXT_REPLY_KEY = "review_next_reply:"
+# Outbox error prefix for an email autopilot held for a human (gate.
+# autopilot_review): approve-all skips these, they're approved one by one.
+HELD_FOR_REVIEW = "held for your review: "
 # Outbox errors starting with this: the send was cut off and the email may
 # have reached them. Never retried, and counted as Harvey's mail, so the
 # dashboard never offers a second one by hand.
@@ -1152,13 +1155,25 @@ class StateManager:
                     (_utcnow().isoformat(), item_id),
                 )
             else:
+                # Not the ones autopilot held for a look (possible planted
+                # links or a leak): those are approved one at a time.
                 cursor = await db.execute(
                     "UPDATE outbox SET status = 'approved', approved_by = 'you', error = '', "
-                    "updated_at = ? WHERE status = 'pending_review'",
-                    (_utcnow().isoformat(),),
+                    "updated_at = ? WHERE status = 'pending_review' "
+                    "AND COALESCE(error, '') NOT LIKE ?",
+                    (_utcnow().isoformat(), HELD_FOR_REVIEW + "%"),
                 )
             await db.commit()
             return cursor.rowcount
+
+    async def count_held_for_review(self) -> int:
+        """Emails autopilot sent back for a human, still waiting."""
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM outbox WHERE status = 'pending_review' AND error LIKE ?",
+                (HELD_FOR_REVIEW + "%",),
+            ) as cursor:
+                return (await cursor.fetchone())[0]
 
     async def cancel_pending_outbox_for_prospect(
         self, prospect_id: str, reason: str = "stop_on_reply"
