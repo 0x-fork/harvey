@@ -10,6 +10,7 @@ three years ago".
 """
 
 import os
+import re
 import tempfile
 from datetime import date
 from types import SimpleNamespace
@@ -330,9 +331,20 @@ def test_cli_and_dashboard_take_the_presets():
     for preset in ("accelerator", "funding"):
         assert dash._discovery_queries({"provider": "serper", "preset": preset}, _config())
     cli = (PROJECT_ROOT / "harvey" / "cli.py").read_text(encoding="utf-8")
-    assert 'choices=["", "yc", "accelerator", "funding"]' in cli
+    choices = re.search(r'"--preset", default="", choices=\[([^\]]*)\]', cli).group(1)
+    assert '"accelerator"' in choices and '"funding"' in choices
     page = (PROJECT_ROOT / "harvey" / "web" / "index.html").read_text(encoding="utf-8")
     assert 'value="accelerator"' in page and 'value="funding"' in page
+
+
+def test_every_preset_checks_and_builds_whether_it_has_one_term_or_several():
+    from harvey.collectors.discover import PRESETS, preset_problem
+    config = _config()
+    config.icp.hiring_signals, config.icp.titles = ["Head of Sales"], ["CEO"]
+    for preset in PRESETS:
+        assert preset_problem(preset, "serper", config) is None
+        queries = build_queries(config, preset=preset)
+        assert queries and all("{" not in q.term for q in queries)
 
 
 # ── profiling ──
