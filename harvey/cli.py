@@ -216,6 +216,7 @@ def cmd_status(args):
         print(f"  Claude calls today:   {by_provider.get('claude', summary['usage_today'])}")
         print(f"  Codex calls today:    {by_provider.get('codex', 0)}")
         from harvey.config import compliance_notice, load_config, sending_notice
+        loaded = None
         try:
             loaded = load_config()
             notice = sending_notice(loaded)
@@ -241,6 +242,14 @@ def cmd_status(args):
             _, detail = held_message(hold, waiting=waiting)
             print("  Sending:              NOT SENDING (couldn't read your inbox)")
             print(textwrap.fill(detail, width=72, initial_indent="                        ",
+                                subsequent_indent="                        "))
+        from harvey.integrations.precleared import current_hold, hold_message
+        precleared_hold = await current_hold(state, loaded)
+        if precleared_hold:
+            message = hold_message(precleared_hold)
+            print(f"  Precleared:           HOLDING COLD EMAIL since {precleared_hold.get('since', '?')}")
+            print(textwrap.fill(f"{message['title']}. {message['detail']}", width=72,
+                                initial_indent="                        ",
                                 subsequent_indent="                        "))
         if address_notice:
             print("  Postal address:       MISSING")
