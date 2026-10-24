@@ -3,6 +3,7 @@ user says yes, saved answers are the defaults when setup is re-run, the key is
 read with hidden input and never printed, and other settings are kept. No
 network: the step only writes harvey.yaml and .env."""
 
+import os
 import shutil
 from types import SimpleNamespace
 
@@ -255,7 +256,8 @@ def test_saving_the_key_keeps_other_env_lines_and_stays_private(files, monkeypat
     for line in other.splitlines():
         assert line in lines
     assert f"PRECLEARED_API_KEY={FAKE_KEY}" in lines
-    assert files.env.stat().st_mode & 0o777 == 0o600
+    if os.name != "nt":   # Windows uses the folder's ACLs, not POSIX modes
+        assert files.env.stat().st_mode & 0o777 == 0o600
     assert FAKE_KEY not in capsys.readouterr().out
     assert FAKE_KEY not in caplog.text
 
