@@ -220,7 +220,11 @@ parts:
   startups* on the Discover tab, searches your industries for companies whose
   own websites say they're backed by Y Combinator.
 - **The signal:** turn on `YC_BACKED` (Signals tab) to tag them, with their batch
-  when the site states it (W24, S23).
+  when the site states it (W24, S23). It reads the homepage and About page for
+  a reference to the company's own YC page or a line where the company says it
+  ("we went through Y Combinator", "YC W24"), not customer lines like "trusted
+  by YC-backed startups". Many YC companies never say it on their site, so it
+  finds the ones that do; a YC-preset search hit counts as a yes too.
 - **The writing:** for those prospects the writer and reply handler use
   `skills/selling_to_startups.md`, a playbook for writing to founders.
 

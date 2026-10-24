@@ -46,7 +46,7 @@ async def state():
     ("<p>We're Y Combinator alumni (W19).</p>", "W19"),
 ])
 def test_a_company_saying_its_yc_backed(html, batch):
-    got = yc_backed(html)
+    got = yc_backed(html, domain="acme.com")
     assert got is not None
     assert got[0] == batch and 0 < got[1] <= 1
 
@@ -342,3 +342,120 @@ async def test_profiling_doesnt_overwrite_yc_evidence_with_not_stated(state):
     obs = await c.profile_company(cid, "acme.com")
     assert not [o for o in obs if o["signal_code"] == "YC_BACKED"]   # silent pages aren't a "no"
     assert await state.yc_batch(cid) == ""
+
+
+# ── review: wrongly tagged, and tags that couldn't be undone ──
+
+
+@pytest.mark.parametrize("html", [
+    "<p>Trusted by 300 YC-backed startups and the Fortune 500.</p>",
+    "<p>Used by YC alumni at Stripe, Ramp and Brex.</p>",
+    "<p>Built for a YC company like yours.</p>",
+    "<p>We're part of the YC Startup School community.</p>",
+    "<p>We went through YC Startup School in 2022.</p>",
+    "<p>We cover every YC company in the W24 batch.</p>",
+    "<p>Our portfolio includes companies from Y Combinator S23.</p>",
+    "<p>Exclusive deal for YC companies. Apply for YC S25 with our help.</p>",
+    "<p>YC Demo Day watch party - Fall 2024</p>",
+    "<p>YC-approved phone: Galaxy S24 Ultra</p>",
+    "<p>YC founders using our plan W20 get 50% off.</p>",
+])
+def test_customer_and_marketing_lines_arent_backing(html):
+    assert yc_backed(html, domain="vendor.com") is None
+
+
+@pytest.mark.parametrize("html,batch", [
+    ("<p>Our investors include Y Combinator, SV Angel and others.</p>", ""),
+    ("<p>Supported by Y Combinator</p>", ""),
+    ("<p>Investors: Y Combinator</p>", ""),
+    ("<p>We were in the Summer 2023 batch of Y Combinator.</p>", "S23"),
+    ("<p>Acme is a Y Combinator company (W22).</p>", "W22"),
+])
+def test_more_real_ways_to_say_it(html, batch):
+    got = yc_backed(html, domain="acme.com")
+    assert got is not None and got[0] == batch
+
+
+@pytest.mark.parametrize("slug,domain,ours", [
+    ("stripe", "", False),               # no domain to compare: not theirs
+    ("air", "airtable.com", False),      # too short to be a match
+    ("acme", "app.acme.com", True),      # the registrable name, not "app"
+    ("acme", "acme.co.uk", True),
+    ("acme", "getacme.com", True),
+    ("acmehq", "acme.com", True),
+    ("airtable", "airbnb.com", False),
+])
+def test_matching_a_yc_page_to_its_company(slug, domain, ours):
+    from harvey.collectors.profile import _is_their_yc_page
+    assert _is_their_yc_page(slug, domain) is ours
+
+
+@pytest.mark.parametrize("domain,junk", [
+    ("workatastartup.com", True), ("startupschool.org", True), ("yclist.com", True),
+    ("ycdb.co", True), ("seedtable.com", True), ("github.com", True),
+    ("acme.github.io", False), ("angelcity.com", False),
+])
+def test_yc_lists_are_junk_and_github_pages_arent(domain, junk):
+    assert is_junk(domain) is junk
+
+
+def test_the_preset_excludes_ycs_own_sites():
+    [q] = build_queries(_config(industries=["fintech"]), preset="yc")
+    for site in ("ycombinator.com", "workatastartup.com", "startupschool.org"):
+        assert f"-site:{site}" in q.term
+
+
+@pytest.mark.asyncio
+async def test_a_wrong_yes_from_profiling_is_undone_by_the_next_profile(state):
+    await seed_signal_catalog(state)
+    await state.set_signal_status("YC_BACKED", "confirmed")
+    cid = await state.add_company(Company(name="Vendor", domain="vendor.com"))
+    await state.add_observation(company_id=cid, signal_code="YC_BACKED", collector="profile",
+                                value_num=1, observed_at="2026-01-01T00:00:00")
+    c = ProfileCollector.__new__(ProfileCollector)
+    c.confirmed, c.site_names, c.state = await state.confirmed_signal_codes(), {}, state
+
+    async def resolve(self, domain):
+        return f"https://{domain}", "<p>Trusted by 300 YC-backed startups.</p>"
+    c._resolve_site = resolve.__get__(c)
+
+    async def get(url):
+        return ""
+    c._get = get
+    [no] = [o for o in await c.profile_company(cid, "vendor.com") if o["signal_code"] == "YC_BACKED"]
+    assert no["value_num"] == 0
+    await state.add_observations([no])
+    assert await state.yc_batch(cid) is None
+
+
+@pytest.mark.asyncio
+async def test_ycs_own_domains_are_never_profiled(state):
+    c = ProfileCollector.__new__(ProfileCollector)
+    c.confirmed, c.site_names, c.state = {"YC_BACKED", "TECH_STACK"}, {}, state
+    fetched = []
+
+    async def resolve(self, domain):
+        fetched.append(domain)
+        return f"https://{domain}", "<p>x</p>"
+    c._resolve_site = resolve.__get__(c)
+    for domain in ("ycombinator.com", "www.ycombinator.com", "news.ycombinator.com", "workatastartup.com"):
+        assert await c.profile_company("c", domain) == []
+    assert fetched == []
+
+
+@pytest.mark.asyncio
+async def test_a_mixed_batch_doesnt_get_founder_framing(state):
+    from harvey.agents.writer import Writer
+    await seed_signal_catalog(state)
+    yc = await _yc_company(state, True)
+    plain = await _yc_company(state, False)
+    brain = RecordingBrain()
+    cfg = SimpleNamespace(
+        channels=SimpleNamespace(email=SimpleNamespace(provider="gmail", require_approval=True)),
+        product=SimpleNamespace(name="P", description="D", key_benefits=[], pricing=""),
+        persona=SimpleNamespace(name="S", company="C", role="R", tone="t"),
+    )
+    w = Writer(brain, state, cfg)
+    w.skills = ""
+    await w._write_sequence([yc, plain])
+    assert "SELLING TO STARTUP FOUNDERS" not in brain.prompts[0]

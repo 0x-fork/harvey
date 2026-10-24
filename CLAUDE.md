@@ -194,7 +194,8 @@ Cities are geocoded automatically (cached forever, one lookup per city), or set
 
 **Selling to startups:** the `yc` preset (above, or *Look for: YC startups* on
 Discover) searches for companies whose own site says they're backed by Y
-Combinator; confirm the `YC_BACKED` signal to tag them (with their batch), and
+Combinator; confirm the `YC_BACKED` signal to tag them (with their batch; it
+reads the homepage and About page, and many YC companies never say it there), and
 the writer and handler then use `skills/selling_to_startups.md` for them. It
 never reads ycombinator.com (their terms forbid scraping and collecting
 founders' contacts), so don't suggest scraping the YC directory instead.

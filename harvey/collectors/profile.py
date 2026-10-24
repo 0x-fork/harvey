@@ -222,65 +222,109 @@ def _text(html: str) -> str:
 
 
 # ── YC_BACKED: what a company says about itself on its own site ──
-# Never read from ycombinator.com, whose terms forbid scraping it. A link to
-# the company's YC page, a batch code, or "backed by Y Combinator" on its own
-# pages is the company's own claim.
+# Never read from ycombinator.com or YC's other sites, whose terms forbid
+# scraping and collecting founders' contacts. What counts is the company's
+# own claim: a reference to its own YC page, or a sentence about itself
+# ("we", "our", its name) or a badge-short line ("YC W24", "Backed by Y
+# Combinator"). Lines about customers and audiences ("trusted by YC-backed
+# startups", "for YC founders") and YC programs (Startup School, Demo Day,
+# applying) are not.
+YC_OWNED_DOMAINS = ("ycombinator.com", "workatastartup.com", "startupschool.org")
 _YC = r"(?:YC|Y[\s-]?Combinator)"
-# Their YC page, as a link or in JSON-LD sameAs (where real sites put it,
-# often with escaped slashes).
 _YC_LINK_RE = re.compile(r"ycombinator\.com\\?/companies\\?/([a-z0-9][\w-]*)", re.I)
 YC_ABOUT_PATHS = ("/about", "/about-us", "/company", "/our-story")
 _YC_SEASONS = {"w": "W", "winter": "W", "s": "S", "summer": "S",
                "f": "F", "fall": "F", "x": "X", "spring": "X"}
-_YC_BATCH_RE = re.compile(
-    rf"\b{_YC}\b(?:['’]s)?[^.\n<>;]{{0,30}}?(?<![\w&#])(Winter|Summer|Fall|Spring|W|S|F|X)\s*'?(\d{{4}}|\d{{2}})\b",
-    re.I)
+_SEASON_WORD = r"(Winter|Summer|Fall|Spring)"
+# A batch right next to YC: "YC W24", "(YC S23)", "Y Combinator's Summer 2023
+# batch", "Y Combinator alumni (W19)", "the Summer 2023 batch of Y Combinator".
+_YC_BATCH_RES = (
+    re.compile(rf"\b{_YC}(?:['’]s)?\s*(?:(?:alumni|alums?|company|startup)\s*)?[\(\[]?\s*"
+               r"(W|S|F|X)\s*'?(\d{2})\b(?![\w-]*\s*(?:Ultra|Plus|Pro|FE|Max)\b)", re.I),
+    re.compile(rf"\b{_YC}(?:['’]s)?\s+{_SEASON_WORD}\s+(?:batch\s+)?(\d{{4}})\b", re.I),
+    re.compile(rf"\b{_SEASON_WORD}\s+(\d{{4}})\s+batch\s+(?:of|at)\s+{_YC}\b", re.I),
+    re.compile(rf"\b{_YC}\s+(?:in|during)\s+(?:the\s+)?{_SEASON_WORD}\s+(?:of\s+)?(\d{{4}})\b", re.I),
+)
 _YC_BACKING_RE = re.compile(
-    rf"\b(?:backed by|funded by|part of|member of|graduated from|alumni of|alums? of|"
-    rf"participated in|went through|accepted into)\s+(?:the\s+)?{_YC}\b"
+    rf"\b(?:backed by|funded by|supported by|part of|member of|graduated from|alumni of|"
+    rf"alums? of|participated in|went through|accepted into)\s+(?:the\s+)?{_YC}\b"
     rf"|\b{_YC}[\s-]+(?:backed|funded|alumni|alums?|alumnus)\b"
-    rf"|\b(?:a|an)\s+{_YC}\s+(?:company|startup)\b",
+    rf"|\b(?:a|an)\s+{_YC}\s+(?:company|startup)\b"
+    rf"|\binvestors?\s*(?:include|including|:)[^.]{{0,80}}\b{_YC}\b",
     re.I)
+# Not a claim about the company itself.
+_YC_NOT_ABOUT_US_RE = re.compile(
+    r"startup school|demo day|\bapply\b|\bapplying\b|application|portfolio|"
+    r"trusted by|used by|loved by|built for|designed for|made for|for (?:a |an )?(?:other )?"
+    rf"{_YC}|like yours|every {_YC}|\b{_YC}[\s-]+(?:backed\s+)?"
+    r"(?:startups|companies|teams|founders|customers|alumni at|alums at)\b|\bdeal for\b|\bperks?\b",
+    re.I)
+_FIRST_PERSON_RE = re.compile(
+    r"\b(?:we|we're|we've|we were|our|us)\b|\b(?:proud|excited|thrilled|honou?red) to\b", re.I)
 _ATTR_TEXT_RE = re.compile(r"""\b(?:alt|title|aria-label)=["']([^"']{0,200})["']""", re.I)
-
-
-def _yc_batch(match) -> str:
-    season = _YC_SEASONS[match.group(1).lower()]
-    year = match.group(2)[-2:]
-    return f"{season}{year}" if 5 <= int(year) <= 40 else ""
+_SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|\s*[|•·]\s*|\n")
+_AFFIXES = re.compile(r"^(?:get|try|use|join|go|hey|with)|(?:hq|app|ai|io|labs|inc|team)$")
+_SECOND_LEVEL = {"co", "com", "org", "net", "ac", "gov", "edu"}
 
 
 def _alnum(text: str) -> str:
     return re.sub(r"[^a-z0-9]", "", text.lower())
 
 
+def _domain_name(domain: str) -> str:
+    """The registrable name: app.acme.com and acme.co.uk are both "acme"."""
+    parts = [p for p in domain.lower().strip(".").split(".") if p]
+    if len(parts) >= 3 and parts[-2] in _SECOND_LEVEL and len(parts[-1]) == 2:
+        return parts[-3]
+    return parts[-2] if len(parts) >= 2 else (parts[0] if parts else "")
+
+
 def _is_their_yc_page(slug: str, domain: str) -> bool:
-    """A YC page link is theirs when its name matches their domain: a
+    """A YC page link is theirs when its name matches their domain's: a
     customer logo can link to that customer's YC page."""
-    if not domain:
-        return True
-    name, label = _alnum(slug), _alnum(domain.split(".")[0])
+    name, label = _alnum(slug), _alnum(_domain_name(domain)) if domain else ""
     if not name or not label:
         return False
-    return name == label or (min(len(name), len(label)) >= 3 and (name in label or label in name))
+    if name == label:
+        return True
+    core_name, core_label = _AFFIXES.sub("", name) or name, _AFFIXES.sub("", label) or label
+    return min(len(core_name), len(core_label)) >= 4 and core_name == core_label
+
+
+def _yc_batch(match) -> str:
+    season, year = _YC_SEASONS[match.group(1).lower()], match.group(2)[-2:]
+    return f"{season}{year}" if 5 <= int(year) <= 40 else ""
 
 
 def yc_backed(html: str, domain: str = "") -> tuple[str, float] | None:
-    """(batch like "W24" or "", confidence) when the page says the company is
-    YC-backed, else None. Mentioning YC (Hacker News, essays, "for YC
-    founders", "powering the last YC batch") isn't being backed by it."""
+    """(batch like "W24" or "", confidence) when the page says the company
+    itself is YC-backed, else None."""
     if not html:
         return None
-    # Entities decoded: "Y Combinator&#x27;s W20" must read as the batch W20, not X27.
-    readable = html_unescape(" ".join([_text(html), *_ATTR_TEXT_RE.findall(html)]))
-    batch_match = _YC_BATCH_RE.search(readable)
-    batch = _yc_batch(batch_match) if batch_match else ""
     if any(_is_their_yc_page(m.group(1), domain) for m in _YC_LINK_RE.finditer(html)):
+        link = True
+    else:
+        link = False
+    # Entities decoded: "Y Combinator&#x27;s W20" must read as the batch W20.
+    readable = html_unescape(" ".join([_text(html), *_ATTR_TEXT_RE.findall(html)]))
+    name = _domain_name(domain) if domain else ""
+    batch, claimed = "", False
+    for sentence in _SENTENCE_RE.split(readable):
+        if not re.search(rf"\b{_YC}\b", sentence, re.I) or _YC_NOT_ABOUT_US_RE.search(sentence):
+            continue
+        about_us = (len(sentence.split()) <= 6 or _FIRST_PERSON_RE.search(sentence)
+                    or (len(name) >= 3 and name in _alnum(sentence)))
+        if not about_us:
+            continue
+        found = next((m for r in _YC_BATCH_RES for m in [r.search(sentence)] if m), None)
+        if found and not batch:
+            batch = _yc_batch(found)
+        if found or _YC_BACKING_RE.search(sentence):
+            claimed = True
+    if link:
         return batch, 0.95
-    if batch:
-        return batch, 0.9
-    if _YC_BACKING_RE.search(readable):
-        return "", 0.85
+    if claimed:
+        return batch, 0.9 if batch else 0.85
     return None
 
 
@@ -455,6 +499,9 @@ class ProfileCollector:
         """Collect every confirmed profile signal for one business."""
         obs: list[dict] = []
         domain = domain.lower().replace("www.", "").strip("/")
+        if any(domain == d or domain.endswith("." + d) for d in YC_OWNED_DOMAINS):
+            # YC's own sites forbid scraping; they're never a prospect anyway.
+            return obs
 
         def add(code, *, num=None, text="", conf=1.0, url=""):
             if not self.wants(code):
@@ -497,15 +544,17 @@ class ProfileCollector:
                 about_url, about = await self._first_present(site, YC_ABOUT_PATHS)
                 if about:
                     yc, where = yc_backed(about, domain), about_url
-            # Most YC companies never say it on these pages, so silence only
-            # counts as "no" when nothing else (a YC-preset search hit) said yes.
-            already = None
+            # Most YC companies never say it on these pages, so silence
+            # doesn't erase a YC-preset search hit (collector "discover").
+            # It does correct an earlier profile "yes", so a wrong tag or a
+            # dropped claim doesn't last forever.
+            searched = False
             if yc is None and getattr(self, "state", None) is not None:
                 try:
-                    already = await self.state.yc_batch(company_id)
+                    searched = await self.state.yc_search_hit(company_id)
                 except Exception:
-                    already = None
-            if yc is not None or already is None:
+                    searched = False
+            if yc is not None or not searched:
                 add("YC_BACKED", num=1 if yc else 0, text=yc[0] if yc else "",
                     conf=yc[1] if yc else 1.0, url=where if yc else site)
 

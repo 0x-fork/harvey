@@ -62,8 +62,10 @@ JUNK_DOMAIN_PATTERNS = tuple(re.compile(p, re.I) for p in (
     r"(hospital|healthsystem|medicalcenter)\.",
     r"health\.org$",
     # startup databases, launch sites and tech press (the YC preset's noise)
-    r"(^|\.)(ycombinator|crunchbase|techcrunch|wellfound|angel|tracxn|pitchbook)\.",
-    r"(^|\.)(cbinsights|producthunt|github|f6s|dealroom|growjo|owler|zoominfo)\.",
+    r"(^|\.)(ycombinator|workatastartup|startupschool|yclist|ycdb|seedtable)\.",
+    r"(^|\.)(crunchbase|techcrunch|wellfound|angel|tracxn|pitchbook)\.",
+    r"(^|\.)(cbinsights|producthunt|f6s|dealroom|growjo|owler|zoominfo)\.",
+    r"(^|\.)github\.com$",
     # infrastructure that is never a prospect
     r"(^|\.)(google|bing|yahoo|duckduckgo|amazon|apple|microsoft)\.",
     r"(wordpress|wix|squarespace|shopify|godaddy|weebly|webflow)\.com$",
@@ -803,6 +805,7 @@ PRESETS = {
         "label": "YC startups",
         "kinds": ("serp",),
         "term": ('"backed by Y Combinator" {industry} -site:ycombinator.com '
+                 "-site:workatastartup.com -site:startupschool.org "
                  "-site:linkedin.com -site:crunchbase.com"),
         "local": False,
     },

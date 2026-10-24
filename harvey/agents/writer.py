@@ -410,9 +410,10 @@ Pricing: {self.config.product.pricing}"""
         # Inject email framework skills
         if self.skills:
             prompt += "\n\n" + self.skills
-        # A batch that's mostly YC startups gets the founder playbook.
+        # One template goes to the whole batch: founder framing only when
+        # every prospect in it is a YC startup.
         backed = [await self._yc(p.company_id) for p in prospects]
-        if prospects and sum(b is not None for b in backed) * 2 >= len(prospects):
+        if prospects and all(b is not None for b in backed):
             prompt += self._startup_playbook()
         # Campaign notes only: this template goes to the whole batch, so a
         # note about one person ("met her at the expo") must never reach it.

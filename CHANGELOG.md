@@ -13,8 +13,10 @@ minor versions can still change behaviour.
   (`harvey discover --preset yc`, or *Look for: YC startups* on Discover)
   searches your industries, through Serper or DataForSEO SERP, for companies
   whose own site says they're backed by Y Combinator. The new `YC_BACKED`
-  signal tags them from their homepage, with the batch when it's stated
-  (W24, S23). For those prospects the writer and reply handler use the new
+  signal tags them from their homepage or About page (a reference to their
+  own YC page, or a line where they say it, never customer or audience
+  lines), with the batch when it's stated (W24, S23). Many YC companies
+  don't say it on their site, so it finds the ones that do. For those prospects the writer and reply handler use the new
   `skills/selling_to_startups.md` playbook: who reads, timing around the
   batch and Demo Day, what not to do. Harvey never reads ycombinator.com,
   whose terms forbid scraping it or collecting founders' contact details.
