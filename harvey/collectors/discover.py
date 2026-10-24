@@ -66,6 +66,11 @@ JUNK_DOMAIN_PATTERNS = tuple(re.compile(p, re.I) for p in (
     r"(^|\.)(crunchbase|techcrunch|wellfound|angel|tracxn|pitchbook)\.",
     r"(^|\.)(cbinsights|producthunt|f6s|dealroom|growjo|owler|zoominfo)\.",
     r"(^|\.)github\.com$",
+    # hosted job boards: the company is whoever's board it is, not the host
+    r"(^|\.)(job-)?boards\.(eu\.)?greenhouse\.io$",
+    r"(^|\.)jobs\.(eu\.)?lever\.co$",
+    r"(^|\.)jobs\.ashbyhq\.com$",
+    r"(^|\.)(apply|jobs)\.workable\.com$",
     # infrastructure that is never a prospect
     r"(^|\.)(google|bing|yahoo|duckduckgo|amazon|apple|microsoft)\.",
     r"(wordpress|wix|squarespace|shopify|godaddy|weebly|webflow)\.com$",
@@ -809,7 +814,23 @@ PRESETS = {
                  "-site:linkedin.com -site:crunchbase.com"),
         "local": False,
     },
+    # Companies hiring for one of your hiring_signals roles (else ICP titles),
+    # found by their OWN careers pages. The hosted boards are excluded: a
+    # boards.greenhouse.io hit names a board, not a website to profile.
+    # Profiling then reads the board their site links to and records the
+    # role (HIRING_ROLE); the search hit alone records nothing.
+    "hiring": {
+        "label": "Companies hiring for your roles",
+        "kinds": ("serp",),
+        "term": ('"{role}" careers {industry} -site:greenhouse.io -site:lever.co '
+                 "-site:ashbyhq.com -site:workable.com -site:linkedin.com "
+                 "-site:indeed.com -site:glassdoor.com -site:ziprecruiter.com"),
+        "local": False,
+    },
 }
+
+# A hit on careers.acme.com is acme.com's careers page.
+_CAREERS_HOST = re.compile(r"^(careers|jobs|join|work|apply|hiring)\.(?=[^.]+\.[^.]+)", re.I)
 
 
 def preset_problem(preset: str, provider_key: str) -> str | None:
@@ -840,7 +861,9 @@ def build_queries(config, cities: list[str] | None = None,
     terms = list(icp.industries) or [config.product.name]
     spec = PRESETS.get(preset) if preset else None
     if spec:
-        terms = [spec["term"].format(industry=t) for t in terms]
+        from harvey.collectors.ats import role_keywords
+        roles = role_keywords(icp) if "{role}" in spec["term"] else [""]
+        terms = [spec["term"].format(industry=t, role=r) for r in roles for t in terms]
         places = cities if cities is not None else ([""] if not spec["local"] else list(icp.geography) or [""])
     else:
         places = cities if cities is not None else list(icp.geography) or [""]
@@ -949,6 +972,8 @@ async def run_discovery(
                 report.found += len(found)
                 batch = []
                 for biz in found:
+                    if query.preset == "hiring" and biz.domain:
+                        biz.domain = _CAREERS_HOST.sub("", biz.domain)
                     if is_junk(biz.domain, biz.raw_title or biz.name):
                         report.junk += 1
                         continue
