@@ -509,6 +509,12 @@ MIGRATIONS: list[str] = [
     ALTER TABLE outbox ADD COLUMN approved_by TEXT DEFAULT '';
     UPDATE outbox SET approved_by = 'earlier' WHERE status IN ('approved', 'sending');
     """,
+    # ── v14: each recipient's time zone, for the send window ──
+    """
+    -- An IANA name such as 'Europe/Oslo', worked out once from what Harvey
+    -- knows about the recipient. Empty until then.
+    ALTER TABLE prospects ADD COLUMN timezone TEXT DEFAULT '';
+    """,
 ]
 
 BRAIN_PROVIDERS = ("claude", "codex")
@@ -742,6 +748,7 @@ class StateManager:
         d["email_verified"] = bool(d.get("email_verified", 0))
         d["phone_verified"] = bool(d.get("phone_verified", 0))
         d["email_status"] = d.get("email_status") or ""
+        d["timezone"] = d.get("timezone") or ""
         return Prospect(**d)
 
     async def add_prospect(self, prospect: Prospect) -> str:
@@ -813,6 +820,15 @@ class StateManager:
             ) as cursor:
                 rows = await cursor.fetchall()
                 return [self._prospect_from_row(r) for r in rows]
+
+    async def set_prospect_timezone(self, prospect_id: str, zone: str):
+        """Remember a recipient's time zone. Leaves updated_at alone: it
+        isn't a change anyone made to the prospect."""
+        async with self._connect() as db:
+            await db.execute(
+                "UPDATE prospects SET timezone = ? WHERE id = ?", (zone, prospect_id)
+            )
+            await db.commit()
 
     async def update_prospect_status(self, prospect_id: str, status: str):
         # An opt-out is permanent: nothing Harvey does later (a reply, a
@@ -1020,10 +1036,15 @@ class StateManager:
         limit: int = 200,
         exclude_kind: str | None = None,
         skip_unready_follow_ups: bool = False,
+        kind: str | None = None,
     ) -> list[dict]:
         """skip_unready_follow_ups: leave out sequence follow-ups whose
-        previous step hasn't gone out yet, so they can't fill the page."""
+        previous step hasn't gone out yet, so they can't fill the page.
+        kind: only that kind ("sequence" for cold email)."""
         where, params = [], []
+        if kind:
+            where.append("kind = ?")
+            params.append(kind)
         if status:
             where.append("status = ?")
             params.append(status)

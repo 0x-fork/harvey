@@ -19,9 +19,10 @@ from datetime import date, datetime, timedelta, timezone
 from harvey.brain import Brain
 from harvey.config import (
     HarveyConfig, EnvConfig, cold_daily_cap, compliance_footer_lines, compliance_notice,
-    compliance_of,
+    compliance_of, operator_timezone, send_window_of,
 )
 from harvey.gate import autopilot_review, pre_send_check
+from harvey.send_window import in_window, next_send_time, recipient_zone
 from harvey.integrations.instantly import InstantlyClient
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
 from harvey.integrations.precleared import PreclearedClient, clear_hold, record_hold
@@ -40,6 +41,8 @@ logger = logging.getLogger("harvey.sender")
 # Max sends drained per heartbeat cycle — spreads volume through the day
 # instead of bursting the daily cap in one minute.
 MAX_SENDS_PER_CYCLE = 8
+# How many due emails quiet hours look through for one that can go now.
+QUIET_HOURS_SCAN = 200
 SEND_JITTER_SECONDS = (4, 15)
 
 # Prospect pipeline statuses that mean "stop emailing this person".
@@ -61,6 +64,11 @@ SENDABLE_EMAIL_STATUSES = {"verified"}
 SENDABLE_EMAIL_STATUSES_WITH_RISKY = {"verified", "risky"}
 
 
+def _utcnow() -> datetime:
+    """Naive UTC now, as the outbox stores times. Tests pin it."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 class Sender:
     def __init__(
         self,
@@ -78,6 +86,13 @@ class Sender:
         self.precleared = PreclearedClient.from_config(config, env)
         # Disabled in tests to skip inter-send sleeps.
         self.send_pacing = True
+        # Set by the heartbeat in quiet hours (send windows in recipients'
+        # zones): only cold email goes, inside its window; replies wait for
+        # the operator's own hours, as they always have.
+        self.cold_only = False
+        # The last drain couldn't ask Precleared: quiet hours don't wake for
+        # cold email again until a drain outside them has run.
+        self.compliance_held = False
 
     @property
     def is_native(self) -> bool:
@@ -85,6 +100,75 @@ class Sender:
             self.config.channels.email.provider in NATIVE_PROVIDERS
             and self.provider is not None
         )
+
+    async def _send_zone(self, prospect, country: str = "") -> str:
+        """The time zone this recipient's send window is in: their own when
+        it can be told (with recipient_timezone on), otherwise the zone in
+        usage.quiet_hours, as before."""
+        window = send_window_of(self.config)
+        if window is not None and window.recipient_timezone:
+            if not country and self.precleared is not None and prospect is not None:
+                # A country Precleared already found counts on every check,
+                # not only on the one that asked it.
+                country = await self.precleared.known_country(prospect.email, self.state)
+            zone = await recipient_zone(self.state, prospect, self.config, country)
+            if zone:
+                return zone
+        return operator_timezone(self.config)
+
+    async def _zone_or_default(self, prospect, country: str = "") -> str:
+        """_send_zone, but a failure to work the zone out falls back to
+        usage.quiet_hours.timezone for this one email instead of stopping
+        the whole drain (replies included)."""
+        try:
+            return await self._send_zone(prospect, country)
+        except Exception as e:
+            logger.warning(
+                f"Sender: couldn't work out the time zone for "
+                f"{getattr(prospect, 'email', '?')}, using quiet_hours.timezone: {e}")
+            return operator_timezone(self.config)
+
+    async def cold_due_in_window(self) -> bool:
+        """Quiet hours: whether a cold email is due, inside its recipient's
+        send window and free to go now (sending not paused, under the daily
+        and warmup caps, no compliance hold). Only then is it worth waking
+        to read replies and send."""
+        window = send_window_of(self.config)
+        if window is None or self.compliance_held or not self.is_native:
+            return False
+        if not self.provider.is_configured() or await self.state.get_setting(KILL_SWITCH_KEY):
+            return False
+        email = self.config.channels.email
+        if email.max_daily_sends - await self.state.count_outbox_sent_today() <= 0:
+            return False
+        midnight = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+        if cold_daily_cap(email) - await self.state.count_outbox_sent_today(
+                kind="sequence",
+                since=midnight.astimezone(timezone.utc).replace(tzinfo=None).isoformat()) <= 0:
+            return False
+        now = _utcnow()
+        due = await self.state.get_outbox(
+            status="approved", due_before=datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+            limit=QUIET_HOURS_SCAN, skip_unready_follow_ups=True, kind="sequence",
+        )
+        for item in due:
+            if item["kind"] != "sequence":
+                continue
+            prospect = await self.state.get_prospect(item["prospect_id"])
+            if prospect is not None and in_window(
+                    now, await self._zone_or_default(prospect), window):
+                return True
+        return False
+
+    async def _outside_window(self, item: dict, zone: str, window) -> bool:
+        """Move a cold email that isn't in its send window to the window's
+        next opening. True when it was moved and must wait."""
+        now = _utcnow()
+        if in_window(now, zone, window):
+            return False
+        later = next_send_time(now, zone, window)
+        await self.state.update_outbox_item(item["id"], send_at=later.isoformat())
+        return True
 
     async def run(self):
         """Deploy campaigns — natively through the outbox, or via Instantly."""
@@ -435,8 +519,9 @@ class Sender:
         staged = 0
         skipped = 0
         answered = 0
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        now = _utcnow()
         seen_emails: set[str] = set()
+        window = send_window_of(self.config)
 
         for prospect_id in campaign.prospect_ids:
             prospect = await self.state.get_prospect(prospect_id)
@@ -455,10 +540,15 @@ class Sender:
                 continue
             seen_emails.add(email)
 
+            # With a send window, each email is planned for the recipient's
+            # office hours; follow-ups keep their delay, then move into it.
+            zone = await self._zone_or_default(prospect) if window is not None else ""
             cumulative_days = 0
             for step in campaign.sequence:
                 cumulative_days += max(0, step.delay_days)
                 send_at = now + timedelta(days=cumulative_days)
+                if window is not None:
+                    send_at = next_send_time(send_at, zone, window)
                 item_id = await self.state.add_outbox_item(
                     prospect_id=prospect.id,
                     campaign_id=campaign.id,
@@ -516,7 +606,7 @@ class Sender:
             return self._with_footer(item["body"])
         return item["body"]
 
-    async def _follow_up_order(self, item: dict) -> str | tuple[str, str] | None:
+    async def _follow_up_order(self, item: dict, prospect=None) -> str | tuple[str, str] | None:
         """For a follow-up: "wait" until the email before it went out and its
         gap has passed, (status, error) when that email never will, else None.
 
@@ -550,7 +640,10 @@ class Sender:
         else:
             gap = timedelta(days=delay)
         ready_at = sent_at + max(MIN_FOLLOW_UP_GAP, gap)
-        if datetime.now(timezone.utc).replace(tzinfo=None) >= ready_at:
+        window = send_window_of(self.config)
+        if window is not None and prospect is not None:
+            ready_at = next_send_time(ready_at, await self._zone_or_default(prospect), window)
+        if _utcnow() >= ready_at:
             return None
         # Reschedule it for then, so it leaves the due queue until it's ready.
         await self.state.update_outbox_item(item["id"], send_at=ready_at.isoformat())
@@ -630,9 +723,11 @@ class Sender:
             since=midnight.astimezone(timezone.utc).replace(tzinfo=None).isoformat())
 
         now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        # In quiet hours only cold email can go, so only cold email is
+        # fetched: replies due ahead of it can't fill the page.
         due = await self.state.get_outbox(
             status="approved", due_before=now, limit=budget * 3,
-            skip_unready_follow_ups=True,
+            skip_unready_follow_ups=True, kind="sequence" if self.cold_only else None,
         )
         # Cold emails held (by an unavailable compliance check, the cold
         # cap, a follow-up's spacing) stay approved and could fill the
@@ -640,7 +735,7 @@ class Sender:
         # their own too and never wait behind them. Bounded: one extra
         # query of the same size.
         seen = {item["id"] for item in due}
-        unchecked = await self.state.get_outbox(
+        unchecked = [] if self.cold_only else await self.state.get_outbox(
             status="approved", due_before=now, limit=budget * 3,
             exclude_kind="sequence",
         )
@@ -654,8 +749,10 @@ class Sender:
             return
 
         allow_risky = getattr(self.config.channels.email, "send_to_risky", False)
+        window = send_window_of(self.config)
         sent = 0
         sent_cold = 0
+        outside_window = 0
         # Set when Precleared can't be asked (allowance used up, network):
         # cold emails wait for a later cycle, replies still go out.
         compliance_paused = False
@@ -669,6 +766,8 @@ class Sender:
         for item in due:
             if sent >= budget:
                 break
+            if self.cold_only and item["kind"] != "sequence":
+                continue  # quiet hours: replies wait for the operator's hours
             if item["kind"] == "sequence" and sent_cold >= cold_left:
                 held_cold += 1
                 continue
@@ -683,11 +782,17 @@ class Sender:
                 await self.state.update_outbox_item(
                     item["id"], status=blocked[0], error=blocked[1])
                 continue
-            order = await self._follow_up_order(item)
+            order = await self._follow_up_order(item, prospect)
             if order == "wait":
                 continue
             if order:
                 await self.state.update_outbox_item(item["id"], status=order[0], error=order[1])
+                continue
+            # Cold email waits for the recipient's send window, however
+            # late it was approved; replies don't.
+            if (window is not None and item["kind"] == "sequence"
+                    and await self._outside_window(item, await self._zone_or_default(prospect), window)):
+                outside_window += 1
                 continue
 
             # Optional compliance check (compliance.precleared): one per
@@ -717,6 +822,14 @@ class Sender:
                     )
                     continue
                 receipt_id = clearance.receipt_id
+                # Precleared found where the recipient is, and nothing else
+                # had: their own window applies from now on.
+                if (window is not None and window.recipient_timezone and clearance.country
+                        and not prospect.timezone):
+                    zone = await self._zone_or_default(prospect, clearance.country)
+                    if zone and await self._outside_window(item, zone, window):
+                        outside_window += 1
+                        continue
 
             # Claim it. A reply, bounce, hand send or rejection may have
             # cancelled it since the queue was read; then it stays cancelled.
@@ -801,6 +914,11 @@ class Sender:
             if self.send_pacing and sent < budget:
                 await asyncio.sleep(random.uniform(*SEND_JITTER_SECONDS))
 
+        self.compliance_held = compliance_paused
+        if outside_window:
+            logger.info(
+                f"Sender: {outside_window} cold email(s) wait for the recipient's "
+                f"send window ({window.start}-{window.end} their time).")
         if self.precleared is not None:
             if hold is not None:
                 # The page read above stops at a few times the cycle's
