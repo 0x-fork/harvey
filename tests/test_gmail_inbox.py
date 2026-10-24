@@ -167,3 +167,32 @@ async def test_a_failed_read_keeps_what_it_did_read():
     assert p._read_cache.get('m1') is not None                 # read fine: kept
     p._request = AsyncMock(side_effect=[{'messages': [{'id': 'm1'}]}])
     assert [m.provider_id for m in await p.get_replies()] == ['m1']
+
+
+@pytest.mark.asyncio
+async def test_pages_are_as_big_as_gmail_allows_by_default():
+    """40 pages of 50 stopped sending for good past 2,000 messages a week;
+    a listing is ids only, so pages of 500 cost nothing extra."""
+    p = provider([{'resultSizeEstimate': 0}])
+    await p.get_replies()
+    assert p._request.call_args.kwargs['params']['maxResults'] == 500
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('expires_in', ['3600', 'soon', None])
+async def test_a_garbled_token_answer_is_no_token_not_a_crash(monkeypatch, expires_in):
+    """It raised out of the send, so the sender recorded 'maybe sent' for an
+    email that never left."""
+    import httpx
+    import harvey.integrations.gmail as gmail
+    body = 'not json' if expires_in == '3600' else {'access_token': 't', 'expires_in': expires_in}
+    transport = httpx.MockTransport(lambda r: httpx.Response(200, **(
+        {'text': body} if isinstance(body, str) else {'json': body})))
+    client = httpx.AsyncClient
+    monkeypatch.setattr(gmail.httpx, 'AsyncClient', lambda **kw: client(transport=transport, **kw))
+    monkeypatch.setattr(gmail, '_load_token', lambda: {'refresh_token': 'r'})
+    p = GmailProvider(SimpleNamespace(), SimpleNamespace(gmail_client_id='i', gmail_client_secret='s'))
+    token = await p._token()
+    assert token in (None, 't')
+    if expires_in is None:
+        assert token == 't'

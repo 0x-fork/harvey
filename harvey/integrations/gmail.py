@@ -111,9 +111,22 @@ class GmailProvider(MailProvider):
                 "Re-run 'harvey gmail auth'."
             )
             return None
-        data = resp.json()
-        self._access_token = data.get("access_token", "")
-        self._access_expires = time.time() + float(data.get("expires_in", 3600))
+        # A garbled answer is no token, not an exception: one raised here
+        # would escape a send and be recorded as "maybe sent".
+        try:
+            data = resp.json()
+        except ValueError:
+            data = None
+        token = data.get("access_token") if isinstance(data, dict) else None
+        if not isinstance(token, str) or not token:
+            logger.error("Gmail token refresh returned no access token.")
+            return None
+        try:
+            expires_in = float(data.get("expires_in") or 3600)
+        except (TypeError, ValueError):
+            expires_in = 3600.0
+        self._access_token = token
+        self._access_expires = time.time() + expires_in
         return self._access_token or None
 
     async def _request(
@@ -207,12 +220,14 @@ class GmailProvider(MailProvider):
                         if isinstance(data.get("threadId", ""), str) else ""),
         )
 
-    async def get_replies(self, limit: int = 50) -> list[InboundMessage]:
+    async def get_replies(self, limit: int = 500) -> list[InboundMessage]:
         """Read the complete recent inbox or raise, so sends wait on failure.
 
         ``limit`` is a page size, not a cap on replies: a reply beyond the
         first page must still stop its queued follow-ups. Like the Graph
-        provider, bound pagination and never return a partial inbox.
+        provider, bound pagination and never return a partial inbox. Pages
+        are Gmail's largest (a listing is ids only), so the bound is
+        MAX_INBOX_PAGES x 500 messages a week before sending is held.
         """
         params = {"q": "in:inbox -from:me newer_than:7d",
                   "maxResults": max(1, min(500, int(limit)))}
