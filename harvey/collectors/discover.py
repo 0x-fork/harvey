@@ -343,6 +343,7 @@ class Business:
     maps_rank: int | None = None     # position in Google Maps results
     keyword: str = ""                # the search that produced the ranks above
     external_id: str = ""            # "<provider>:<stable id>"
+    alt_ids: tuple[str, ...] = ()    # other ids the same business was stored under
     source_url: str = ""
     provider: str = ""
     raw_title: str = ""             # SERP evidence for junk filtering before normalization
@@ -444,6 +445,9 @@ class DiscoveryProvider:
     # Geocode cities before the run (listings search a radius; the
     # DataForSEO rank providers search from a point).
     needs_coordinates: bool = False
+    # Rank signals this provider measures. For each one, a search that no
+    # longer finds a business it found before records that, per phrase.
+    rank_codes: tuple[str, ...] = ()
 
     def configured(self, env: dict) -> bool:
         return all(env.get(k) for k in self.env_keys)
@@ -543,7 +547,8 @@ class DataForSEOListings(DiscoveryProvider):
             review_count=rating.get("votes_count"),
             is_claimed=item.get("is_claimed"),
             has_website=bool(url),
-            external_id=f"dataforseo:{item['place_id']}" if item.get("place_id") else "",
+            external_id=_gbp_ids(item)[0],
+            alt_ids=_gbp_ids(item)[1],
             source_url=item.get("check_url") or "",
             provider=self.key,
         )
@@ -578,8 +583,12 @@ class DataForSEOSerp(DiscoveryProvider):
     # poll for it minutes later); the run loop checks the spend cap between
     # synchronous calls, so Live keeps that check honest.
     PAGE_COST = 0.002
-    # DataForSEO's documented example radius for a point search.
-    POINT_RADIUS = "200"
+    # The radius of the search point. DataForSEO documents it in mm
+    # (199-199999), so 2000 is 2 m: a pinpoint at the city centre, which is
+    # what "when we searched from downtown Denver" means. Chosen so that if
+    # the unit were metres it would still be 2 km, still downtown.
+    POINT_RADIUS = "2000"
+    rank_codes = ("SERP_RANK", "IN_LOCAL_PACK")
 
     def estimate(self, queries):
         # Billing is base price x number of pages, 10 results to a page.
@@ -672,6 +681,7 @@ class DataForSEOMaps(DataForSEOSerp):
               "searched from downtown', not an absolute position.")
 
     SERP_COST = 0.002     # per SERP of up to 100 results
+    rank_codes = ("MAPS_RANK",)
     # City-wide zoom; DataForSEO accepts 3z-21z and defaults to 17z (a few
     # streets), which would rank only whoever is closest to the pin.
     ZOOM = "12z"
@@ -691,10 +701,7 @@ class DataForSEOMaps(DataForSEOSerp):
                 continue
             url = item.get("url") or ""
             domain = normalize_domain(item.get("domain") or url)
-            place = item.get("place_id") or ""
-            cid = item.get("cid") or ""
-            external = (f"dataforseo:{place}" if place else
-                        f"dataforseo:cid:{cid}" if cid else "")
+            external, alt_ids = _gbp_ids(item)
             if not (domain or external):
                 continue
             rating = item.get("rating") or {}
@@ -710,10 +717,24 @@ class DataForSEOMaps(DataForSEOSerp):
                 is_claimed=item.get("is_claimed"),
                 has_website=bool(url or domain),
                 maps_rank=item.get("rank_group"),
-                external_id=external, source_url=url,
+                external_id=external, alt_ids=alt_ids, source_url=url,
                 provider=self.key, keyword=keyword,
             ))
         return out
+
+
+def _gbp_ids(item: dict) -> tuple[str, tuple[str, ...]]:
+    """(external_id, aliases) for a Google Business Profile result.
+
+    Keyed on cid: it is the one id the organic local pack carries too, so a
+    websiteless business seen in the pack and then on Maps is one company.
+    place_id stays an alias, because companies were stored by it before.
+    """
+    place = item.get("place_id") or ""
+    cid = str(item.get("cid") or "")
+    if cid:
+        return f"dataforseo:cid:{cid}", ((f"dataforseo:{place}",) if place else ())
+    return (f"dataforseo:{place}" if place else ""), ()
 
 
 def _best(current: int | None, new) -> int | None:
@@ -733,6 +754,7 @@ class Serper(DiscoveryProvider):
     key = "serper"
     label = "Serper"
     kind = "serp"
+    rank_codes = ("SERP_RANK",)
     blurb = ("Fast Google search with rank positions. The easiest one to try: "
              "2,500 free queries, no credit card, one API key.")
     cost_note = "~$0.30-$1.00 per 1,000 searches depending on plan"
@@ -1163,6 +1185,7 @@ async def run_discovery(
     seen: set[str] = set()
     best_ranks: dict[tuple[str, str], tuple] = {}
     company_ids: dict[str, str] = {}
+    ranked_in_run: dict[tuple[str, str], set[str]] = {}
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
             for i, query in enumerate(queries):
@@ -1203,7 +1226,21 @@ async def run_discovery(
                     if not ident:
                         continue
                     first = ident not in seen
-                    rank_key = (ident, (biz.keyword or query.keyword()).lower())
+                    if first:
+                        seen.add(ident)
+                        company_id, is_new = await _upsert(state, biz, query)
+                        if is_new:
+                            report.new_companies += 1
+                        else:
+                            report.known_companies += 1
+                        company_ids[ident] = company_id
+                    company_id = company_ids[ident]
+                    phrase = biz.keyword or query.keyword()
+                    for code, value in zip(RANK_CODES, _rank_tuple(biz)):
+                        if value is not None:
+                            ranked_in_run.setdefault((code, phrase), set()).add(company_id)
+
+                    rank_key = (ident, phrase.lower())
                     ranks = _rank_tuple(biz)
                     previous = best_ranks.get(rank_key)
                     improved = previous is None or any(
@@ -1222,19 +1259,25 @@ async def run_discovery(
                         best_ranks[rank_key] = tuple(
                             _best(old, new) for new, old in
                             zip(ranks, previous or (None,) * len(ranks)))
-
-                    if first:
-                        seen.add(ident)
-                        company_id, is_new = await _upsert(state, biz, query)
-                        if is_new:
-                            report.new_companies += 1
-                        else:
-                            report.known_companies += 1
-                        company_ids[ident] = company_id
-                    company_id = company_ids[ident]
                     batch.extend(_observations(biz, company_id, confirmed,
                                                report.run_id, query=query,
                                                ranks_only=not first))
+
+                # A business this phrase ranked before, and that no search for
+                # it this run has found, is no longer ranked (within depth) or
+                # no longer in the pack. Say so, so the latest reading is true.
+                phrase = query.keyword()
+                for code in provider.rank_codes:
+                    if code not in confirmed:
+                        continue
+                    found_now = ranked_in_run.setdefault((code, phrase), set())
+                    for gone in await state.ranked_company_ids(code, phrase) - found_now:
+                        batch.append({
+                            "company_id": gone, "signal_code": code,
+                            "collector": "discover", "value_num": 0.0,
+                            "value_text": phrase, "confidence": 1.0,
+                            "evidence_url": "", "run_id": report.run_id,
+                        })
 
                 # Flush every batch. The observations are the asset; buffering
                 # them until some threshold means a run that dies loses them.
@@ -1261,8 +1304,9 @@ async def _upsert(state, biz: Business, query: DiscoveryQuery) -> tuple[str, boo
     existing = None
     if biz.domain:
         existing = await state.get_company_by_domain(biz.domain)
-    if existing is None and biz.external_id:
-        existing = await state.get_company_by_external_id(biz.external_id)
+    for external in (biz.external_id, *biz.alt_ids):
+        if existing is None and external:
+            existing = await state.get_company_by_external_id(external)
     if existing:
         return existing.id, False
 
@@ -1281,6 +1325,7 @@ async def _upsert(state, biz: Business, query: DiscoveryQuery) -> tuple[str, boo
 
 
 RANK_FIELDS = ("rank", "local_pack_rank", "maps_rank")
+RANK_CODES = ("SERP_RANK", "IN_LOCAL_PACK", "MAPS_RANK")      # same order
 
 
 def _rank_tuple(biz: Business) -> tuple:

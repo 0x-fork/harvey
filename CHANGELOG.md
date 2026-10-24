@@ -38,7 +38,10 @@ minor versions can still change behaviour.
   claimed status, keeping businesses with no website by their place_id
   (`NO_WEBSITE`). Both search from the geocoded city centre. Every rank is
   stored with the search phrase that produced it ("#14 for 'roofer Denver,
-  CO'"), one per business per phrase, keeping the best. `icp.keyword_variants`
+  CO'"), one per business per phrase, keeping the best. When a later search
+  for that phrase no longer finds a business, Harvey records that, so an old
+  rank or a lost pack slot doesn't keep matching. Websiteless businesses are
+  keyed on Google's cid, so the pack and Maps resolve to one company. `icp.keyword_variants`
   adds search phrases per industry. The cohort builder takes numeric ranges
   (Signals tab, `/api/cohort` `ranges`, `/api/cohort.csv?ranges=SERP_RANK:11:30`),
   so "organic rank 11-30, not in the local pack" is one query. The signal

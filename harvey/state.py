@@ -1589,7 +1589,15 @@ class StateManager:
     # and signal, with history still on disk underneath). `positive` is the
     # subset where the finding is actually true — value_num IS NULL covers text
     # signals like INCUMBENT_AGENCY, where the row's existence IS the finding.
-    _CURRENT_CTE = """
+    # Rank signals are different: a company has one rank PER SEARCH PHRASE
+    # (value_text), so "is it ranked" and "rank 11-30" read the newest row of
+    # each phrase — #4 for one search and #18 for another is in range on the
+    # second. Ties within one second (two searches in a run) go to the row
+    # written last. A search that no longer finds the company writes 0 for
+    # that phrase, which reads as absent. Rows from before phrases were
+    # stored (empty value_text) stop counting once a phrased row exists.
+    _RANK_CODES = "('SERP_RANK', 'IN_LOCAL_PACK', 'MAPS_RANK')"
+    _CURRENT_CTE = f"""
     WITH latest AS (
         SELECT o.* FROM observations o
         JOIN (SELECT company_id, signal_code, MAX(observed_at) AS t
@@ -1597,9 +1605,27 @@ class StateManager:
           ON newest.company_id = o.company_id
          AND newest.signal_code = o.signal_code
          AND newest.t = o.observed_at
+        WHERE o.signal_code NOT IN {_RANK_CODES}
+    ),
+    ranked AS (
+        SELECT o.* FROM observations o
+        WHERE o.signal_code IN {_RANK_CODES}
+          AND o.rowid = (
+              SELECT n.rowid FROM observations n
+              WHERE n.company_id = o.company_id
+                AND n.signal_code = o.signal_code
+                AND COALESCE(n.value_text, '') = COALESCE(o.value_text, '')
+              ORDER BY n.observed_at DESC, n.rowid DESC LIMIT 1)
+          AND NOT (COALESCE(o.value_text, '') = '' AND EXISTS (
+              SELECT 1 FROM observations p
+              WHERE p.company_id = o.company_id
+                AND p.signal_code = o.signal_code
+                AND COALESCE(p.value_text, '') != ''))
     ),
     positive AS (
         SELECT * FROM latest WHERE value_num IS NULL OR value_num != 0
+        UNION ALL
+        SELECT * FROM ranked WHERE value_num IS NOT NULL AND value_num != 0
     )
     """
 
@@ -1657,23 +1683,15 @@ class StateManager:
             async with db.execute(sql, params) as cursor:
                 return [row[0] for row in await cursor.fetchall()]
 
-    # Ranks are recorded per search phrase (value_text), so "rank 11-30"
-    # reads the newest observation of EACH phrase — a company at #4 for one
-    # search and #18 for another is in range on the second. For numeric
-    # signals without a phrase this is the same as `latest`.
-    _KEYED_CTE = """,
-    keyed AS (
-        SELECT o.* FROM observations o
-        JOIN (SELECT company_id, signal_code, COALESCE(value_text, '') AS vt,
-                     MAX(observed_at) AS t
-              FROM observations
-              GROUP BY company_id, signal_code, COALESCE(value_text, '')) newest
-          ON newest.company_id = o.company_id
-         AND newest.signal_code = o.signal_code
-         AND newest.vt = COALESCE(o.value_text, '')
-         AND newest.t = o.observed_at
-    )
-    """
+    async def ranked_company_ids(self, code: str, phrase: str) -> set[str]:
+        """Companies currently ranked (or in the pack) for this search phrase."""
+        async with self._connect() as db:
+            async with db.execute(
+                self._CURRENT_CTE + " SELECT DISTINCT company_id FROM positive "
+                "WHERE signal_code = ? AND value_text = ? AND company_id != ''",
+                (code, phrase),
+            ) as cursor:
+                return {row[0] for row in await cursor.fetchall()}
 
     async def cohort_companies(self, require: list[str], exclude: list[str],
                                offset: int = 0, limit: int | None = None,
@@ -1703,8 +1721,9 @@ class StateManager:
                          f"WHERE signal_code IN ({','.join('?' for _ in exclude)}))")
             params.extend(exclude)
         for r in ranges:
-            sub = ("id IN (SELECT company_id FROM keyed WHERE signal_code = ? "
-                   "AND value_num IS NOT NULL")
+            # The same current, positive, confidence >= 0 view require uses.
+            sub = ("id IN (SELECT company_id FROM positive WHERE signal_code = ? "
+                   "AND value_num IS NOT NULL AND confidence >= 0")
             params.append(r["code"])
             if r.get("min") is not None:
                 sub += " AND value_num >= ?"
@@ -1713,7 +1732,7 @@ class StateManager:
                 sub += " AND value_num <= ?"
                 params.append(float(r["max"]))
             where.append(sub + ")")
-        base = (self._CURRENT_CTE + self._KEYED_CTE +
+        base = (self._CURRENT_CTE +
                 " SELECT {columns} FROM companies WHERE " + " AND ".join(where))
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
