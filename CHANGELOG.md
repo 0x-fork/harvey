@@ -142,6 +142,15 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- **LinkedIn-profile web searches run only when LinkedIn prospecting is on**
+  (from #60 by FreemanGT). Searching `site:linkedin.com/in` for your titles
+  found names with no company and no email, which Harvey can never verify
+  or write to, and they counted toward the "no usable emails" check that
+  pauses prospecting for the day. It also ran first and could use up the
+  cycle's three searches before company discovery, which finds people you
+  can email, got any. That search now runs only when LinkedIn prospecting
+  is on (`channels.linkedin.enabled`, off by default) with a LinkedIn login.
+
 - **A reply stops the cold email to the whole company.** Stop-on-reply was
   per person, so when an owner wrote back "not interested" the office
   manager still got the follow-up. Now a reply (not a bounce, an
