@@ -19,7 +19,7 @@ import json
 import logging
 import time
 import webbrowser
-from email.message import EmailMessage
+from email.message import EmailMessage, Message
 from email.utils import parseaddr
 
 import httpx
@@ -481,7 +481,18 @@ class GmailProvider(MailProvider):
             if not data:
                 return ""
             try:
-                return base64.urlsafe_b64decode(data + "===").decode(errors="replace")
+                raw = base64.urlsafe_b64decode(data + "===")
+                mime = Message()
+                for header in part.get("headers", []):
+                    if header.get("name", "").lower() == "content-type":
+                        mime["Content-Type"] = header.get("value", "")
+                        break
+                charset = mime.get_content_charset() or "utf-8"
+                try:
+                    return raw.decode(charset, errors="replace")
+                except (LookupError, ValueError):
+                    # Unknown or invalid charsets keep the existing UTF-8 fallback.
+                    return raw.decode("utf-8", errors="replace")
             except Exception:
                 return ""
 
