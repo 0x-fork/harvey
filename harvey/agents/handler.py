@@ -736,7 +736,8 @@ class Handler:
     def _instantly_reply_held(self, prospect, response: str) -> list[str]:
         """Why an Instantly reply must not go out by itself, or []."""
         gate = pre_send_check(prospect.email, "Re:", response, kind="reply")
-        return list(gate.reasons) + autopilot_review("", response, self.config)
+        return list(gate.reasons) + autopilot_review("", response, self.config,
+                                                     recipient=prospect.email)
 
     async def _classify_intent(self, reply_text: str, prospect) -> str:
         """Ask the brain to classify the reply's intent."""

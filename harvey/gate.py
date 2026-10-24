@@ -129,13 +129,32 @@ _FILE_ENDINGS = frozenset("""
     js ts pdf png jpg jpeg gif svg webp heic txt csv doc docx xls xlsx ppt pptx key pages
     json yaml yml toml xml html htm css exe dmg msi bat ini cfg mp3 mp4 wav
 """.split())
-# Endings a spelled-out "evil dot com" is read as a link for.
-_SPOKEN_ENDINGS = "com|net|org|io|co|ai|app|dev|info|biz|me|us|xyz|site|online|link"
+# A bare "name.ending" with no path or www. is a link when the ending is a
+# real one: any two letters (country codes), or one of these. A path or
+# www. makes anything a link. Prose with a missing space ("here.Then",
+# "approx.half") has neither.
+_KNOWN_ENDINGS = frozenset("""
+    com net org info biz name pro mobi asia tel xxx io ai app dev xyz site online store shop
+    tech cloud page agency studio digital email live life media news blog club world today
+    one link click top icu buzz win bid loan work fun space website host press services
+    solutions company business center group network systems software tools zone works sale
+    deals plus vip best ltd inc llc gmbh zip mov cfd sbs cyou rest bar beauty hair skin
+    love sexy porn casino bet poker game games bio eco green energy solar money cash pay
+    finance capital fund trade market markets exchange loans credit insurance legal law
+    health care clinic dental doctor coach academy school university courses training jobs
+    careers events tickets travel tours hotel homes house realty estate properties land
+    gov edu mil int test example invalid localhost onion
+""".split())
+_ENDINGS_RE = "|".join(sorted(_KNOWN_ENDINGS, key=len, reverse=True))
 _ZERO_WIDTH_RE = re.compile("[\u200b-\u200f\u2060\ufeff]")
-_DOT_FORMS_RE = re.compile(r"\s*[\[(]\s*(?:\.|dot)\s*[\])]\s*", re.IGNORECASE)
-_SPOKEN_DOT_RE = re.compile(rf"(?<=\w\w)\s+dot\s+(?=(?:{_SPOKEN_ENDINGS})\b)", re.IGNORECASE)
+_DOT_FORMS_RE = re.compile(r"\s*[\[({]\s*(?:\.|dot)\s*[\])}]\s*", re.IGNORECASE)
+_SPOKEN_DOT_RE = re.compile(rf"(?<=\w\w)\s+dot\s+(?=(?:{_ENDINGS_RE}|[a-z]{{2}})\b)", re.IGNORECASE)
+_SPACED_DOT_RE = re.compile(rf"(?<=\w)\s+\.\s*(?=(?:{_ENDINGS_RE})\b|[^\W\d_]{{2,24}}/)", re.IGNORECASE)
 _SCHEME_URL_RE = re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s<>\"']+", re.IGNORECASE)
-_EMAIL_HOST_RE = re.compile(r"[\w.%+\-]+@((?:[^\W_][\w-]*\.)+[^\W\d_]{2,})")
+# An address, or just "@domain" (the name before it is optional to a reader).
+_EMAIL_HOST_RE = re.compile(r"(?:[\w.%+\-]+|\"[^\"\n]*\"|“[^”\n]*”)?@((?:[^\W_][\w-]*\.)+[^\W\d_]{2,})")
+_HOST_OK_RE = re.compile(r"^[^\W_](?:[\w.-]*[^\W_])?$")
+UNREADABLE_LINK = "link that can't be read"
 _IP_RE = re.compile(r"(?<![\w.])\d{1,3}(?:\.\d{1,3}){3}(?![\w.])")
 _BARE_RE = re.compile(
     r"(?<![\w@.])((?:[^\W_](?:[\w-]{0,61}[^\W_])?\.)+([^\W\d_]{2,24}))(?![\w-])([/?#][^\s<>\"']*)?")
@@ -149,6 +168,7 @@ def _normalize(text: str) -> str:
     text = unicodedata.normalize("NFKC", text or "")
     text = _ZERO_WIDTH_RE.sub("", text).replace("\u3002", ".").replace("\uff61", ".")
     text = _DOT_FORMS_RE.sub(".", text)
+    text = _SPACED_DOT_RE.sub(".", text)
     return _SPOKEN_DOT_RE.sub(".", text)
 
 
@@ -172,7 +192,11 @@ def find_links(text: str) -> list[tuple[str, str]]:
             host = _host(parts.hostname or "")
             path = parts.path
         except ValueError:
-            host, path = _host(url.split("://", 1)[-1].split("/", 1)[0]), ""
+            host, path = "", ""
+        if not _HOST_OK_RE.match(host):
+            # Won't parse, or a host no browser would take as written: never
+            # yours, whatever it ends in.
+            host, path = UNREADABLE_LINK, ""
         found.append((host, host + path))
     rest = _SCHEME_URL_RE.sub(" ", text)
     for m in _EMAIL_HOST_RE.finditer(rest):
@@ -181,7 +205,10 @@ def find_links(text: str) -> list[tuple[str, str]]:
     for m in _IP_RE.finditer(rest):
         found.append((m.group(0), m.group(0)))
     for m in _BARE_RE.finditer(rest):
-        if m.group(2).lower() in _FILE_ENDINGS and not m.group(3):
+        ending, has_path = m.group(2).lower(), bool(m.group(3))
+        www = m.group(1).lower().startswith("www.")
+        if not has_path and not www and (ending in _FILE_ENDINGS or not (
+                len(ending) == 2 or ending in _KNOWN_ENDINGS)):
             continue
         host = _host(m.group(1))
         found.append((host, host + (m.group(3) or "").split("?")[0].split("#")[0]))
@@ -224,7 +251,15 @@ def _is_ours(host: str, allowed: set[str]) -> bool:
 
 
 def _is_booking_page(link: str, prefix: str) -> bool:
-    return bool(prefix) and (link.rstrip("/") == prefix or link.startswith(prefix + "/"))
+    """``link`` is your booking page (or below it), as a browser resolves it:
+    "cal.com/you/15/../../them" is someone else's page."""
+    from urllib.parse import unquote
+    if not prefix:
+        return False
+    link = unquote(unquote(link))
+    if any(seg in ("..", ".") for seg in link.split("/")[1:]):
+        return False
+    return link.rstrip("/") == prefix or link.startswith(prefix + "/")
 
 
 def _shown(host: str, link: str, prefix: str) -> str:
@@ -275,15 +310,19 @@ def _instruction_runs(root) -> dict[tuple, str]:
     return _leak_cache["runs"]
 
 
-def autopilot_review(subject: str, body: str, config, root=None) -> list[str]:
+def autopilot_review(subject: str, body: str, config, root=None, recipient: str = "") -> list[str]:
     """Why an email nobody approved must wait for a human, or [] to send.
 
     Two things a planted instruction would try: point the reader somewhere
-    that isn't yours, or get Harvey to quote its own instructions back."""
+    that isn't yours, or get Harvey to quote its own instructions back.
+    ``recipient``'s own domain is fine to mention to them ("saw
+    joesroofing.com"): it's theirs."""
     from harvey.paths import PROJECT_ROOT
     reasons: list[str] = []
     text = f"{subject or ''}\n{body or ''}"
     allowed = allowed_link_domains(config)
+    if "@" in (recipient or ""):
+        allowed.add(_host(recipient.rsplit("@", 1)[1]))
     prefix = _booking_prefix(config)
     foreign = list(dict.fromkeys(
         _shown(host, link, prefix) for host, link in find_links(text)

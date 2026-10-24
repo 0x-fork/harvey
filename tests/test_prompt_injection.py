@@ -197,10 +197,28 @@ def test_your_own_domains_pass(body):
     ("https://evil.example\\.mysend.test/", "evil.example"),
     # A booking link allows that page, not everyone's page on the same host.
     ("Book: https://cal.com/attacker/meet", "cal.com/attacker"),
+    # ...and climbing out of it is someone else's page (second review, #66).
+    ("https://cal.com/sam/15/../../attacker", "cal.com"),
+    ("cal.com/sam/15/%2e%2e/%2e%2e/attacker", "cal.com"),
+    # A link that won't parse is never yours.
+    ("https://evil.example[.mysend.test/x", "link that can't be read"),
+    ("https://evil.example%00.mysend.test/x", "link that can't be read"),
+    # Spellings that dodge a plain dot.
+    ("evil . com/x", "evil.com"),
+    ("write to @evil.example", "evil.example"),
 ])
 def test_a_link_elsewhere_is_held(body, host):
     [reason] = autopilot_review("hi", body, _cfg())
     assert host in reason and "link_domains" in reason
+
+
+@pytest.mark.parametrize("body", [
+    "Saw joesroofing.com, the gallery is great. Who handles the phones?",
+    "I emailed info@joesroofing.com last week.",
+    "Read it here.Then let me know, approx.half of teams do. Google.Maps too.",
+])
+def test_their_own_site_and_ordinary_prose_pass(body):
+    assert autopilot_review("hi", body, _cfg(), recipient="joe@joesroofing.com") == []
 
 
 def test_the_subject_is_checked_too():

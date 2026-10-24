@@ -139,7 +139,7 @@ class Sender:
         for p in prospects:
             fields = " \n".join(str(v or "") for v in (
                 p.first_name, p.last_name, p.company, p.title, p.personalization_notes))
-            held = autopilot_review("", fields, self.config)
+            held = autopilot_review("", fields, self.config, recipient=p.email)
             if held:
                 logger.warning(f"Sender: left {p.email} out of the Instantly upload: {held}")
             else:
@@ -571,7 +571,8 @@ class Sender:
         if item.get("approved_by") != "you":
             # Nobody approved this one (autopilot): what a planted
             # instruction would add sends it back to you instead.
-            held = autopilot_review(item["subject"], self._outgoing_body(item), self.config)
+            held = autopilot_review(item["subject"], self._outgoing_body(item), self.config,
+                                    recipient=item["to_email"])
             if held:
                 logger.warning(f"Sender: holding email to {item['to_email']} for review: {held}")
                 return "pending_review", (HELD_FOR_REVIEW + "; ".join(held))[:300]
