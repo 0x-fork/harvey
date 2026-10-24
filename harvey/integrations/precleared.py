@@ -472,15 +472,17 @@ def hold_message(hold: dict) -> dict:
             "title": "Your Precleared key is out of checks for today",
             "detail": (f"{emails}. The key has used today's free checks and has no pack "
                        f"left. Buy checks to send them now: {url or BUY_URL}. Otherwise they "
-                       f"go out after the free checks reset at midnight UK time. {replies}"),
+                       "go out after the free checks reset at midnight UK time, or switch the "
+                       f"check off (compliance.precleared.enabled: false). {replies}"),
         }
     if kind == "key_rejected":
         return {
             "tone": "bad", "url": url or GET_KEY_URL, "url_label": "Get a new key",
             "title": "Precleared rejected your key",
             "detail": (f"{emails}. PRECLEARED_API_KEY was rejected (wrong or revoked). "
-                       "Check the key in .env, or get a new free key at "
-                       f"{url or GET_KEY_URL}. {replies}"),
+                       "Check the key in .env, get a new free key at "
+                       f"{url or GET_KEY_URL}, or switch the check off "
+                       f"(compliance.precleared.enabled: false). {replies}"),
         }
     reason = _text(hold.get("reason")) or "no answer"
     return {
