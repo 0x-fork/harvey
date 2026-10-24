@@ -30,6 +30,21 @@ minor versions can still change behaviour.
   `skills/signal_playbook.md` has a short section on using a posting as the
   hook: cite the role as posted, never guess salary or headcount, don't
   imply inside knowledge, mind the posting date.
+
+- **Find companies by where they rank in a city.** DataForSEO SERP now also
+  records who holds the local 3-pack (`IN_LOCAL_PACK`, slot 1-3, ads
+  excluded), and a new **DataForSEO Google Maps** provider records each
+  business's map position (`MAPS_RANK`) with its rating, category and
+  claimed status, keeping businesses with no website by their place_id
+  (`NO_WEBSITE`). Both search from the geocoded city centre. Every rank is
+  stored with the search phrase that produced it ("#14 for 'roofer Denver,
+  CO'"), one per business per phrase, keeping the best. `icp.keyword_variants`
+  adds search phrases per industry. The cohort builder takes numeric ranges
+  (Signals tab, `/api/cohort` `ranges`, `/api/cohort.csv?ranges=SERP_RANK:11:30`),
+  so "organic rank 11-30, not in the local pack" is one query. The signal
+  playbook has rank-based angles, worded as "when we searched from downtown
+  Denver", never as an absolute position.
+
 - **A built-in skill for selling to YC startups.** The `yc` discovery preset
   (`harvey discover --preset yc`, or *Look for: YC startups* on Discover)
   searches your industries, through Serper or DataForSEO SERP, for companies
@@ -95,6 +110,17 @@ minor versions can still change behaviour.
   for one of them, the same email domain, and only if it's that company's
   own domain, never a shared one like gmail.com or rr.com. Instantly
   campaigns Harvey creates turn on Instantly's own `stop_for_company`.
+
+- **DataForSEO SERP sends a location.** It sent only a keyword, but
+  DataForSEO requires a location on every task, so searches failed or came
+  back un-localised. It now sends the geocoded city point, or a
+  "Denver,Colorado,United States" location name, or the United States for
+  searches with no city. "No search results" is now an empty answer rather
+  than an error; other task errors still stop that query and are reported.
+- **DataForSEO SERP estimates were 3.3x low.** They used the standard-queue
+  price ($0.0006 per 10 results); Harvey calls the Live endpoint ($0.002),
+  so a depth-30 search is $0.006, not $0.0018. Harvey stays on Live: it's
+  synchronous, so the spend cap checked between searches sees real spend.
 
 - **Gmail reads replies in the charset they were written in** (from #58 by
   xiaoheiai4719-collab). Every reply was decoded as UTF-8, so a reply sent

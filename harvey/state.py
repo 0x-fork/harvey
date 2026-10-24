@@ -1657,25 +1657,64 @@ class StateManager:
             async with db.execute(sql, params) as cursor:
                 return [row[0] for row in await cursor.fetchall()]
 
+    # Ranks are recorded per search phrase (value_text), so "rank 11-30"
+    # reads the newest observation of EACH phrase — a company at #4 for one
+    # search and #18 for another is in range on the second. For numeric
+    # signals without a phrase this is the same as `latest`.
+    _KEYED_CTE = """,
+    keyed AS (
+        SELECT o.* FROM observations o
+        JOIN (SELECT company_id, signal_code, COALESCE(value_text, '') AS vt,
+                     MAX(observed_at) AS t
+              FROM observations
+              GROUP BY company_id, signal_code, COALESCE(value_text, '')) newest
+          ON newest.company_id = o.company_id
+         AND newest.signal_code = o.signal_code
+         AND newest.vt = COALESCE(o.value_text, '')
+         AND newest.t = o.observed_at
+    )
+    """
+
     async def cohort_companies(self, require: list[str], exclude: list[str],
-                               offset: int = 0, limit: int | None = None) -> tuple[int, list[dict]]:
-        """Count all matches and page company details in one read snapshot."""
-        if not require:
+                               offset: int = 0, limit: int | None = None,
+                               ranges: list[dict] | None = None) -> tuple[int, list[dict]]:
+        """Count all matches and page company details in one read snapshot.
+
+        ``ranges`` are numeric filters, ``[{"code", "min", "max"}]`` with
+        either bound optional: organic rank 11-30 is
+        ``{"code": "SERP_RANK", "min": 11, "max": 30}``. A range implies the
+        signal is present, so a range alone is a cohort.
+        """
+        ranges = list(ranges or [])
+        if not require and not ranges:
             return 0, []
         require = list(dict.fromkeys(require))
         exclude = list(dict.fromkeys(exclude))
-        matches = (
-            "SELECT company_id FROM positive WHERE company_id != '' AND "
-            f"signal_code IN ({','.join('?' for _ in require)}) "
-            "AND confidence >= 0 GROUP BY company_id "
-            "HAVING COUNT(DISTINCT signal_code) = ?"
-        )
-        params = [*require, len(require)]
+        where, params = [], []
+        if require:
+            where.append(
+                "id IN (SELECT company_id FROM positive WHERE company_id != '' AND "
+                f"signal_code IN ({','.join('?' for _ in require)}) "
+                "AND confidence >= 0 GROUP BY company_id "
+                "HAVING COUNT(DISTINCT signal_code) = ?)")
+            params += [*require, len(require)]
         if exclude:
-            matches += (" AND company_id NOT IN (SELECT company_id FROM positive "
-                        f"WHERE signal_code IN ({','.join('?' for _ in exclude)}))")
+            where.append("id NOT IN (SELECT company_id FROM positive "
+                         f"WHERE signal_code IN ({','.join('?' for _ in exclude)}))")
             params.extend(exclude)
-        base = self._CURRENT_CTE + " SELECT {columns} FROM companies WHERE id IN (" + matches + ")"
+        for r in ranges:
+            sub = ("id IN (SELECT company_id FROM keyed WHERE signal_code = ? "
+                   "AND value_num IS NOT NULL")
+            params.append(r["code"])
+            if r.get("min") is not None:
+                sub += " AND value_num >= ?"
+                params.append(float(r["min"]))
+            if r.get("max") is not None:
+                sub += " AND value_num <= ?"
+                params.append(float(r["max"]))
+            where.append(sub + ")")
+        base = (self._CURRENT_CTE + self._KEYED_CTE +
+                " SELECT {columns} FROM companies WHERE " + " AND ".join(where))
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN")
