@@ -22,7 +22,7 @@ from harvey.integrations.mail_provider import (
     NATIVE_PROVIDERS, get_mail_provider, strip_quoted_reply,
 )
 from harvey.models.conversation import Conversation, Message
-from harvey.state import StateManager
+from harvey.state import REVIEW_NEXT_REPLY_KEY, StateManager
 
 logger = logging.getLogger("harvey.handler")
 
@@ -542,6 +542,19 @@ class Handler:
             await self._queue_native_reply(
                 response, prospect, convo, reply_meta or {}, intent
             )
+        elif await self.state.get_setting(REVIEW_NEXT_REPLY_KEY + prospect.id):
+            # You undid their opt-out, and Instantly can't hold a reply for
+            # approval: the first answer after an undo is yours to send.
+            await self.state.update_conversation(convo.id, status="needs_human")
+            await self.state.delete_setting(REVIEW_NEXT_REPLY_KEY + prospect.id)
+            await self.state.log_action(
+                action_type="escalation",
+                agent="handler",
+                details={"prospect_email": lead_email,
+                         "reason": "first reply since you undid their opt-out",
+                         "reply_preview": reply_text[:200]},
+            )
+            logger.info(f"Handler: {lead_email} wrote after their opt-out was undone. Handed to you.")
         elif reply_uuid:
             result = await self.instantly.send_reply(reply_uuid, response)
             if result is not None:
@@ -673,6 +686,11 @@ class Handler:
         require_approval = getattr(
             self.config.channels.email, "require_approval", True
         )
+        # The first reply since you undid their opt-out waits for you, even
+        # on autopilot: the undo panel promises it.
+        review_key = REVIEW_NEXT_REPLY_KEY + prospect.id
+        if await self.state.get_setting(review_key):
+            require_approval = True
         subject = reply_meta.get("subject", "")
         if subject and not subject.lower().startswith("re:"):
             subject = f"Re: {subject}"
@@ -691,6 +709,7 @@ class Handler:
             in_reply_to=reply_meta.get("message_id", ""),
         )
         if item_id:
+            await self.state.delete_setting(review_key)
             mode = "queued for your approval" if require_approval else "queued to send"
             logger.info(f"Handler: reply to {prospect.email} {mode} ({intent}).")
             await self.state.log_action(

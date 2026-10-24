@@ -471,3 +471,69 @@ async def test_after_an_undo_their_next_reply_is_handled_normally(state):
     await make_handler(state, provider)._run_native()
     drafts = await state.get_outbox(status="pending_review")
     assert [d["kind"] for d in drafts] == ["reply"]      # waits for approval, as any reply
+
+
+@pytest.mark.asyncio
+async def test_on_autopilot_the_first_reply_after_an_undo_still_waits(state, monkeypatch):
+    # The undo panel promises their next reply is drafted for approval.
+    monkeypatch.setattr(Cfg.channels.email, "require_approval", False)
+    pid = await seed_prospect(state, status="opted_out")
+    assert await state.undo_opt_out(pid) is True
+
+    provider = FakeProvider()
+    provider.inbound = [InboundMessage(
+        provider_id="in6", from_email="jane@acme.com", subject="Re: hi",
+        body="Sorry, wrong button. What does it cost?",
+    )]
+    await make_handler(state, provider)._run_native()
+    assert [d["status"] for d in await state.get_outbox()] == ["pending_review"]
+
+    # Only the first one: after that, autopilot is autopilot again.
+    provider.inbound = [InboundMessage(
+        provider_id="in7", from_email="jane@acme.com", subject="Re: hi",
+        body="And is there a contract?",
+    )]
+    await make_handler(state, provider)._run_native()
+    # (Their newer reply also cancels the draft still waiting, as always.)
+    assert sorted(d["status"] for d in await state.get_outbox()) == ["approved", "cancelled"]
+
+
+@pytest.mark.asyncio
+async def test_on_instantly_the_first_reply_after_an_undo_goes_to_you(state, monkeypatch):
+    import harvey.agents.handler as handler_mod
+    monkeypatch.setattr(handler_mod, "legacy_sending_held", lambda cfg: False)
+    pid = await seed_prospect(state, status="opted_out")
+    assert await state.undo_opt_out(pid) is True
+
+    handler = make_handler(state, FakeProvider())
+    handler.provider = None                      # legacy Instantly path
+    sent = []
+
+    async def send_reply(uuid, body):
+        sent.append(body)
+        return {"ok": True}
+    handler.instantly.send_reply = send_reply
+    await handler._process_reply("jane@acme.com", "Sorry, wrong button. What does it cost?", "u1")
+
+    assert sent == []
+    assert [c.prospect_id for c in await state.get_conversations_by_status("needs_human")] == [pid]
+
+
+@pytest.mark.asyncio
+async def test_undo_and_its_log_are_one_write(state):
+    pid = await seed_prospect(state, status="opted_out")
+    assert await state.undo_opt_out(pid, details={"previous_why": "w"}) is True
+    [d] = await _logged(state, "opt_out_undone")
+    assert d == {"prospect_id": pid, "previous_why": "w"}
+    assert await state.undo_opt_out(pid) is False
+    assert len(await _logged(state, "opt_out_undone")) == 1     # no log for a refused undo
+
+
+@pytest.mark.asyncio
+async def test_actions_are_indexed_by_type(state):
+    import aiosqlite
+    async with aiosqlite.connect(state.db_path) as db:
+        async with db.execute("SELECT name FROM sqlite_master WHERE type = 'index' "
+                              "AND tbl_name = 'actions'") as cursor:
+            names = {r[0] for r in await cursor.fetchall()}
+    assert "idx_actions_type_created" in names

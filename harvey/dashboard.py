@@ -1330,13 +1330,11 @@ async def undo_opt_out(prospect_id: str, request: Request):
     state = _state()
     await state.init_db()
     history = await state.opt_out_history(prospect_id)
-    if not await state.undo_opt_out(prospect_id):
-        return _refuse("This person isn't opted out.")
     last = next((h for h in reversed(history) if h["action"] == "opt_out"), {})
-    await state.log_action("opt_out_undone", "dashboard", {
-        "prospect_id": prospect_id, "prospect_email": rows[0].get("email") or "",
-        "previous_why": last.get("why", ""), "previous_at": last.get("at", ""),
-    })
+    if not await state.undo_opt_out(prospect_id, details={
+            "prospect_email": rows[0].get("email") or "",
+            "previous_why": last.get("why", ""), "previous_at": last.get("at", "")}):
+        return _refuse("This person isn't opted out.")
     return {"success": True, "status": "replied"}
 
 

@@ -50,8 +50,9 @@ minor versions can still change behaviour.
   model's judgement), the words it matched and their message. **Why?** on
   their row in Contacts (or on the conversation) shows it, and **Undo
   opt-out** reverses a mistaken one after a confirm: they become *replied*,
-  so nothing is sent on its own and their next reply is drafted for your
-  approval. Opt-outs from before this show their last message instead, and
+  so nothing is sent on its own, and Harvey's answer to their next reply
+  waits for your approval even with `require_approval: false` (on
+  Instantly, which can't hold a reply, that conversation comes to you). Opt-outs from before this show their last message instead, and
   every undo is logged.
 - **`aiosmtplib` is now 5.1.3 or later** (was `>=3.0.1,<4`). Older versions
   wrote a CR/LF inside an address straight to the SMTP server, so an address

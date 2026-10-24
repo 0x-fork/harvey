@@ -2011,8 +2011,8 @@ function optOutPanel(p) {
       escHtml(statusMeta(d.status).label) + ').</span></div>';
   } else if (_optOut.armed) {
     html += '<div class="convo-actions"><span class="muted">Harvey will treat them as having replied. Nothing is ' +
-      'sent automatically, emails the opt-out cancelled stay cancelled, and their next reply gets a draft ' +
-      'for your approval. Only undo it if they didn’t mean to opt out.</span>' +
+      'sent automatically, emails the opt-out cancelled stay cancelled, and Harvey’s answer to their next ' +
+      'reply waits for your approval, even on autopilot. Only undo it if they didn’t mean to opt out.</span>' +
       '<button class="btn btn-primary btn-sm" onclick="undoOptOut()"' + (_optOut.busy ? ' disabled' : '') +
         '>Confirm undo</button>' +
       '<button class="btn btn-ghost btn-sm" onclick="_optOut.armed=false;renderContacts()">Cancel</button></div>';
