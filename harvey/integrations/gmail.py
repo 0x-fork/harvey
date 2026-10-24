@@ -15,11 +15,12 @@ rest.
 """
 
 import base64
+import codecs
 import json
 import logging
 import time
 import webbrowser
-from email.message import EmailMessage
+from email.message import EmailMessage, Message
 from email.utils import parseaddr
 
 import httpx
@@ -45,6 +46,9 @@ MAX_INBOX_PAGES = 40
 FULL_READ_EVERY_SECONDS = 24 * 3600
 # Labels that mean "not a reply to handle".
 _NOT_REPLIES = frozenset({"SENT", "DRAFT", "SPAM", "TRASH"})
+# Codecs Python accepts that are no real mail charset (see _extract_text).
+_NOT_MAIL_CHARSETS = frozenset({"punycode", "idna", "utf_7", "unicode_escape", "raw_unicode_escape"})
+MAX_DECODE_BYTES = 200_000
 # _request's answer for a 404 when the caller asked to know.
 _GONE = object()
 
@@ -481,9 +485,40 @@ class GmailProvider(MailProvider):
             if not data:
                 return ""
             try:
-                return base64.urlsafe_b64decode(data + "===").decode(errors="replace")
+                raw = base64.urlsafe_b64decode(data + "===")
             except Exception:
                 return ""
+            # Finding the charset must never cost the text: odd headers mean
+            # UTF-8, as before, not an empty body (an unsubscribe in it would
+            # be lost).
+            charset = "utf-8"
+            try:
+                headers = part.get("headers")
+                for header in headers if isinstance(headers, list) else []:
+                    if (isinstance(header, dict) and isinstance(header.get("value"), str)
+                            and str(header.get("name") or "").lower() == "content-type"):
+                        mime = Message()
+                        mime["Content-Type"] = header["value"]
+                        charset = mime.get_content_charset() or "utf-8"
+                        break
+            except Exception:
+                charset = "utf-8"
+            try:
+                # A sender picks the label. Codecs that aren't mail charsets
+                # are refused: punycode is quadratic (megabytes stall the
+                # heartbeat) and the escape codecs let them shape the text.
+                if codecs.lookup(charset).name.replace("-", "_") in _NOT_MAIL_CHARSETS:
+                    charset = "utf-8"
+            except (LookupError, ValueError, TypeError):   # unknown, or a null in the name
+                charset = "utf-8"
+            # Harvey keeps 5,000 characters of a body; decode no further than
+            # that could need.
+            raw = raw[:MAX_DECODE_BYTES]
+            try:
+                return raw.decode(charset, errors="replace")
+            except (LookupError, ValueError):
+                # Unknown or invalid charsets keep the existing UTF-8 fallback.
+                return raw.decode("utf-8", errors="replace")
 
         if payload.get("mimeType", "").startswith("text/plain"):
             return decode(payload)

@@ -53,6 +53,12 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- **Gmail reads replies in the charset they were written in** (from #58 by
+  xiaoheiai4719-collab). Every reply was decoded as UTF-8, so a reply sent
+  as ISO-8859-1 or Windows-1252 ("Je préfère mardi") reached the model
+  garbled. Each part now uses its declared charset; an unknown or missing
+  one, or odd headers, falls back to UTF-8 without losing the text. SMTP
+  and Microsoft 365 already decoded correctly.
 - **You see it when Harvey isn't sending because it couldn't read your
   inbox.** Sending waits until replies are read, so an opt-out stops its
   follow-up. That hold only showed in the log, so a lapsed Gmail sign-in
