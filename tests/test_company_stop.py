@@ -127,8 +127,9 @@ async def test_a_bounce_does_not_stop_colleagues(state):
 @pytest.mark.asyncio
 async def test_the_drain_cancels_a_colleague_s_follow_up(state):
     cid = await _company(state)
-    await _person(state, "ann@acme.com", cid, status="replied")
+    ann = await _person(state, "ann@acme.com", cid, status="replied")
     bob = await _person(state, "bob@acme.com", cid)
+    await state.stop_company(ann)
     queued = await _queued(state, bob, "bob@acme.com")
     provider = FakeProvider()
     await make_sender(state, provider)._drain_due()
@@ -140,10 +141,100 @@ async def test_the_drain_cancels_a_colleague_s_follow_up(state):
 @pytest.mark.asyncio
 async def test_a_new_campaign_skips_people_whose_colleague_replied(state):
     cid = await _company(state)
-    await _person(state, "ann@acme.com", cid, status="lost")
+    ann = await _person(state, "ann@acme.com", cid, status="lost")
+    await state.stop_company(ann)
     bob = await _person(state, "bob@acme.com", cid, status="new")
     dee = await _person(state, "dee@else.com", status="new")
     campaign = await seed_campaign(state, [bob, dee])
     await make_sender(state, FakeProvider())._stage_campaign_native(campaign)
     staged = {r["to_email"] for r in await state.get_outbox()}
     assert staged == {"dee@else.com"}
+
+
+# ── review: only real colleagues, only real answers ──
+
+
+@pytest.mark.asyncio
+async def test_two_companies_on_one_mail_domain_are_not_colleagues(state):
+    a, b = await _company(state, "annroofing.com"), await _company(state, "bobplumbing.com")
+    await _person(state, "ann@acme.com", a)
+    bob = await _person(state, "bob@acme.com", b)
+    queued = await _queued(state, bob, "bob@acme.com")
+    await _reply(state, "ann@acme.com")
+    assert (await _status(state, queued))[0] == "approved"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("domain", ["rr.com", "yahoo.co.uk", "earthlink.net", "btinternet.com", "shaw.ca", "pm.me"])
+async def test_isp_and_regional_mailboxes_are_not_a_company(state, domain):
+    await _person(state, f"ann@{domain}")
+    bob = await _person(state, f"bob@{domain}")
+    queued = await _queued(state, bob, f"bob@{domain}")
+    await _reply(state, f"ann@{domain}")
+    assert (await _status(state, queued))[0] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_one_side_without_a_company_matches_only_that_company_s_domain(state):
+    acme = await _company(state, "acme.com")
+    await _person(state, "ann@acme.com", acme)
+    bob = await _person(state, "bob@acme.com")                 # no company on file
+    queued = await _queued(state, bob, "bob@acme.com")
+    other = await _company(state, "agency.com")               # their mail isn't on their domain
+    cat = await _person(state, "cat@shared.net", other)
+    dan = await _person(state, "dan@shared.net")
+    dans = await _queued(state, dan, "dan@shared.net")
+    await _reply(state, "ann@acme.com")
+    await _reply(state, "cat@shared.net")
+    assert (await _status(state, queued))[0] == "cancelled"
+    assert (await _status(state, dans))[0] == "approved"
+    assert cat
+
+
+@pytest.mark.asyncio
+async def test_an_address_with_no_domain_matches_nobody(state):
+    ann = await _person(state, "ann@")
+    bob = await _person(state, "bob@")
+    queued = await _queued(state, bob, "bob@")
+    await state.stop_company(ann)
+    assert (await _status(state, queued))[0] == "approved"
+    assert await state.colleague_who_replied(bob) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("intent,body", [
+    ("ooo", "I'm out of the office until Monday."),
+    ("wrong_person", "Not me, talk to Bob."),
+])
+async def test_an_out_of_office_or_a_referral_does_not_stop_the_company(state, intent, body):
+    cid = await _company(state)
+    await _person(state, "ann@acme.com", cid)
+    bob = await _person(state, "bob@acme.com", cid)
+    queued = await _queued(state, bob, "bob@acme.com")
+    await _reply(state, "ann@acme.com", body, intent)
+    assert (await _status(state, queued))[0] == "approved"
+    assert await state.colleague_who_replied(bob) is None
+
+
+@pytest.mark.asyncio
+async def test_the_writer_skips_and_doesn_t_count_people_whose_company_answered(state):
+    cid = await _company(state)
+    ann = await _person(state, "ann@acme.com", cid)
+    await _person(state, "bob@acme.com", cid, status="new")
+    assert await state.count_writable_prospects() == 1
+    await state.stop_company(ann)
+    assert await state.count_writable_prospects() == 0
+
+
+@pytest.mark.asyncio
+async def test_instantly_campaigns_stop_for_the_whole_company():
+    from harvey.integrations.instantly import InstantlyClient
+    client = InstantlyClient.__new__(InstantlyClient)
+    sent = {}
+
+    async def fake_request(method, path, body=None, **kw):
+        sent.update(body or {})
+        return {"id": "c1"}
+    client._request = fake_request
+    await client.create_campaign("x")
+    assert sent["stop_for_company"] is True

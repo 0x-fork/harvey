@@ -434,6 +434,7 @@ class Sender:
 
         staged = 0
         skipped = 0
+        answered = 0
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         seen_emails: set[str] = set()
 
@@ -450,7 +451,7 @@ class Sender:
                 skipped += 1
                 continue
             if await self.state.colleague_who_replied(prospect.id):
-                skipped += 1      # their company already answered
+                answered += 1     # their company already answered
                 continue
             seen_emails.add(email)
 
@@ -481,6 +482,11 @@ class Sender:
             logger.info(
                 f"Sender: held back {skipped} prospect(s) with unverified "
                 f"emails from '{campaign.name}'."
+            )
+        if answered:
+            logger.info(
+                f"Sender: left out {answered} prospect(s) from '{campaign.name}': "
+                f"{COLLEAGUE_REPLIED} at their company."
             )
         if staged:
             mode = "awaiting your approval" if require_approval else "approved"

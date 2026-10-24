@@ -48,6 +48,8 @@ INTENT_LABELS = {
 # Intents that get an automated reply. Everything else is closed,
 # deferred, or escalated to a human.
 AUTO_REPLY_INTENTS = {"interested", "objection", "question", "wrong_person"}
+# Replies that don't stop the cold email to the rest of their company.
+NO_COMPANY_STOP_INTENTS = {"ooo", "wrong_person"}
 
 # Hard opt-out phrases. If any of these appear, we ALWAYS honor the
 # opt-out regardless of what the LLM classifier says.
@@ -315,9 +317,11 @@ class Handler:
     async def _stop_colleagues(self, prospect):
         """A reply from anyone at a company stops the cold sequence to
         everyone else there: the owner said no, the office manager doesn't
-        get the follow-up. A bounce doesn't come here; it's one address."""
+        get the follow-up. Not for a bounce (one address), an out-of-office
+        (nobody answered) or a "wrong person" (they named who to write to).
+        Idempotent: a retried reply stops the same emails."""
         try:
-            cancelled = await self.state.cancel_pending_outbox_for_colleagues(prospect.id)
+            cancelled = await self.state.stop_company(prospect.id)
         except Exception as e:
             logger.warning(f"Handler: couldn't stop colleagues' emails: {e}")
             return
@@ -418,7 +422,6 @@ class Handler:
                 )
         except Exception as e:
             logger.debug(f"Handler: outbox cancel failed: {e}")
-        await self._stop_colleagues(prospect)
 
         # 1. Classify intent. Hard keyword checks run FIRST and override
         # the LLM — opt-outs and legal threats must never be missed.
@@ -430,6 +433,8 @@ class Handler:
         else:
             intent = await self._classify_intent(reply_text, prospect)
         logger.info(f"Handler: Intent for {lead_email}: {intent}")
+        if intent not in NO_COMPANY_STOP_INTENTS:
+            await self._stop_colleagues(prospect)
 
         # 2. The conversation as it will be, in memory only. Nothing about
         # this reply is stored until every model call it needs has succeeded:
