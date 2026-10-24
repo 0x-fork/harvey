@@ -643,13 +643,14 @@ class SetupWizard:
         current = _current_precleared()
         was_on = current.get("enabled") is True
         _print_harvey("Before the first email to anyone new, I can ask Precleared")
-        _print_harvey("(precleared.dev) whether cold email to them is allowed. A UK")
+        _print_harvey("(precleared.dev) which cold-email rules apply to them. A UK")
         _print_harvey("sole trader needs consent where a limited company doesn't,")
         _print_harvey("and the address alone won't tell you which. Totally optional.")
         print("\n  Anything that isn't a clear yes waits in the Outbox with the reason.")
         print("  It checks mail sent through Gmail, Microsoft 365 or SMTP, not Instantly.")
-        print("  Precleared receives each new recipient's address, your country, your")
-        print("  product description and, if you set one, your prospects' country.")
+        print("  Precleared receives each new recipient's address, your country, how")
+        print("  the address was found, your product description and, if you set one,")
+        print("  your prospects' country.")
 
         if not _ask_yes_no("Turn on the cold-email check?", default=was_on):
             # Only touch the config to switch off a check that was on.
@@ -725,7 +726,7 @@ class SetupWizard:
         )
         if key:
             self.env_vars["PRECLEARED_API_KEY"] = key
-            _print_harvey("Saved. That's 25 free checks a day.")
+            _print_harvey("Saved the key to .env.")
         elif has_key:
             _print_harvey("Keeping the key you already have.")
         else:

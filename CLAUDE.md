@@ -233,7 +233,7 @@ These go in `harvey.yaml` under `usage:`. Use sensible defaults unless they want
 
 ### Step 7: Cold-Email Check (Optional)
 
-Offer this once, briefly, and take no for an answer. With `compliance.precleared.enabled: true`, Harvey asks [Precleared](https://precleared.dev) whether cold email to each new address is allowed before the first email goes out. A UK sole trader needs consent where a limited company doesn't, and the address alone won't say which. Anything that isn't `ok_to_email` waits in the Outbox with the reason. It checks mail sent through Gmail, Microsoft 365 or SMTP, not Instantly. Precleared receives each new recipient's address, the sender country, the address source, the product description and, if set, the prospects' country.
+Offer this once, briefly, and take no for an answer. With `compliance.precleared.enabled: true`, Harvey asks [Precleared](https://precleared.dev) which cold-email rules apply to each new address before the first email goes out. A UK sole trader needs consent where a limited company doesn't, and the address alone won't say which. Anything that isn't `ok_to_email` waits in the Outbox with the reason. It checks mail sent through Gmail, Microsoft 365 or SMTP, not Instantly. Precleared receives each new recipient's address, the sender country, the address source, the product description and, if set, the prospects' country.
 
 If they want it, ask one thing at a time:
 - Where is the business based? `sender_country` must be `GB` or `US`. If it's neither, leave the check off.
