@@ -174,6 +174,7 @@ harvey discover --providers                        # the menu, with real prices
 harvey discover --estimate                         # projected spend, then exits
 harvey discover                                    # free OpenStreetMap source
 harvey discover --provider dataforseo_listings --max-spend 2.00
+harvey discover --preset yc --provider serper   # startups that say they're YC-backed
 ```
 
 The dashboard's **Discover** tab is the same thing with the tradeoffs laid out
@@ -190,6 +191,14 @@ side by side: what each source does, what it costs, its free tier, and which
 Cities are geocoded automatically (cached forever, one lookup per city), or set
 `icp.geo_coordinates` in harvey.yaml to control the radius:
 `"Denver, CO": "39.7392,-104.9903,50"`.
+
+**Selling to startups:** the `yc` preset (above, or *Look for: YC startups* on
+Discover) searches for companies whose own site says they're backed by Y
+Combinator; confirm the `YC_BACKED` signal to tag them (with their batch; it
+reads the homepage and About page, and many YC companies never say it there), and
+the writer and handler then use `skills/selling_to_startups.md` for them. It
+never reads ycombinator.com (their terms forbid scraping and collecting
+founders' contacts), so don't suggest scraping the YC directory instead.
 
 **Depth 20-30, not 100.** Google removed 100-results-per-page in September 2025,
 so depth 100 is now billed as ten pages at nearly every provider. Below rank 30

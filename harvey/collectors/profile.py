@@ -221,6 +221,151 @@ def _text(html: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"(?s)<[^>]+>", " ", _strip_code(html)))
 
 
+# ── YC_BACKED: what a company says about itself on its own site ──
+# Never read from ycombinator.com or YC's other sites, whose terms forbid
+# scraping and collecting founders' contacts. What counts is the company's
+# own claim: a reference to its own YC page, or a sentence about itself
+# ("we", "our", its name) or a badge-short line ("YC W24", "Backed by Y
+# Combinator"). Lines about customers and audiences ("trusted by YC-backed
+# startups", "for YC founders") and YC programs (Startup School, Demo Day,
+# applying) are not.
+YC_OWNED_DOMAINS = ("ycombinator.com", "workatastartup.com", "startupschool.org")
+_YC = r"(?:YC|Y[\s-]?Combinator)"
+_YC_LINK_RE = re.compile(r"ycombinator\.com\\?/companies\\?/([a-z0-9][\w-]*)", re.I)
+YC_ABOUT_PATHS = ("/about", "/about-us", "/company", "/our-story")
+_YC_SEASONS = {"w": "W", "winter": "W", "s": "S", "summer": "S",
+               "f": "F", "fall": "F", "x": "X", "spring": "X"}
+_SEASON_WORD = r"(Winter|Summer|Fall|Spring)"
+# A batch right next to YC: "YC W24", "(YC S23)", "Y Combinator's Summer 2023
+# batch", "Y Combinator alumni (W19)", "the Summer 2023 batch of Y Combinator".
+_YC_BATCH_RES = (
+    re.compile(rf"\b{_YC}(?:['’]s)?\s*(?:(?:alumni|alums?|company|startup)\s*)?[\(\[]?\s*"
+               r"(W|S|F|X)\s*'?(\d{2})\b(?![\w-]*\s*(?:Ultra|Plus|Pro|FE|Max)\b)", re.I),
+    re.compile(rf"\b{_YC}(?:['’]s)?\s+{_SEASON_WORD}\s+(?:batch\s+)?(\d{{4}})\b", re.I),
+    re.compile(rf"\b{_SEASON_WORD}\s+(\d{{4}})\s+batch\s+(?:of|at)\s+{_YC}\b", re.I),
+    re.compile(rf"\b{_YC}\s+(?:in|during)\s+(?:the\s+)?{_SEASON_WORD}\s+(?:of\s+)?(\d{{4}})\b", re.I),
+    re.compile(rf"\b{_YC}\s+demo day\s*[\(\[]\s*(W|S|F|X)\s*'?(\d{{2}})\b", re.I),
+)
+# What a claim looks like. Anchored at the start of a sentence, so the
+# company is the one being described, not a customer, a team member or an
+# audience ("trusted by YC-backed startups", "we sponsored the YC dinner").
+_BATCH = r"(?:W|S|F|X)\s*'?\d{2}"
+_BADGE_RE = re.compile(  # a whole line that is a badge: backing words or a batch, not a bare "YC"
+    rf"^\(?\s*(?:(?:backed|funded|supported)\s+by\s+{_YC}(?:\s*[\(\[]?\s*{_BATCH}\s*[\)\]]?)?"
+    rf"|{_YC}[\s-]+(?:backed|funded)(?:\s*[\(\[]?\s*{_BATCH}\s*[\)\]]?)?"
+    rf"|{_YC}\s*[\(\[]?\s*{_BATCH}\s*[\)\]]?)\s*\)?\.?$", re.I)
+_FILLER = r"(?:\s+(?:proudly|also|now|officially|recently|originally|first|both|all|so|were|was|are|is|been|have|has|had|very))*"
+_CLAIM_BODY = (
+    rf"{_FILLER}\s+(?:backed by|funded by|supported by|part of|a member of|members of|graduated from|"
+    rf"alumni of|alums? of|went through|joined|hatched (?:in|at)|incubated (?:in|at|by)|accepted into|"
+    rf"participated in|launched at|in)\s+(?:the\s+)?{_YC}\b"
+    rf"|{_FILLER}\s+in\s+the\s+{_SEASON_WORD}\s+\d{{4}}\s+batch\s+of\s+{_YC}\b"
+    rf"|{_FILLER}\s+(?:a|an)\s+{_YC}(?:\s+{_BATCH})?[\s-]+(?:(?:backed|funded)\s+)?"
+    rf"(?:company|startup|platform|product|business|team|tool)\b"
+    rf"|{_FILLER}\s+{_YC}[\s-]+(?:backed|funded|alumni|alums?|alumnus)\b"
+    rf"|\s*[\(\[]\s*{_YC}\s*{_BATCH}\s*[\)\]]"
+)
+# "in YC" only after a form of be ("we were in YC"), not "believe in YC".
+_IN_NEEDS_BE = re.compile(rf"(?<!\bwere)(?<!\bwas)(?<!\bare)(?<!\bis)(?<!\bbeen)\s+in\s+(?:the\s+)?{_YC}\b", re.I)
+_SELF_SUBJECT = (r"(?:we|we're|we are|we were|we've been|proud(?:ly)? to be|excited to be|honou?red to be"
+                 r"|the company|our company)")
+_FOUNDED_PREFIX = r"(?:founded in \d{4},?\s+)?"
+# "<subject> ... and is backed by YC", but not "...companies that are backed by YC".
+_LATER_BACKING = (rf"[^.]{{0,80}}?(?<!\bthat)(?<!\bwhich)(?<!\bwho)\s+(?:is|are|was|were|has been|have been)"
+                  rf"\s+(?:proudly\s+)?(?:backed|funded|supported)\s+by\s+{_YC}\b")
+_INVESTORS_RE = re.compile(rf"^(?:our\s+)?investors?\s*(?:include|including|are|:)[^.]{{0,80}}\b{_YC}\b", re.I)
+_LEADING_BACKING_RE = re.compile(rf"^(?:backed|funded|supported)\s+by\s+{_YC}\b", re.I)
+# A YC program right after the mention, with no batch: not backing.
+_YC_PROGRAM_RE = re.compile(
+    rf"\b{_YC}(?:['’]s)?\s+(?:startup school|demo day|application|interview|events?|podcast|blog|news|jobs|deals?|perks?)\b",
+    re.I)
+_ATTR_TEXT_RE = re.compile(r"""\b(?:alt|title|aria-label)=["']([^"']{0,200})["']""", re.I)
+_BLOCK_TAG_RE = re.compile(r"(?i)</?(?:p|div|h[1-6]|li|ul|ol|br|section|footer|header|nav|article|td|tr|table|blockquote|figcaption|dt|dd)\b[^>]*>")
+_SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|\s*[|•·]\s*|\n")
+_PREFIXES = re.compile(r"^(?:get|try|use|join)(?=\w{4})")
+_SUFFIXES = re.compile(r"(?<=\w{4})hq$")
+_SECOND_LEVEL = {"co", "com", "org", "net", "ac", "gov", "edu"}
+
+
+def _lines(html: str) -> list[str]:
+    """Readable sentences, with block boundaries kept (a badge isn't run into
+    the next paragraph) and entities decoded ("Y Combinator&#x27;s W20")."""
+    text = _BLOCK_TAG_RE.sub("\n", _strip_code(html))
+    text = html_unescape(re.sub(r"(?s)<[^>]+>", " ", text))
+    text += "\n" + "\n".join(html_unescape(a) for a in _ATTR_TEXT_RE.findall(html))
+    out = []
+    for line in text.split("\n"):
+        line = re.sub(r"\s+", " ", line).strip()
+        out.extend(p.strip() for p in _SENTENCE_RE.split(line) if p.strip())
+    return out
+
+
+def _alnum(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+def _domain_name(domain: str) -> str:
+    """The registrable name: app.acme.com and acme.co.uk are both "acme"."""
+    parts = [p for p in domain.lower().strip(".").split(".") if p]
+    if len(parts) >= 3 and parts[-2] in _SECOND_LEVEL and len(parts[-1]) == 2:
+        return parts[-3]
+    return parts[-2] if len(parts) >= 2 else (parts[0] if parts else "")
+
+
+def _is_their_yc_page(slug: str, domain: str) -> bool:
+    """A YC page link is theirs when its name matches their domain's: a
+    customer logo can link to that customer's YC page."""
+    name, label = _alnum(slug), _alnum(_domain_name(domain)) if domain else ""
+    if not name or not label:
+        return False
+    if name == label:
+        return True
+    # getacme.com / acmehq.com and the slug "acme", nothing looser.
+    core = lambda t: _SUFFIXES.sub("", _PREFIXES.sub("", t))
+    return min(len(core(name)), len(core(label))) >= 4 and core(name) == core(label)
+
+
+def _yc_batch(match) -> str:
+    season, year = _YC_SEASONS[match.group(1).lower()], match.group(2)[-2:]
+    return f"{season}{year}" if 5 <= int(year) <= 40 else ""
+
+
+def yc_backed(html: str, domain: str = "") -> tuple[str, float] | None:
+    """(batch like "W24" or "", confidence) when the page says the company
+    itself is YC-backed, else None."""
+    if not html:
+        return None
+    link = any(_is_their_yc_page(m.group(1), domain) for m in _YC_LINK_RE.finditer(html))
+    name = _domain_name(domain) if domain else ""
+    # The name as written on the page may have spaces or hyphens ("Acme Corp"
+    # for acmecorp.com): any separators between its letters.
+    spelled = r"[\s.-]?".join(re.escape(ch) for ch in _alnum(name)) if len(_alnum(name)) >= 3 else ""
+    subject = rf"(?:{_SELF_SUBJECT}" + (rf"|{spelled}\b" if spelled else "") + r")"
+    claim_re = re.compile(rf"^{_FOUNDED_PREFIX}{subject},?(?:{_CLAIM_BODY}|{_LATER_BACKING})", re.I)
+    batch, claimed = "", False
+    for sentence in _lines(html):
+        if not re.search(rf"\b{_YC}\b", sentence, re.I):
+            continue
+        found = next((m for r in _YC_BATCH_RES for m in [r.search(sentence)] if m), None)
+        match = claim_re.search(sentence)
+        if match and _IN_NEEDS_BE.search(match.group(0)) and not re.search(
+                r"\bin\s+the\s+\w+\s+\d{4}\s+batch|hatched in|incubated in|participated in", match.group(0), re.I):
+            match = None
+        ok = bool(_BADGE_RE.match(sentence) or match or _INVESTORS_RE.search(sentence)
+                  or _LEADING_BACKING_RE.search(sentence))
+        if ok and not found and _YC_PROGRAM_RE.search(sentence):
+            ok = False      # Startup School, Demo Day, a YC blog: a program, not backing
+        if ok:
+            claimed = True
+            if found and not batch:
+                batch = _yc_batch(found)
+    if link:
+        return batch, 0.95
+    if claimed:
+        return batch, 0.9 if batch else 0.85
+    return None
+
+
 class ProfileCollector:
     """Fetches a business's public pages and emits observations.
 
@@ -392,6 +537,9 @@ class ProfileCollector:
         """Collect every confirmed profile signal for one business."""
         obs: list[dict] = []
         domain = domain.lower().replace("www.", "").strip("/")
+        if any(domain == d or domain.endswith("." + d) for d in YC_OWNED_DOMAINS):
+            # YC's own sites forbid scraping; they're never a prospect anyway.
+            return obs
 
         def add(code, *, num=None, text="", conf=1.0, url=""):
             if not self.wants(code):
@@ -425,6 +573,28 @@ class ProfileCollector:
 
         # Booking gap
         add("NO_ONLINE_BOOKING", num=0 if self._any(home, BOOKING_HINTS) else 1)
+
+        # YC-backed, as the company says on its own site: the homepage, or
+        # its About page (where most say it, if anywhere).
+        if self.wants("YC_BACKED"):
+            yc, where = yc_backed(home, domain), site
+            if yc is None:
+                about_url, about = await self._first_present(site, YC_ABOUT_PATHS)
+                if about:
+                    yc, where = yc_backed(about, domain), about_url
+            # Most YC companies never say it on these pages, so silence
+            # doesn't erase a YC-preset search hit (collector "discover").
+            # It does correct an earlier profile "yes", so a wrong tag or a
+            # dropped claim doesn't last forever.
+            searched = False
+            if yc is None and getattr(self, "state", None) is not None:
+                try:
+                    searched = await self.state.yc_search_hit(company_id)
+                except Exception:
+                    searched = False
+            if yc is not None or not searched:
+                add("YC_BACKED", num=1 if yc else 0, text=yc[0] if yc else "",
+                    conf=yc[1] if yc else 1.0, url=where if yc else site)
 
         # Incumbent agency — the compounding signal
         agency = self.detect_agency(home, domain)

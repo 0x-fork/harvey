@@ -213,6 +213,25 @@ harvey discover               # go
 | **DataForSEO SERP** | $0.0018 / search | $1 credit + free sandbox | Rank as the buying signal. |
 | **Serper** | ~$0.30–1.00 / 1,000 | 2,500 free, no card | The easiest paid one to try. |
 
+**Selling to startups?** Harvey has a built-in YC-startup skill, made of three
+parts:
+
+- **The search:** `harvey discover --preset yc --provider serper`, or *Look for: YC
+  startups* on the Discover tab, searches your industries for companies whose
+  own websites say they're backed by Y Combinator.
+- **The signal:** turn on `YC_BACKED` (Signals tab) to tag them, with their batch
+  when the site states it (W24, S23). It reads the homepage and About page for
+  a reference to the company's own YC page or a line where the company says it
+  ("we went through Y Combinator", "YC W24"), not customer lines like "trusted
+  by YC-backed startups". Many YC companies never say it on their site, so it
+  finds the ones that do; a YC-preset search hit counts as a yes too.
+- **The writing:** for those prospects the writer and reply handler use
+  `skills/selling_to_startups.md`, a playbook for writing to founders.
+
+Harvey never reads ycombinator.com itself, whose terms forbid scraping it or
+collecting founders' contact details; everything comes from the companies' own
+sites and your search provider.
+
 Cities geocode themselves (cached forever, one lookup each). Directories, aggregators and institutions are filtered by pattern, not a blocklist — `en.wikipedia.org` and `biz.yelp.com` never make it in.
 
 > **Depth 20–30, not 100.** Google removed 100-results-per-page in September 2025, so depth 100 is now billed as ten pages nearly everywhere. Below rank 30 it is mostly directories anyway.

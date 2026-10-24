@@ -869,6 +869,16 @@ Product: {self.config.product.name} — {self.config.product.description}"""
         # Inject objection handling + sales methodology skills
         if self.skills:
             prompt += "\n\n" + self.skills
+        # A YC startup's founder gets the founder playbook.
+        try:
+            yc = (await self.state.yc_batch(prospect.company_id)
+                  if getattr(prospect, "company_id", "") else None)
+        except Exception:
+            yc = None   # an optional lookup never stops a reply
+        if yc is not None and hasattr(self.brain, "load_skill"):
+            playbook = self.brain.load_skill("selling_to_startups")
+            if playbook:
+                prompt += "\n\nSELLING TO STARTUP FOUNDERS\n" + playbook
 
         prompt += f"""
 
