@@ -35,6 +35,7 @@ async def collect_prospects(
     """Fetch prospects matching the filters as export-ready dicts.
 
     Default view is the *deliverable* list (verified + risky emails).
+    Outreach exports exclude opted-out prospects even with explicit filters.
     ``include_all`` disables every filter for a full dump.
     """
     import aiosqlite
@@ -42,6 +43,10 @@ async def collect_prospects(
     where = []
     params: list = []
     if not include_all:
+        # Opt-outs must not be reintroduced by an outreach filter. IS NOT also
+        # preserves legacy NULL statuses; only known opt-outs are suppressed.
+        where.append("status IS NOT ?")
+        params.append("opted_out")
         wanted = email_statuses if email_statuses is not None else DEFAULT_EMAIL_STATUSES
         if wanted:
             placeholders = ",".join("?" for _ in wanted)

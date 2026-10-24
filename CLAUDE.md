@@ -102,7 +102,7 @@ SERPER_API_KEY=            # web search + discovery (2,500 free, then a $50 prep
 
 **Email verification matters:** Harvey learns each company's email *pattern* and verifies ONE candidate rather than guessing (raw SMTP probing is not viable from a locally-running agent — outbound port 25 is usually blocked, and Google Workspace / Microsoft 365 accept everything from an unknown IP). Without a verifier key, found emails are marked `guess` and are **never sent**.
 
-**Approval by default:** with a native provider, every outgoing email waits in the **Outbox** for your approval (dashboard Outbox tab, or `harvey outbox`). Once you trust the output, set `channels.email.require_approval: false` in harvey.yaml for full autopilot.
+**Approval by default:** with a native provider, every outgoing email waits in the **Outbox** for your approval (dashboard Outbox tab, or `harvey outbox`). **Autopilot** (`channels.email.require_approval: false`) sends on its own, still inside the daily limit, quiet hours and opt-out rules, but holds any email that links to a domain that isn't the user's or quotes Harvey's own instructions (text from websites and replies can carry planted instructions). Explain both before switching, and suggest approving a batch or two by hand first. The user switches it in dashboard → Settings → Sending (turning it on there takes typing `autopilot`; turning it off is one click and works at once), or in the config file Harvey reads (`harvey.local.yaml` if trained, else `harvey.yaml`); a running Harvey picks it up next cycle. Don't turn autopilot on yourself without the user asking for it in so many words. If they send from a secondary domain, their main site goes in `channels.email.link_domains` (training adds the trained site automatically). On Instantly, approval mode means campaigns aren't deployed at all.
 
 After getting the Instantly API key, test it:
 ```bash
@@ -174,6 +174,7 @@ harvey discover --providers                        # the menu, with real prices
 harvey discover --estimate                         # projected spend, then exits
 harvey discover                                    # free OpenStreetMap source
 harvey discover --provider dataforseo_listings --max-spend 2.00
+harvey discover --preset yc --provider serper   # startups that say they're YC-backed
 ```
 
 The dashboard's **Discover** tab is the same thing with the tradeoffs laid out
@@ -190,6 +191,14 @@ side by side: what each source does, what it costs, its free tier, and which
 Cities are geocoded automatically (cached forever, one lookup per city), or set
 `icp.geo_coordinates` in harvey.yaml to control the radius:
 `"Denver, CO": "39.7392,-104.9903,50"`.
+
+**Selling to startups:** the `yc` preset (above, or *Look for: YC startups* on
+Discover) searches for companies whose own site says they're backed by Y
+Combinator; confirm the `YC_BACKED` signal to tag them (with their batch; it
+reads the homepage and About page, and many YC companies never say it there), and
+the writer and handler then use `skills/selling_to_startups.md` for them. It
+never reads ycombinator.com (their terms forbid scraping and collecting
+founders' contacts), so don't suggest scraping the YC directory instead.
 
 **Depth 20-30, not 100.** Google removed 100-results-per-page in September 2025,
 so depth 100 is now billed as ten pages at nearly every provider. Below rank 30

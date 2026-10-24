@@ -608,6 +608,26 @@ async def get_harvey_logs():
 # ── Pipeline Data (existing endpoints) ──
 
 
+def _pipeline_bucket(status: str | None, stage: str | None, intent: str | None,
+                     email_status: str | None = None) -> str:
+    """One funnel stage per contact, from its status and latest conversation."""
+    status = status or "new"
+    if status in ("new", "queued"):
+        return "to_write"
+    if status == "contacted":
+        # A bounce leaves the status alone and marks the address invalid.
+        return "closed_out" if email_status == "invalid" else "contacted"
+    if status == "meeting":
+        return "ready_to_meet"
+    if status == "replied" and stage != "closed_lost":
+        if stage == "closing":
+            return "ready_to_meet"
+        if intent == "interested" or stage in ("presenting", "negotiating"):
+            return "interested"
+        return "replied"
+    return "closed_out"   # lost, opted out, bounced, unwritable
+
+
 @app.get("/api/stats")
 async def get_stats():
     """Pipeline overview stats."""
@@ -628,6 +648,21 @@ async def get_stats():
         )
         convo_map = {r["status"]: r["count"] for r in conversations}
 
+        # Where each contact stands. Prospect status alone stops at
+        # "replied"; how a reply went lives on its latest conversation.
+        rows = await query_db("""
+            SELECT p.status, p.email_status, l.stage, l.intent, COUNT(*) AS count FROM prospects p
+            LEFT JOIN (SELECT prospect_id, stage, intent, ROW_NUMBER() OVER (
+                         PARTITION BY prospect_id ORDER BY updated_at DESC, created_at DESC) AS rn
+                       FROM conversations) l ON l.prospect_id = p.id AND l.rn = 1
+            GROUP BY p.status, p.email_status, l.stage, l.intent
+        """)
+        pipeline = dict.fromkeys(
+            ("to_write", "contacted", "replied", "interested", "ready_to_meet", "closed_out"), 0)
+        for r in rows:
+            pipeline[_pipeline_bucket(r["status"], r["stage"], r["intent"],
+                                      r["email_status"])] += r["count"]
+
         actions = await query_db("SELECT COUNT(*) as count FROM actions")
         action_count = actions[0]["count"] if actions else 0
 
@@ -641,6 +676,7 @@ async def get_stats():
             "prospects": {"total": prospect_total, "by_status": prospect_map},
             "campaigns": {"total": sum(campaign_map.values()), "by_status": campaign_map},
             "conversations": {"total": sum(convo_map.values()), "by_status": convo_map},
+            "pipeline": pipeline,
             "actions_total": action_count,
             "claude_calls_today": usage_today,
             "codex_calls_today": codex_today,
@@ -763,6 +799,12 @@ async def get_usage():
 @app.get("/api/prospects")
 async def get_prospects():
     rows = await query_db("SELECT * FROM prospects ORDER BY created_at DESC LIMIT 200")
+    # Someone whose opt-out was undone keeps a way to see what happened.
+    undone = {r["pid"] for r in await query_db(
+        "SELECT DISTINCT json_extract(details_json, '$.prospect_id') AS pid FROM actions "
+        "WHERE action_type = 'opt_out_undone' AND json_valid(details_json)")}
+    for r in rows:
+        r["opt_out_undone"] = r.get("id") in undone
     return rows
 
 
@@ -880,13 +922,67 @@ async def get_outbox_api():
         return {"error": str(e)}
 
 
+@app.get("/api/sending-mode")
+async def get_sending_mode():
+    """Approval (every email waits for you) or autopilot, and what that means here."""
+    from harvey.config import load_config
+    from harvey.gate import _booking_prefix, allowed_link_domains
+    path = _resolve_config_file()
+    try:
+        config = load_config(str(path))
+    except Exception as e:
+        return JSONResponse({"error": f"Couldn't read {path.name}: {e}"}, status_code=500)
+    state = _state()
+    await state.init_db()
+    return {
+        "mode": "approval" if config.channels.email.require_approval else "autopilot",
+        "provider": config.channels.email.provider,
+        "file": path.name,
+        "your_domains": sorted(allowed_link_domains(config)),
+        "booking_page": _booking_prefix(config),
+        "held": await state.count_held_for_review(),
+    }
+
+
+@app.post("/api/sending-mode")
+async def set_sending_mode(request: Request):
+    """Switch it. Autopilot needs {"mode": "autopilot", "confirm": "autopilot"};
+    {"mode": "approval"} works at once and sends back to the Outbox whatever
+    autopilot approved that hasn't gone out."""
+    from harvey.config import ConfigError, set_require_approval
+    try:
+        body = await request.json()
+    except ValueError:
+        body = None
+    mode = body.get("mode") if isinstance(body, dict) else None
+    if mode not in ("approval", "autopilot"):
+        return _refuse('expected {"mode": "approval"} or {"mode": "autopilot", "confirm": "autopilot"}', 400)
+    if mode == "autopilot" and body.get("confirm") != "autopilot":
+        return _refuse('Type "autopilot" to confirm: Harvey will send email without asking you.', 400)
+    path = _resolve_config_file()
+    try:
+        set_require_approval(mode == "approval", path)
+    except ConfigError as e:
+        return _refuse(str(e), 409)
+    state = _state()
+    await state.init_db()
+    requeued = await state.requeue_autopilot_approved() if mode == "approval" else 0
+    await state.log_action("sending_mode", "dashboard", {"mode": mode, "file": path.name,
+                                                         "requeued": requeued})
+    out = {"success": True, "mode": mode}
+    if mode == "approval":
+        out["requeued"] = requeued
+    return out
+
+
 @app.post("/api/outbox/approve-all")
 async def outbox_approve_all():
     try:
         state = _state()
         await state.init_db()
         n = await state.approve_outbox()
-        return {"success": True, "approved": n}
+        # Held ones (possible planted link or leak) are approved one by one.
+        return {"success": True, "approved": n, "held": await state.count_held_for_review()}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 
@@ -1235,20 +1331,156 @@ async def get_campaigns():
     return rows
 
 
+@app.get("/api/prospects/{prospect_id}/opt-out")
+async def get_opt_out(prospect_id: str):
+    """Why this person is opted out: the rule, the words and their message."""
+    rows = await query_db("SELECT status FROM prospects WHERE id = ?", (prospect_id,))
+    if not rows:
+        return _refuse("unknown prospect", 404)
+    status = rows[0].get("status") or "new"
+    state = _state()
+    await state.init_db()
+    history = await state.opt_out_history(prospect_id)
+    last = next((h for h in reversed(history) if h["action"] == "opt_out"), None)
+    out = {
+        "opted_out": status == "opted_out", "status": status, "recorded": bool(last),
+        "at": None, "rule": None, "matched": "", "why": "", "message": "",
+        "conversation_id": "", "history": history,
+    }
+    if last:
+        out.update({k: last.get(k) or out[k] for k in
+                    ("rule", "matched", "why", "message", "conversation_id")})
+        out["at"] = last["at"]
+    elif status == "opted_out" or history:
+        # Opted out before Harvey kept reasons (and maybe undone since):
+        # show the last thing they wrote.
+        for c in await query_db(
+                "SELECT id, thread_json, updated_at FROM conversations "
+                "WHERE prospect_id = ? ORDER BY updated_at DESC", (prospect_id,)):
+            try:
+                thread = json.loads(c.get("thread_json") or "[]")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            theirs = [m for m in thread if isinstance(m, dict) and m.get("sender") == "prospect"]
+            if theirs:
+                out.update(message=str(theirs[-1].get("content") or ""),
+                           conversation_id=c["id"], at=theirs[-1].get("timestamp") or c.get("updated_at"))
+                break
+    return out
+
+
+@app.post("/api/prospects/{prospect_id}/opt-out/undo")
+async def undo_opt_out(prospect_id: str, request: Request):
+    """The owner says this opt-out was a mistake. Needs {"confirm": true}."""
+    try:
+        body = await request.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, dict) or body.get("confirm") is not True:
+        return _refuse('expected {"confirm": true}', 400)
+    rows = await query_db("SELECT email FROM prospects WHERE id = ?", (prospect_id,))
+    if not rows:
+        return _refuse("unknown prospect", 404)
+    state = _state()
+    await state.init_db()
+    history = await state.opt_out_history(prospect_id)
+    last = next((h for h in reversed(history) if h["action"] == "opt_out"), {})
+    if not await state.undo_opt_out(prospect_id, details={
+            "prospect_email": rows[0].get("email") or "",
+            "previous_why": last.get("why", ""), "previous_at": last.get("at", "")}):
+        return _refuse("This person isn't opted out.")
+    return {"success": True, "status": "replied"}
+
+
 @app.get("/api/conversations")
 async def get_conversations():
     rows = await query_db("""
-        SELECT c.*, p.first_name, p.last_name, p.email as prospect_email, p.company
+        SELECT c.*, p.first_name, p.last_name, p.email as prospect_email, p.company,
+               p.status as prospect_status
         FROM conversations c
         LEFT JOIN prospects p ON c.prospect_id = p.id
         ORDER BY c.updated_at DESC LIMIT 100
     """)
+    # The stored thread holds replies and Harvey's answers; the cold emails
+    # a reply answers live in the Outbox. Attach those (sent ones only) and
+    # any answer still waiting for approval, so the page shows the exchange.
+    pids = sorted({r["prospect_id"] for r in rows if r.get("prospect_id")})
+    emails: dict[str, list] = {}
+    if pids:
+        for e in await query_db(
+                "SELECT prospect_id, campaign_id, step, subject, body, sent_at FROM outbox "
+                f"WHERE kind = 'sequence' AND status = 'sent' AND prospect_id IN ({_in(pids)}) "
+                "ORDER BY sent_at", tuple(pids)):
+            emails.setdefault(e.pop("prospect_id"), []).append(e)
+    cids = [r["id"] for r in rows]
+    drafts = {d.pop("conversation_id"): d for d in (await query_db(
+        "SELECT id, conversation_id, subject, body, send_at FROM outbox "
+        f"WHERE kind = 'reply' AND status = 'pending_review' AND conversation_id IN ({_in(cids)}) "
+        "ORDER BY created_at", tuple(cids)) if cids else [])}
     for row in rows:
         try:
             row["thread"] = json.loads(row.get("thread_json", "[]"))
         except (json.JSONDecodeError, TypeError):
             row["thread"] = []
+        # A prospect in two campaigns: show the sequence this reply answers.
+        camp = row.get("campaign_id") or ""
+        row["emails"] = [{k: v for k, v in e.items() if k != "campaign_id"}
+                         for e in emails.get(row.get("prospect_id"), [])
+                         if not camp or e.get("campaign_id") == camp]
+        row["draft"] = drafts.get(row["id"])
     return rows
+
+
+@app.post("/api/conversations/{convo_id}/status")
+async def set_conversation_status(convo_id: str, request: Request):
+    """Close a conversation, or hand one Harvey escalated back to it.
+
+    Harvey answers new replies only on open conversations, so "open" means
+    "Harvey, carry on" and "closed" means it's done."""
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    status = data.get("status") if isinstance(data, dict) else None
+    if status not in ("open", "closed"):
+        return JSONResponse({"success": False, "message": "status must be open or closed"},
+                            status_code=400)
+    rows = await query_db("SELECT status FROM conversations WHERE id = ?", (convo_id,))
+    if not rows:
+        return JSONResponse({"success": False, "message": "No such conversation."},
+                            status_code=404)
+    state = _state()
+    await state.update_conversation(convo_id, status=status)
+    await state.log_action("conversation_status", "dashboard",
+                           {"conversation_id": convo_id, "from": rows[0]["status"], "to": status})
+    return {"success": True, "status": status}
+
+
+@app.get("/api/trend")
+async def get_trend(days: int = 14, tz: int = 0):
+    """Daily counts for the last `days` days in the viewer's time zone
+    (`tz`: minutes east of UTC; stored times are UTC): contacts found,
+    emails sent, first replies. Days with nothing are 0."""
+    from datetime import datetime, timedelta, timezone
+    days = max(1, min(90, days))
+    tz = max(-840, min(840, tz))
+    shift = f"{tz:+d} minutes"
+    today = (datetime.now(timezone.utc) + timedelta(minutes=tz)).date()
+    labels = [(today - timedelta(days=n)).isoformat() for n in range(days - 1, -1, -1)]
+
+    async def per_day(table: str, column: str, where: str = "") -> list[int]:
+        rows = await query_db(
+            f"SELECT date({column}, ?) AS d, COUNT(*) AS n FROM {table} "
+            f"WHERE date({column}, ?) >= ? {where} GROUP BY d", (shift, shift, labels[0]))
+        counts = {r["d"]: r["n"] for r in rows}
+        return [counts.get(day, 0) for day in labels]
+
+    return {
+        "days": labels,
+        "found": await per_day("prospects", "created_at"),
+        "sent": await per_day("outbox", "sent_at", "AND status = 'sent'"),
+        "replies": await per_day("conversations", "created_at"),
+    }
 
 
 @app.get("/api/activity")
@@ -1272,16 +1504,22 @@ async def get_activity():
 
 _discovery_task: asyncio.Task | None = None
 _discovery_report: dict | None = None
+_discovery_kind = "discover"   # or "profile": reading sites has no stop switch
 
 
 def _discovery_queries(body: dict, config):
-    from harvey.collectors.discover import build_queries
+    from harvey.collectors.discover import build_queries, preset_problem
 
+    preset = str(body.get("preset") or "")
+    problem = preset_problem(preset, str(body.get("provider") or ""))
+    if problem:
+        raise ValueError(problem)
     cities = [c.strip() for c in (body.get("cities") or []) if c.strip()] or None
     return build_queries(
         config, cities=cities,
         depth=int(body.get("depth") or 30),
         limit=int(body.get("limit") or 100),
+        preset=preset,
     )
 
 
@@ -1300,6 +1538,8 @@ async def get_discovery_providers():
             "selected": await state.get_setting("discovery_provider") or DEFAULT_PROVIDER,
             "paused": await state.get_setting("discovery_paused"),
             "running": bool(_discovery_task and not _discovery_task.done()),
+            "running_kind": _discovery_kind,
+            "unprofiled": await state.count_companies_needing_profile(),
             "last_report": _discovery_report,
         }
     except Exception as e:
@@ -1320,7 +1560,10 @@ async def estimate_discovery(request: Request):
             return JSONResponse({"error": f"unknown provider {provider!r}"},
                                 status_code=400)
 
-        queries = _discovery_queries(body, load_config())
+        try:
+            queries = _discovery_queries(body, load_config())
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
         return {
             "provider": provider,
             "queries": [q.keyword() for q in queries],
@@ -1357,13 +1600,19 @@ async def start_discovery(request: Request):
                                 status_code=400)
 
         config = load_config()
-        queries = _discovery_queries(body, config)
+        try:
+            queries = _discovery_queries(body, config)
+        except ValueError as e:
+            return JSONResponse({"success": False, "message": str(e)}, status_code=400)
         max_spend = float(body.get("max_spend") or 1.0)
 
         state = _state()
         await state.init_db()
         await state.set_setting("discovery_provider", provider)
         await state.set_setting("discovery_paused", "")
+
+        global _discovery_kind
+        _discovery_kind = "discover"
 
         async def _go():
             global _discovery_report
@@ -1421,6 +1670,8 @@ async def start_profile():
                 logger.exception("profile run failed")
                 _discovery_report = {"errors": [str(exc)], "stopped": "failed"}
 
+        global _discovery_kind
+        _discovery_kind = "profile"
         _discovery_report = None
         _discovery_task = asyncio.create_task(_go())
         return {"success": True, "pending": pending}
@@ -1602,33 +1853,43 @@ async def get_live_status():
              f"{replies} replies" if replies else "No replies yet", info=True),
     ]
 
+    next_tab = ""   # where the next step is done, when it's done in the dashboard
     if reading or finding:
         next_up = "Wait — Harvey is working. This page updates by itself."
     elif finding_emails:
         next_up = "Wait — emails are being found."
     elif stopped:
-        next_up = "A job stopped before finishing. Run it again."
+        next_up, next_tab = "A job stopped before finishing. Run it again.", "discover"
     elif harvey_sends and awaiting_review:
-        next_up = f"Review the {awaiting_review} draft(s) waiting in the Outbox."
+        next_up, next_tab = f"Review the {awaiting_review} draft(s) waiting in the Outbox.", "outbox"
     elif by_hand:
-        next_up = f"Open Campaigns and send the {len(by_hand)} unsent email(s)."
+        next_up, next_tab = f"Open Campaigns and send the {len(by_hand)} unsent email(s).", "campaigns"
     elif profiled > checked:
-        next_up = f"Find emails for the {profiled - checked} businesses not checked yet."
+        next_up, next_tab = f"Find emails for the {profiled - checked} businesses not checked yet.", "controls"
     elif deliverable - drafted:
-        next_up = f"Write first emails for {len(deliverable - drafted)} more contact(s)."
+        next_up, next_tab = f"Write first emails for {len(deliverable - drafted)} more contact(s).", "controls"
     elif not companies:
-        next_up = "Search for businesses to get started."
+        next_up, next_tab = "Search for businesses to get started.", "discover"
     else:
-        next_up = "Search more cities or industries to get more leads."
+        next_up, next_tab = "Search more cities or industries to get more leads.", "discover"
 
     return {
         "steps": steps,
         "running": [dict(r, eta_text=_eta_text(r["eta_min"])) for r in running],
         "stopped": stopped,
         "next": next_up,
+        "next_tab": next_tab,
         "cost_usd": round(cost, 4),
         "updated_at": now.isoformat() + "Z",
     }
+
+
+def _require_approval_now() -> bool:
+    try:
+        from harvey.config import load_config
+        return bool(load_config(str(_resolve_config_file())).channels.email.require_approval)
+    except Exception:
+        return True
 
 
 @app.get("/api/today")
@@ -1660,6 +1921,10 @@ async def get_today():
             "SELECT COUNT(*) AS n FROM conversations WHERE status = 'open'"
         )
         open_convos = convos[0]["n"] if convos else 0
+        handed = await query_db(
+            "SELECT COUNT(*) AS n FROM conversations WHERE status = 'needs_human'"
+        )
+        needs_human = handed[0]["n"] if handed else 0
         companies = await query_db("SELECT COUNT(*) AS n FROM companies")
         n_companies = companies[0]["n"] if companies else 0
 
@@ -1671,10 +1936,34 @@ async def get_today():
             "outbox_pending": len(pending),
             "outbox_approved": len(approved),
             "open_conversations": open_convos,
+            "needs_human": needs_human,
+            "signals_proposed": len(proposed),
+            "email_provider": _current_provider(),
             "unprofiled": unprofiled_count,
         }
 
         # Ordered by how much it blocks Harvey from doing anything at all.
+        brain = await _brain_status()
+        if brain.get("status") == "paused":
+            who = "Codex" if brain.get("provider") == "codex" else "Harvey's model"
+            items.append({
+                "key": "brain-paused", "tone": "bad",
+                "title": f"{who} is paused, so Harvey is waiting",
+                "detail": (str(brain.get("reason") or "It can't be used right now.")[:300] +
+                           " Replies and queued emails are untouched; Harvey resumes "
+                           "once it's fixed. harvey status --check says what's wrong."),
+                "action": "Open the log", "tab": "controls",
+            })
+
+        hold = await state.current_sends_held()
+        if hold:
+            from harvey.sending_mode import held_message
+            title, detail = held_message(hold, waiting=len(approved))
+            items.append({
+                "key": "sends-held", "tone": "bad", "title": title, "detail": detail,
+                "action": "Open the log", "tab": "controls",
+            })
+
         if paused:
             items.append({
                 "key": "paused", "tone": "bad",
@@ -1732,12 +2021,26 @@ async def get_today():
                 "action": "Read their sites", "tab": "discover",
             })
 
+        if needs_human:
+            items.append({
+                "key": "needs-human", "tone": "bad",
+                "title": (f"{needs_human} conversation needs you" if needs_human == 1
+                          else f"{needs_human} conversations need you"),
+                "detail": ("Harvey stopped and handed these over: an escalation, or a "
+                           "reply it had no safe answer for. Reply yourself, then close "
+                           "it or hand it back."),
+                "action": "Read them", "tab": "conversations",
+            })
+
         if pending:
             items.append({
                 "key": "outbox", "tone": "warn",
                 "title": (f"{len(pending)} email waiting for approval" if len(pending) == 1
                           else f"{len(pending)} emails waiting for approval"),
-                "detail": "Nothing sends until you approve it. Read them one at a time.",
+                "detail": ("Nothing sends until you approve it. Read them one at a time."
+                           if _require_approval_now() else
+                           "Autopilot sends the rest on its own; these wait for you. "
+                           "Read them one at a time."),
                 "action": "Open the decisions desk", "tab": "outbox",
             })
 
@@ -1983,7 +2286,19 @@ async def get_runs_api():
         state = _state()
         await state.init_db()
         await state.sweep_stale_runs()
-        return await state.get_runs(limit=25)
+        runs = await state.get_runs(limit=25)
+        # Same rule as the live panel: a "running" run that has recorded
+        # nothing for STALE_RUN_SECONDS has stopped, whatever its row says.
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        for run in runs:
+            if run.get("status") != "running":
+                continue
+            last = _parse_ts(await _first(
+                "SELECT MAX(observed_at) AS t FROM observations WHERE run_id = ?",
+                (run["id"],))) or _parse_ts(run.get("started_at"))
+            if last and (now - last).total_seconds() > STALE_RUN_SECONDS:
+                run["status"] = "stalled"
+        return runs
     except Exception as e:
         return {"error": str(e)}
 

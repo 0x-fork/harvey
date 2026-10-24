@@ -61,6 +61,11 @@ JUNK_DOMAIN_PATTERNS = tuple(re.compile(p, re.I) for p in (
     r"\.(edu|gov|mil)$",
     r"(hospital|healthsystem|medicalcenter)\.",
     r"health\.org$",
+    # startup databases, launch sites and tech press (the YC preset's noise)
+    r"(^|\.)(ycombinator|workatastartup|startupschool|yclist|ycdb|seedtable)\.",
+    r"(^|\.)(crunchbase|techcrunch|wellfound|angel|tracxn|pitchbook)\.",
+    r"(^|\.)(cbinsights|producthunt|f6s|dealroom|growjo|owler|zoominfo)\.",
+    r"(^|\.)github\.com$",
     # infrastructure that is never a prospect
     r"(^|\.)(google|bing|yahoo|duckduckgo|amazon|apple|microsoft)\.",
     r"(wordpress|wix|squarespace|shopify|godaddy|weebly|webflow)\.com$",
@@ -337,6 +342,7 @@ class DiscoveryQuery:
     coordinate: str = ""             # "lat,lng,radius_km" for listings providers
     depth: int = 30                  # SERP depth; ignored by listings providers
     limit: int = 100                 # max records to take from one query
+    preset: str = ""                 # PRESETS key that built it, if any
 
     def keyword(self) -> str:
         return f"{self.term} {self.location}".strip()
@@ -789,22 +795,60 @@ class DiscoveryReport:
         }
 
 
+# Built-in searches beyond "your ICP". Each says how to turn an industry into
+# a search, and which kind of provider can run it.
+PRESETS = {
+    # Startups that say on their own site they're YC-backed. Never
+    # ycombinator.com itself, whose terms forbid scraping and harvesting
+    # contacts; its pages and the startup databases are excluded too.
+    "yc": {
+        "label": "YC startups",
+        "kinds": ("serp",),
+        "term": ('"backed by Y Combinator" {industry} -site:ycombinator.com '
+                 "-site:workatastartup.com -site:startupschool.org "
+                 "-site:linkedin.com -site:crunchbase.com"),
+        "local": False,
+    },
+}
+
+
+def preset_problem(preset: str, provider_key: str) -> str | None:
+    """Why ``preset`` can't run on ``provider_key``, or None."""
+    if not preset:
+        return None
+    spec = PRESETS.get(preset)
+    if spec is None:
+        return f"Unknown preset {preset!r}. Presets: {', '.join(PRESETS)}."
+    provider = PROVIDERS.get(provider_key)
+    if provider is None or provider.kind not in spec["kinds"]:
+        names = ", ".join(k for k, p in PROVIDERS.items() if p.kind in spec["kinds"])
+        return (f"The {spec['label']} preset is a web search, so it needs a search "
+                f"provider ({names}), not {provider_key}.")
+    return None
+
+
 def build_queries(config, cities: list[str] | None = None,
-                  depth: int = 30, limit: int = 100) -> list[DiscoveryQuery]:
+                  depth: int = 30, limit: int = 100, preset: str = "") -> list[DiscoveryQuery]:
     """Turn the configured ICP into a concrete query list.
 
     One query per (industry x city). Coordinates come from
     ``icp.geo_coordinates`` when present, because listings providers need a
-    radius, not a place name.
+    radius, not a place name. A ``preset`` (PRESETS) rewrites each industry
+    into its search; a non-local one only uses cities you pass.
     """
     icp = config.icp
     terms = list(icp.industries) or [config.product.name]
-    places = cities if cities is not None else list(icp.geography) or [""]
+    spec = PRESETS.get(preset) if preset else None
+    if spec:
+        terms = [spec["term"].format(industry=t) for t in terms]
+        places = cities if cities is not None else ([""] if not spec["local"] else list(icp.geography) or [""])
+    else:
+        places = cities if cities is not None else list(icp.geography) or [""]
     coords = getattr(icp, "geo_coordinates", {}) or {}
 
     return [
         DiscoveryQuery(term=term, location=place, depth=depth, limit=limit,
-                       coordinate=coords.get(place, ""))
+                       coordinate=coords.get(place, ""), preset=preset if spec else "")
         for term in terms
         for place in places
     ]
@@ -919,7 +963,7 @@ async def run_discovery(
                     else:
                         report.known_companies += 1
                     batch.extend(_observations(biz, company_id, confirmed,
-                                               report.run_id))
+                                               report.run_id, query=query))
 
                 # Flush every batch. The observations are the asset; buffering
                 # them until some threshold means a run that dies loses them.
@@ -966,7 +1010,7 @@ async def _upsert(state, biz: Business, query: DiscoveryQuery) -> tuple[str, boo
 
 
 def _observations(biz: Business, company_id: str, confirmed: set[str],
-                  run_id: str) -> list[dict]:
+                  run_id: str, query: DiscoveryQuery | None = None) -> list[dict]:
     """Every fact this business gave us, as rows — and only the confirmed ones."""
     rows: list[dict] = []
 
@@ -990,6 +1034,11 @@ def _observations(biz: Business, company_id: str, confirmed: set[str],
         add("REVIEW_RATING", num=float(biz.rating))
     if biz.review_count is not None:
         add("REVIEW_COUNT", num=float(biz.review_count))
+    if query is not None and query.preset == "yc":
+        # The search matched "backed by Y Combinator" on a page of their own
+        # site (third-party sites are filtered out above). Short of reading
+        # that page ourselves, so below the homepage's own claim.
+        add("YC_BACKED", num=1.0, conf=0.7)
     return rows
 
 

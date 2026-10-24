@@ -50,6 +50,9 @@ channels:
     provider: "gmail"          # gmail (recommended) | microsoft | smtp | instantly
     max_daily_sends: 50
     require_approval: true      # native: review in Outbox; Instantly: sending held
+    # link_domains: ["mainsite.com"]   # your own sites besides the sending
+    #                                  # domain and booking link; on autopilot,
+    #                                  # an email linking elsewhere waits for you
     send_to_risky: false        # also send to catch-all domains (off = safest)
     max_bounce_rate: 0.05       # pause all sending if bounces exceed this
     # New sending domain? Set start_date to the day your warmup service went

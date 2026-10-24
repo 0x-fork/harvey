@@ -234,6 +234,14 @@ def cmd_status(args):
             print("  Sending:              HELD")
             print(textwrap.fill(notice, width=72, initial_indent="                        ",
                                 subsequent_indent="                        "))
+        hold = await state.current_sends_held()
+        if hold:
+            from harvey.sending_mode import held_message
+            waiting = len(await state.get_outbox(status="approved", limit=500))
+            _, detail = held_message(hold, waiting=waiting)
+            print("  Sending:              NOT SENDING (couldn't read your inbox)")
+            print(textwrap.fill(detail, width=72, initial_indent="                        ",
+                                subsequent_indent="                        "))
         if address_notice:
             print("  Postal address:       MISSING")
             print(textwrap.fill(address_notice, width=72, initial_indent="                        ",
@@ -463,7 +471,12 @@ def cmd_outbox(args):
 
         if args.approve_all:
             n = await state.approve_outbox()
-            print(f"\n  Approved {n} email(s). They'll send on schedule.\n")
+            print(f"\n  Approved {n} email(s). They'll send on schedule.")
+            held = await state.count_held_for_review()
+            if held:
+                print(f"  {held} email(s) Harvey held for review were left out: read each one,")
+                print("  then approve it with --approve <id>.")
+            print()
             return
         if args.approve:
             n = await state.approve_outbox(args.approve)
@@ -530,7 +543,7 @@ def cmd_discover(args):
     from harvey.state import StateManager
     from harvey.config import load_config
     from harvey.collectors.discover import (
-        PROVIDERS, build_queries, provider_menu, run_discovery,
+        PROVIDERS, build_queries, preset_problem, provider_menu, run_discovery,
     )
 
     async def _discover():
@@ -561,8 +574,13 @@ def cmd_discover(args):
 
         # Semicolons, not commas: "Denver, CO" is one city, not two.
         cities = [c.strip() for c in args.city.split(";") if c.strip()] or None
+        preset = getattr(args, "preset", "") or ""
+        problem = preset_problem(preset, args.provider)
+        if problem:
+            print(f"\n  {problem}\n")
+            sys.exit(2)
         queries = build_queries(config, cities=cities,
-                                depth=args.depth, limit=args.limit)
+                                depth=args.depth, limit=args.limit, preset=preset)
 
         report = await run_discovery(state, config, args.provider, queries,
                                      max_spend=args.max_spend, dry_run=True)
@@ -860,8 +878,8 @@ def main():
         help="Comma-separated statuses to include (default: verified,risky)",
     )
     sub.add_argument("--min-score", type=int, default=0, help="Minimum ICP score")
-    sub.add_argument("--status", default="", help="Comma-separated pipeline statuses (e.g. new,queued)")
-    sub.add_argument("--all", action="store_true", help="Export everything, no filters")
+    sub.add_argument("--status", default="", help="Comma-separated pipeline statuses (e.g. new,queued); opted-out contacts stay excluded")
+    sub.add_argument("--all", action="store_true", help="Export the raw list without filters, including opted-out contacts (not for outreach)")
     sub.set_defaults(func=cmd_export)
 
     # harvey gmail auth|test
@@ -900,6 +918,10 @@ def main():
                      help="Max records per query (default: 100)")
     sub.add_argument("--max-spend", type=float, default=1.0,
                      help="Hard cap in dollars (default: 1.00)")
+    sub.add_argument("--preset", default="", choices=["", "yc"],
+                     help="A built-in search instead of your ICP's industries. "
+                          "yc: startups whose own site says they're YC-backed "
+                          "(needs serper or dataforseo_serp)")
     sub.add_argument("--no-profile", action="store_true",
                      help="Don't profile what was found (profiling is free)")
     sub.set_defaults(func=cmd_discover)

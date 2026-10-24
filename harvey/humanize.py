@@ -21,6 +21,7 @@ import re
 from pathlib import Path
 
 from harvey.textio import read_user_text
+from harvey.untrusted import UNTRUSTED_RULE, fence
 
 logger = logging.getLogger("harvey.humanize")
 
@@ -115,7 +116,9 @@ Hard limits on the rewrite, on top of the instructions above:
 - The subject stays lowercase, 2-5 words. An empty subject stays empty.
 
 Draft:
-{json.dumps(payload, ensure_ascii=False, indent=2)}
+{fence(json.dumps(payload, ensure_ascii=False, indent=2), "draft")}
+
+{UNTRUSTED_RULE}
 
 Return ONLY a JSON object: {{"subject": "...", "body": "..."}}"""
 

@@ -16,13 +16,16 @@ from harvey.brain import Brain, BrainUnavailable
 from harvey.config import (
     DEFAULT_OPT_OUT_LINE, HarveyConfig, EnvConfig, compliance_of, legacy_sending_held,
 )
+from harvey.gate import autopilot_review, pre_send_check
 from harvey.humanize import humanize, humanizer_enabled
 from harvey.integrations.instantly import InstantlyClient
 from harvey.integrations.mail_provider import (
     NATIVE_PROVIDERS, get_mail_provider, strip_quoted_reply,
 )
 from harvey.models.conversation import Conversation, Message
-from harvey.state import StateManager
+from harvey.state import REVIEW_NEXT_REPLY_KEY, StateManager
+from harvey.sending_mode import sync_sending_mode
+from harvey.untrusted import UNTRUSTED_RULE, fence
 
 logger = logging.getLogger("harvey.handler")
 
@@ -136,16 +139,33 @@ class OurText:
         return "\n".join(kept)
 
 
-def _is_opt_out(their_text: str, own_words: str) -> bool:
-    """their_text: everything they wrote, our text removed. own_words: their
+def _opt_out_reason(their_text: str, own_words: str) -> dict | None:
+    """Which opt-out rule their reply trips, and on what words, or None.
+
+    their_text: everything they wrote, our text removed. own_words: their
     reply without the quote. Longer phrases match across a line wrap; "no
-    thanks" only within a line."""
-    if any(p in _flat(their_text) for p in OPT_OUT_PATTERNS):
-        return True
-    if any(NO_THANKS_RE.search(_flat(line)) for line in their_text.split("\n")):
-        return True
+    thanks" only within a line. The result is kept with the opt-out so a
+    human can see why Harvey stopped, and undo it if it was wrong."""
+    flat = _flat(their_text)
+    for p in OPT_OUT_PATTERNS:
+        if p in flat:
+            return {"rule": "phrase", "matched": p,
+                    "why": f'Their reply contains "{p}".'}
+    for line in their_text.split("\n"):
+        m = NO_THANKS_RE.search(_flat(line))
+        if m:
+            return {"rule": "no_thanks", "matched": m.group(0),
+                    "why": f'Their reply says "{m.group(0)}", what the opt-out line asks for.'}
     bare = _flat(_MOBILE_SIGNATURE_RE.sub("", own_words or ""))
-    return re.sub(r"[^\w\s-]", "", bare).strip() in BARE_OPT_OUTS
+    bare = re.sub(r"[^\w\s-]", "", bare).strip()
+    if bare in BARE_OPT_OUTS:
+        return {"rule": "only_words", "matched": bare,
+                "why": f'Their reply was only "{bare}".'}
+    return None
+
+
+MODEL_OPT_OUT = {"rule": "model", "matched": "",
+                 "why": "No opt-out phrase matched; the model read the reply as a request to stop."}
 
 # Phrases that mean a human must take over. Never auto-reply to these.
 ESCALATION_PATTERNS = (
@@ -180,6 +200,7 @@ class Handler:
         self.instantly = InstantlyClient(env.instantly_api_key)
         self.provider = get_mail_provider(config, env)
         self.skills = ""
+        self.last_read_problem = ""   # why the last mailbox read failed, for the heartbeat
 
     @property
     def is_native(self) -> bool:
@@ -291,6 +312,53 @@ class Handler:
             compliance.postal_address, compliance.opt_out_line, DEFAULT_OPT_OUT_LINE,
         ])
 
+    async def _record_after_opt_out(
+        self, prospect, reply_text: str, campaign_id: str = "", escalate: bool = False,
+    ):
+        """Keep a message from someone who opted out, and do nothing else.
+
+        No model call and no reply: they asked not to be contacted, and an
+        out-of-office or a "thanks" doesn't change that. Their status stays
+        opted_out (so they stay out of exports), anything still queued for
+        them is cancelled, and the message lands in a closed conversation a
+        human can read and act on by hand. A complaint or legal threat goes
+        to Needs you instead, as it would from anyone else.
+        """
+        try:
+            await self.state.cancel_pending_outbox_for_prospect(prospect.id)
+        except Exception as e:
+            logger.debug(f"Handler: outbox cancel failed: {e}")
+        await self.state.add_conversation(Conversation(
+            id="",
+            prospect_id=prospect.id,
+            campaign_id=campaign_id,
+            channel="email",
+            thread=[Message(sender="prospect", content=reply_text)],
+            intent="escalate" if escalate else "unsubscribe",
+            stage="closed_lost",
+            status="needs_human" if escalate else "closed",
+        ))
+        if escalate:
+            await self.state.log_action(
+                action_type="escalation",
+                agent="handler",
+                details={"prospect_email": prospect.email, "reply_preview": reply_text[:200]},
+            )
+            logger.warning(
+                f"Handler: ESCALATED reply from {prospect.email}, who opted out earlier. "
+                "Needs human review. No auto-reply sent."
+            )
+            return
+        await self.state.log_action(
+            action_type="reply_after_opt_out",
+            agent="handler",
+            details={"prospect_email": prospect.email},
+        )
+        logger.info(
+            f"Handler: {prospect.email} opted out earlier and wrote again. "
+            "Kept the message; no reply sent."
+        )
+
     async def _process_reply(
         self,
         lead_email: str,
@@ -317,6 +385,11 @@ class Handler:
         stripped = strip_quoted_reply(reply_text) or reply_text
         reply_text = ours.remove(stripped).strip() or stripped
 
+        if prospect.status == "opted_out":
+            escalate = any(p in keyword_text for p in ESCALATION_PATTERNS)
+            await self._record_after_opt_out(prospect, reply_text, campaign_id, escalate)
+            return
+
         # Update prospect status + stop-on-reply: a human answered, so every
         # queued sequence email for them is now wrong to send.
         await self.state.update_prospect_status(prospect.id, "replied")
@@ -332,7 +405,8 @@ class Handler:
 
         # 1. Classify intent. Hard keyword checks run FIRST and override
         # the LLM — opt-outs and legal threats must never be missed.
-        if _is_opt_out(their_text, reply_text):
+        opt_out = _opt_out_reason(their_text, reply_text)
+        if opt_out:
             intent = "unsubscribe"
         elif any(p in keyword_text for p in ESCALATION_PATTERNS):
             intent = "escalate"
@@ -368,6 +442,7 @@ class Handler:
 
         # 2b. Draft the reply now, while nothing is stored yet. A held
         # Instantly setup can't send it, so don't spend a model call on it.
+        await sync_sending_mode(self.config, self.state)
         held = not self.is_native and legacy_sending_held(self.config)
         response = ""
         if intent in AUTO_REPLY_INTENTS and not held:
@@ -394,7 +469,13 @@ class Handler:
             await self.state.log_action(
                 action_type="opt_out",
                 agent="handler",
-                details={"prospect_email": lead_email},
+                details={
+                    "prospect_id": prospect.id,
+                    "prospect_email": lead_email,
+                    **(opt_out or MODEL_OPT_OUT),
+                    "message": reply_text[:1000],
+                    "conversation_id": convo.id,
+                },
             )
             logger.info(f"Handler: {lead_email} opted out. Suppressed permanently. No reply sent.")
             return
@@ -466,6 +547,31 @@ class Handler:
             await self._queue_native_reply(
                 response, prospect, convo, reply_meta or {}, intent
             )
+        elif await self.state.get_setting(REVIEW_NEXT_REPLY_KEY + prospect.id):
+            # You undid their opt-out, and Instantly can't hold a reply for
+            # approval: the first answer after an undo is yours to send.
+            await self.state.update_conversation(convo.id, status="needs_human")
+            await self.state.delete_setting(REVIEW_NEXT_REPLY_KEY + prospect.id)
+            await self.state.log_action(
+                action_type="escalation",
+                agent="handler",
+                details={"prospect_email": lead_email,
+                         "reason": "first reply since you undid their opt-out",
+                         "reply_preview": reply_text[:200]},
+            )
+            logger.info(f"Handler: {lead_email} wrote after their opt-out was undone. Handed to you.")
+        elif held_reasons := self._instantly_reply_held(prospect, response):
+            # Instantly sends at once, with no Outbox to hold it in: an answer
+            # the gate or the autopilot review stops goes to you instead.
+            await self.state.update_conversation(convo.id, status="needs_human")
+            await self.state.log_action(
+                action_type="escalation",
+                agent="handler",
+                details={"prospect_email": lead_email,
+                         "reason": "Harvey's answer was held: " + "; ".join(held_reasons)[:200],
+                         "reply_preview": reply_text[:200]},
+            )
+            logger.warning(f"Handler: answer to {lead_email} held ({held_reasons}). Handed to you.")
         elif reply_uuid:
             result = await self.instantly.send_reply(reply_uuid, response)
             if result is not None:
@@ -498,10 +604,13 @@ class Handler:
             )
             return True  # nothing to read; the sender can't send through it either
 
+        self.last_read_problem = ""
         try:
             inbound = await self.provider.get_replies()
         except Exception as e:
             logger.error(f"Handler: fetching replies failed: {e}")
+            # Kept for the heartbeat: sending is held, and Today says why.
+            self.last_read_problem = f"{self.provider.name}: {e}"
             return False
 
         handled = 0
@@ -533,6 +642,7 @@ class Handler:
                 break
             except Exception as e:
                 logger.error(f"Handler: error processing {msg.from_email}: {e}")
+                self.last_read_problem = f"a reply from {msg.from_email} couldn't be handled ({e})"
                 complete = False
             finally:
                 if consumed:
@@ -542,6 +652,11 @@ class Handler:
             logger.info(f"Handler: processed {handled} inbound message(s).")
         else:
             logger.info("Handler: no new replies.")
+        if complete:
+            # Every reply read was handled: the provider may start its next
+            # read after these (Gmail's history marker). Not otherwise, so
+            # what wasn't handled is read again.
+            self.provider.confirm_read()
         return complete
 
     async def _handle_bounce(self, msg):
@@ -594,9 +709,15 @@ class Handler:
         self, response: str, prospect, convo, reply_meta: dict, intent: str
     ):
         """Route Harvey's reply through the outbox (approval ladder applies)."""
+        await sync_sending_mode(self.config, self.state)
         require_approval = getattr(
             self.config.channels.email, "require_approval", True
         )
+        # The first reply since you undid their opt-out waits for you, even
+        # on autopilot: the undo panel promises it.
+        review_key = REVIEW_NEXT_REPLY_KEY + prospect.id
+        if await self.state.get_setting(review_key):
+            require_approval = True
         subject = reply_meta.get("subject", "")
         if subject and not subject.lower().startswith("re:"):
             subject = f"Re: {subject}"
@@ -613,8 +734,10 @@ class Handler:
             provider=self.provider.name if self.provider else "",
             thread_ref=reply_meta.get("thread_ref", ""),
             in_reply_to=reply_meta.get("message_id", ""),
+            approved_by="" if require_approval else "autopilot",
         )
         if item_id:
+            await self.state.delete_setting(review_key)
             mode = "queued for your approval" if require_approval else "queued to send"
             logger.info(f"Handler: reply to {prospect.email} {mode} ({intent}).")
             await self.state.log_action(
@@ -623,6 +746,12 @@ class Handler:
                 details={"prospect_email": prospect.email, "intent": intent,
                          "response_preview": response[:100]},
             )
+
+    def _instantly_reply_held(self, prospect, response: str) -> list[str]:
+        """Why an Instantly reply must not go out by itself, or []."""
+        gate = pre_send_check(prospect.email, "Re:", response, kind="reply")
+        return list(gate.reasons) + autopilot_review("", response, self.config,
+                                                     recipient=prospect.email)
 
     async def _classify_intent(self, reply_text: str, prospect) -> str:
         """Ask the brain to classify the reply's intent."""
@@ -639,8 +768,9 @@ class Handler:
 When in doubt between "not_interested" and "unsubscribe", choose "unsubscribe".
 When in doubt between anything and "escalate", choose "escalate".
 
-Reply from {prospect.full_name()} ({prospect.title} at {prospect.company}):
-\"\"\"{reply_text}\"\"\"
+{UNTRUSTED_RULE}
+
+{fence(f"Reply from {prospect.full_name()} ({prospect.title} at {prospect.company}):" + chr(10) + reply_text, "their reply")}
 
 Respond with ONLY the category label, nothing else."""
 
@@ -739,11 +869,23 @@ Product: {self.config.product.name} — {self.config.product.description}"""
         # Inject objection handling + sales methodology skills
         if self.skills:
             prompt += "\n\n" + self.skills
+        # A YC startup's founder gets the founder playbook.
+        try:
+            yc = (await self.state.yc_batch(prospect.company_id)
+                  if getattr(prospect, "company_id", "") else None)
+        except Exception:
+            yc = None   # an optional lookup never stops a reply
+        if yc is not None and hasattr(self.brain, "load_skill"):
+            playbook = self.brain.load_skill("selling_to_startups")
+            if playbook:
+                prompt += "\n\nSELLING TO STARTUP FOUNDERS\n" + playbook
 
         prompt += f"""
 
 Conversation so far:
-{history}
+{fence(history, "the conversation")}
+
+{UNTRUSTED_RULE}
 
 The prospect's intent is: {intent}
 {objection_context}
