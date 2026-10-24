@@ -163,12 +163,20 @@ async def test_a_cached_verdict_alone_does_not_clear_the_hold(state):
 
 @pytest.mark.asyncio
 async def test_a_switched_off_check_records_nothing(state):
+    # A hold recorded while the check was on, then the check is switched
+    # off: cold email goes out and nothing says it waits on Precleared.
     await two_cold_and_a_reply(state)
-    sender = make_sender(state, FakeProvider())
-    sender.precleared = None
+    sender = with_check(make_sender(state, FakeProvider()),
+                        mock_status(429, {"error": "daily_limit"}))
+    await sender._drain_due()
+    assert (await stored(state))["status"] == "held"
 
+    provider = FakeProvider()
+    sender = make_sender(state, provider)
+    sender.precleared = None
     await sender._drain_due()
 
+    assert sorted(m["to"] for m in provider.sent) == ["jane@example.com", "sam@example.net"]
     assert await state.get_setting(STATUS_KEY) == ""
 
 
@@ -224,11 +232,23 @@ def _seed(db_path, value):
     asyncio.run(go())
 
 
+def fake_config(enabled=True, provider="gmail"):
+    from types import SimpleNamespace as NS
+    return NS(compliance=NS(precleared=NS(enabled=enabled)),
+              channels=NS(email=NS(provider=provider)))
+
+
+def check_on(monkeypatch, **kwargs):
+    import harvey.config as config_mod
+    monkeypatch.setattr(config_mod, "load_config", lambda *a, **k: fake_config(**kwargs))
+
+
 def _now():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def test_today_shows_the_hold_with_its_link(client):  # noqa: F811
+def test_today_shows_the_hold_with_its_link(client, monkeypatch):  # noqa: F811
+    check_on(monkeypatch)
     _seed(client.db_path, json.dumps({
         "status": "held", "kind": "out_of_checks", "url": CHECKOUT, "waiting": 3,
         "since": _now(), "at": _now(), "reason": "",
@@ -249,6 +269,7 @@ def test_today_says_nothing_without_a_hold(client):  # noqa: F811
 
 
 def test_cli_status_shows_the_hold(monkeypatch, tmp_path, capsys):
+    check_on(monkeypatch)
     import harvey.cli as cli
     import harvey.state as state_mod
 
@@ -288,22 +309,6 @@ async def test_since_restarts_after_a_stale_gap(state):
 
 
 @pytest.mark.asyncio
-async def test_switching_the_check_off_clears_a_recorded_hold(state):
-    # With the check off, cold email no longer waits on Precleared, so a
-    # card saying it does would be wrong.
-    await record_hold(state, Clearance(allowed=False, held=True, hold_kind="key_rejected"), 4)
-    await two_cold_and_a_reply(state)
-    provider = FakeProvider()
-    sender = make_sender(state, provider)
-    sender.precleared = None
-
-    await sender._drain_due()
-
-    assert len(provider.sent) == 3
-    assert await current_hold(state) == {}
-
-
-@pytest.mark.asyncio
 async def test_waiting_counts_every_cold_email_behind_the_hold(state):
     # More cold email is due than one cycle reads; the count must not stop
     # at the page size.
@@ -335,3 +340,188 @@ async def test_no_piece_of_the_key_reaches_the_hold(state):
     assert hold["kind"] == "unavailable"
     assert key[:10] not in json.dumps(hold)
     assert key[:10] not in hold_message(hold)["detail"]
+
+
+CONTROL = "\x1b]8;;https://evil.example\x07Click\x1b]8;;\x07\x1b[2J\x9b31m\x7f\x00"
+
+
+def _has_control(text):
+    import unicodedata
+    return any(unicodedata.category(ch) == "Cc" for ch in str(text))
+
+
+@pytest.mark.asyncio
+async def test_control_characters_in_an_error_body_never_reach_the_hold(state):
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(503, text="down " + CONTROL + " try later"))
+    await two_cold_and_a_reply(state)
+    sender = with_check(make_sender(state, FakeProvider()), transport)
+
+    await sender._drain_due()
+
+    hold = await stored(state)
+    assert hold["kind"] == "unavailable"
+    assert "try later" in hold["reason"]
+    assert not _has_control(hold["reason"])
+
+
+def test_hold_message_strips_control_characters_from_a_stored_hold():
+    for kind in ("keyless_limit", "out_of_checks", "key_rejected", "unavailable"):
+        message = hold_message({"kind": kind, "waiting": 1,
+                                "reason": "down " + CONTROL,
+                                "url": "https://precleared.dev/buy" + CONTROL})
+        for value in message.values():
+            assert not _has_control(value), (kind, value)
+
+
+def test_cli_status_never_prints_control_characters(monkeypatch, tmp_path, capsys):
+    import harvey.cli as cli
+    import harvey.state as state_mod
+
+    check_on(monkeypatch)
+    db = tmp_path / "status.db"
+    _seed(db, json.dumps({"status": "held", "kind": "unavailable", "waiting": 1,
+                          "url": "", "since": _now() + CONTROL, "at": _now(),
+                          "reason": "down " + CONTROL}))
+    monkeypatch.setattr(state_mod, "StateManager", lambda: StateManager(str(db)))
+
+    cli.cmd_status(type("A", (), {"check": False})())
+
+    out = capsys.readouterr().out
+    assert "Precleared:" in out
+    assert "\x1b" not in out and "\x07" not in out and "\x9b" not in out
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("form", ["json", "percent", "percent-lower", "percent-twice"])
+async def test_an_escaped_or_encoded_key_is_redacted_too(state, form):
+    import re
+    from urllib.parse import quote
+    from harvey.integrations.precleared import PreclearedClient
+
+    key = "pc_live_Ab/Cd+Ef=Gh9"
+    echoed = {
+        "json": key.replace("/", "\\/"),
+        "percent": quote(key, safe=""),
+        "percent-lower": re.sub(r"%[0-9A-F]{2}", lambda m: m.group().lower(),
+                                quote(key, safe="")),
+        "percent-twice": quote(quote(key, safe=""), safe=""),
+    }[form]
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(500, text=f"bad auth for {echoed} today"))
+    client = PreclearedClient("GB", api_key=key, transport=transport)
+
+    result = await client.clear("person@example.com", state)
+
+    assert result.held and result.hold_kind == "unavailable"
+    assert echoed not in result.reason
+    assert "Ab" + "/" not in result.reason and "Cd" not in result.reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("url", [
+    "https://evil.example/pay",
+    "https://precleared.dev.evil.example/buy",
+    "https://evilprecleared.dev/buy",
+])
+async def test_a_checkout_link_off_precleared_falls_back_to_the_buy_page(state, url):
+    from harvey.integrations.precleared import BUY_URL, PreclearedClient
+
+    client = PreclearedClient("GB", api_key="pc_live_test",
+                              transport=mock_status(402, {"buy_url": url}))
+
+    result = await client.clear("person@example.com", state)
+
+    assert result.hold_kind == "out_of_checks"
+    assert result.fix_url == BUY_URL
+    assert url not in result.reason
+
+
+@pytest.mark.asyncio
+async def test_a_checkout_link_on_precleared_is_kept(state):
+    from harvey.integrations.precleared import PreclearedClient
+
+    url = "https://pay.precleared.dev/session/example123"
+    client = PreclearedClient("GB", api_key="pc_live_test",
+                              transport=mock_status(402, {"buy_url": url}))
+
+    result = await client.clear("person@example.com", state)
+
+    assert result.fix_url == url
+
+
+@pytest.mark.asyncio
+async def test_count_due_cold_outbox_counts_only_due_approved_cold_email(state):
+    from harvey.agents.sender import Sender  # noqa: F401 (schema in place)
+
+    a = await seed_prospect(state, email="a@example.com")
+    b = await seed_prospect(state, email="b@example.com")
+    c = await seed_prospect(state, email="c@example.com", status="replied")
+    await queue(state, a, to="a@example.com")                 # counts
+    await queue(state, a, step=2, to="a@example.com")         # step 1 still queued
+    await queue(state, b, to="b@example.com")                 # counts
+    await queue(state, c, kind="reply", to="c@example.com")   # a reply
+    later = await queue(state, b, to="b@example.com", campaign="c2")
+    await state.update_outbox_item(later, send_at="2999-01-01T00:00:00")
+    pending = await queue(state, b, to="b@example.com", campaign="c3")
+    await state.update_outbox_item(pending, status="pending_review")
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+    assert await state.count_due_cold_outbox(now) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_held_cycle_does_not_read_a_huge_page(state):
+    await two_cold_and_a_reply(state)
+    sender = with_check(make_sender(state, FakeProvider()),
+                        mock_status(429, {"error": "daily_limit"}))
+    limits = []
+    real = state.get_outbox
+
+    async def spy(*args, **kwargs):
+        limits.append(kwargs.get("limit", 200))
+        return await real(*args, **kwargs)
+
+    state.get_outbox = spy
+    await sender._drain_due()
+
+    assert (await stored(state))["waiting"] == 2
+    assert max(limits) <= 24
+
+
+@pytest.mark.asyncio
+async def test_the_hold_is_hidden_when_the_check_does_not_apply(state):
+    await record_hold(state, Clearance(allowed=False, held=True, hold_kind="key_rejected"), 2)
+
+    assert (await current_hold(state, fake_config()))["kind"] == "key_rejected"
+    assert await current_hold(state, fake_config(enabled=False)) == {}
+    assert await current_hold(state, fake_config(provider="instantly")) == {}
+    # Without a config to judge by (it failed to load), the hold still shows.
+    assert (await current_hold(state))["kind"] == "key_rejected"
+
+
+def test_today_hides_the_hold_when_the_check_is_off(client, monkeypatch):  # noqa: F811
+    check_on(monkeypatch, enabled=False)
+    _seed(client.db_path, json.dumps({
+        "status": "held", "kind": "key_rejected", "url": "", "waiting": 3,
+        "since": _now(), "at": _now(), "reason": "",
+    }))
+
+    items = client.get("/api/today").json()["items"]
+
+    assert not [i for i in items if i["key"] == "precleared-hold"]
+
+
+def test_cli_status_hides_the_hold_when_the_provider_is_not_native(monkeypatch, tmp_path, capsys):
+    import harvey.cli as cli
+    import harvey.state as state_mod
+
+    check_on(monkeypatch, provider="instantly")
+    db = tmp_path / "status.db"
+    _seed(db, json.dumps({"status": "held", "kind": "keyless_limit", "waiting": 2,
+                          "url": "", "since": _now(), "at": _now(), "reason": ""}))
+    monkeypatch.setattr(state_mod, "StateManager", lambda: StateManager(str(db)))
+
+    cli.cmd_status(type("A", (), {"check": False})())
+
+    assert "Precleared:" not in capsys.readouterr().out

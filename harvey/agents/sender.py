@@ -805,12 +805,8 @@ class Sender:
             if hold is not None:
                 # The page read above stops at a few times the cycle's
                 # budget; count every due cold email still waiting.
-                still_due = await self.state.get_outbox(
-                    status="approved", due_before=now, limit=1000,
-                    skip_unready_follow_ups=True,
-                )
-                waiting_on_check = max(waiting_on_check, sum(
-                    1 for i in still_due if i["kind"] == "sequence"))
+                waiting_on_check = max(
+                    waiting_on_check, await self.state.count_due_cold_outbox(now))
                 await record_hold(self.state, hold, waiting_on_check)
             elif answered:
                 await clear_hold(self.state)

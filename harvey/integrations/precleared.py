@@ -37,6 +37,7 @@ import ipaddress
 import json
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from urllib.parse import unquote, urlsplit
@@ -72,6 +73,9 @@ STATUS_KEY = "precleared_status"
 # stale: Harvey stopped running, or the check was switched off.
 STATUS_MAX_AGE = timedelta(hours=26)
 HOLD_KINDS = ("keyless_limit", "out_of_checks", "key_rejected", "unavailable")
+# A 402's checkout link is only followed to Precleared itself or its card
+# checkout; any other host falls back to BUY_URL.
+BUY_HOSTS = ("precleared.dev", "checkout.stripe.com")
 
 
 @dataclass
@@ -132,7 +136,10 @@ class PreclearedClient:
 
     def _redact(self, text: str) -> str:
         if self.api_key and text:
-            return text.replace(self.api_key, "***REDACTED***")
+            text = text.replace(self.api_key, "***REDACTED***")
+            # Echoed escaped or percent-encoded: drop the text altogether.
+            if _contains_key(text, self.api_key):
+                return "***REDACTED***"
         return text or ""
 
     def _fingerprint(self) -> str:
@@ -229,7 +236,8 @@ class PreclearedClient:
                              reason="PRECLEARED_API_KEY was rejected (wrong or revoked)")
         if resp.status_code != 200:
             return Clearance(allowed=False, held=True, hold_kind="unavailable",
-                             reason=f"Precleared HTTP {resp.status_code}: {self._redact(resp.text)[:200]}")
+                             reason=f"Precleared HTTP {resp.status_code}: "
+                                    f"{_clean(self._redact(resp.text))[:200]}")
 
         try:
             data = resp.json()
@@ -263,6 +271,27 @@ class PreclearedClient:
 def _text(value) -> str:
     """A stripped string, or "" for anything that isn't one."""
     return value.strip() if isinstance(value, str) else ""
+
+
+def _clean(text: str) -> str:
+    """Text with control characters (C0 incl. ESC, DEL, C1) made spaces,
+    so text Precleared supplied can't drive a terminal (links, clears)."""
+    return "".join(" " if unicodedata.category(ch) == "Cc" else ch for ch in text or "")
+
+
+def _contains_key(text: str, api_key: str) -> bool:
+    """Whether ``text`` holds ``api_key`` as is, JSON-escaped (``\\/``) or
+    percent-encoded (any case, nested). Too deep to finish checking counts
+    as yes."""
+    decoded = text
+    for _ in range(8):
+        if api_key in decoded:
+            return True
+        next_decoded = unquote(decoded).replace("\\/", "/")
+        if next_decoded == decoded:
+            return False
+        decoded = next_decoded
+    return True
 
 
 def _buy_url(resp: httpx.Response, api_key: str = "") -> str:
@@ -305,21 +334,14 @@ def _buy_url(resp: httpx.Response, api_key: str = "") -> str:
                 for label in ascii_host.split(".")
             ):
                 return BUY_URL
+        if not any(host == h or host.endswith("." + h) for h in BUY_HOSTS):
+            return BUY_URL
     except (ValueError, UnicodeError):
         return BUY_URL
 
-    if api_key:
-        # Inspect decoded copies, but keep a usable checkout/session URL intact.
-        # Reject excessive nesting instead of logging a credential we could not
-        # finish checking. unquote handles upper/lower-case percent escapes.
-        decoded = url
-        for _ in range(8):
-            if api_key in decoded:
-                return BUY_URL
-            next_decoded = unquote(decoded)
-            if next_decoded == decoded:
-                return url
-            decoded = next_decoded
+    if api_key and _contains_key(url, api_key):
+        # Decoded copies are inspected, but a usable checkout/session URL
+        # is kept intact.
         return BUY_URL
     return url
 
@@ -411,8 +433,8 @@ async def record_hold(state, clearance: Clearance, waiting: int) -> None:
         since = previous.get("since") if (
             previous.get("status") == "held" and previous.get("kind") == kind) else None
         await state.set_setting(STATUS_KEY, json.dumps({
-            "status": "held", "kind": kind, "reason": clearance.reason[:300],
-            "url": clearance.fix_url, "waiting": max(1, int(waiting)),
+            "status": "held", "kind": kind, "reason": _clean(clearance.reason)[:300],
+            "url": _clean(clearance.fix_url), "waiting": max(1, int(waiting)),
             "since": since or now, "at": now,
         }))
     except Exception as e:
@@ -428,8 +450,25 @@ async def clear_hold(state) -> None:
         logger.warning(f"Precleared: failed to clear the hold: {e}")
 
 
-async def current_hold(state) -> dict:
-    """The recorded hold if a cycle hit it recently, else {}."""
+def hold_applies(config) -> bool:
+    """Whether the check is on for this config: enabled, on a native provider."""
+    from harvey.integrations.mail_provider import NATIVE_PROVIDERS
+
+    settings = getattr(getattr(config, "compliance", None), "precleared", None)
+    provider = getattr(getattr(getattr(config, "channels", None), "email", None),
+                       "provider", None)
+    return getattr(settings, "enabled", False) is True and provider in NATIVE_PROVIDERS
+
+
+async def current_hold(state, config=None) -> dict:
+    """The recorded hold if a cycle hit it recently, else {}.
+
+    Given the loaded config, also {} when the check is off there or the
+    provider isn't a native one (the check never runs then). Without one
+    (it failed to load) the hold still shows.
+    """
+    if config is not None and not hold_applies(config):
+        return {}
     status = parse_status(await state.get_setting(STATUS_KEY))
     if status.get("status") != "held":
         return {}
@@ -441,7 +480,7 @@ async def current_hold(state) -> dict:
         at = at.replace(tzinfo=timezone.utc)
     if _utcnow() - at > STATUS_MAX_AGE:
         return {}
-    return status
+    return {k: _clean(v) if isinstance(v, str) else v for k, v in status.items()}
 
 
 def hold_message(hold: dict) -> dict:
@@ -451,6 +490,8 @@ def hold_message(hold: dict) -> dict:
     """
     kind = hold.get("kind")
     url = _text(hold.get("url"))
+    if any(unicodedata.category(ch) == "Cc" or ch.isspace() for ch in url):
+        url = ""
     try:
         waiting = max(1, int(hold.get("waiting") or 1))
     except (TypeError, ValueError):
@@ -484,7 +525,7 @@ def hold_message(hold: dict) -> dict:
                        f"{url or GET_KEY_URL}, or switch the check off "
                        f"(compliance.precleared.enabled: false). {replies}"),
         }
-    reason = _text(hold.get("reason")) or "no answer"
+    reason = _text(_clean(_text(hold.get("reason")))) or "no answer"
     return {
         "tone": "warn", "url": "", "url_label": "",
         "title": "Precleared can't be reached right now",
