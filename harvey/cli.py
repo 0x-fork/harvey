@@ -234,6 +234,14 @@ def cmd_status(args):
             print("  Sending:              HELD")
             print(textwrap.fill(notice, width=72, initial_indent="                        ",
                                 subsequent_indent="                        "))
+        hold = await state.current_sends_held()
+        if hold:
+            from harvey.sending_mode import held_message
+            waiting = len(await state.get_outbox(status="approved", limit=500))
+            _, detail = held_message(hold, waiting=waiting)
+            print("  Sending:              NOT SENDING (couldn't read your inbox)")
+            print(textwrap.fill(detail, width=72, initial_indent="                        ",
+                                subsequent_indent="                        "))
         if address_notice:
             print("  Postal address:       MISSING")
             print(textwrap.fill(address_notice, width=72, initial_indent="                        ",

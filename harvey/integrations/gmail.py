@@ -82,6 +82,7 @@ class GmailProvider(MailProvider):
         # A Gmail message's content never changes, so each cycle's complete
         # read only downloads what's new. Memory only.
         self._read_cache: dict[str, InboundMessage | None] = {}
+        self._token_problem = ""
 
     def is_configured(self) -> bool:
         return bool(self.client_id and self.client_secret and _load_token())
@@ -92,8 +93,12 @@ class GmailProvider(MailProvider):
             return self._access_token
         stored = _load_token()
         if not stored:
-            logger.error("Gmail: not authorized. Run 'harvey gmail auth'.")
+            self._token_problem = "not signed in to Gmail. Run 'harvey gmail auth'."
+            logger.error("Gmail: " + self._token_problem)
             return None
+        # Why there's no token, for whoever asked (get_replies says it).
+        unreachable = ("couldn't reach Google to refresh the Gmail sign-in{}; "
+                       "Harvey tries again next cycle.")
         try:
             async with httpx.AsyncClient(timeout=TIMEOUT) as client:
                 resp = await client.post(TOKEN_URL, data={
@@ -104,12 +109,17 @@ class GmailProvider(MailProvider):
                 })
         except httpx.HTTPError as e:
             logger.error(f"Gmail token refresh failed: {e}")
+            self._token_problem = unreachable.format(f" ({type(e).__name__})")
+            return None
+        if resp.status_code in (400, 401, 403):
+            self._token_problem = (f"Google rejected the saved Gmail sign-in ({resp.status_code}). "
+                                   "Run 'harvey gmail auth'.")
+            logger.error(f"Gmail token refresh rejected ({resp.status_code}). "
+                         "Re-run 'harvey gmail auth'.")
             return None
         if resp.status_code != 200:
-            logger.error(
-                f"Gmail token refresh rejected ({resp.status_code}). "
-                "Re-run 'harvey gmail auth'."
-            )
+            self._token_problem = unreachable.format(f" (HTTP {resp.status_code})")
+            logger.error(f"Gmail token refresh failed ({resp.status_code}).")
             return None
         # A garbled answer is no token, not an exception: one raised here
         # would escape a send and be recorded as "maybe sent".
@@ -119,8 +129,10 @@ class GmailProvider(MailProvider):
             data = None
         token = data.get("access_token") if isinstance(data, dict) else None
         if not isinstance(token, str) or not token:
+            self._token_problem = unreachable.format(" (no token in Google's answer)")
             logger.error("Gmail token refresh returned no access token.")
             return None
+        self._token_problem = ""
         try:
             expires_in = float(data.get("expires_in") or 3600)
         except (TypeError, ValueError):
@@ -229,6 +241,9 @@ class GmailProvider(MailProvider):
         are Gmail's largest (a listing is ids only), so the bound is
         MAX_INBOX_PAGES x 500 messages a week before sending is held.
         """
+        if not await self._token():
+            raise GmailError(self._token_problem
+                             or "not signed in to Gmail. Run 'harvey gmail auth'.")
         params = {"q": "in:inbox -from:me newer_than:7d",
                   "maxResults": max(1, min(500, int(limit)))}
         out = []
