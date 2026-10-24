@@ -129,14 +129,15 @@ minor versions can still change behaviour.
   Harvey recognises and can't contain a link. Based on #13 by Camilo Cruz.
 - **The Today page and `harvey status` say when Precleared is holding cold
   email.** When the check can't be made (its free checks for the day are used
-  up, the key is out of checks or was rejected, or Precleared can't be
-  reached), cold email still waits and replies still go out, but this used to
-  reach only the log, so cold email just went out slower. Harvey now records
-  the hold, and the Today page and `harvey status` say how many cold emails
-  are waiting and what fixes it: a free key, a pack for that key (the checkout
-  link from Precleared's answer), or nothing but time. The next fresh answer
-  clears it, a hold not seen for a day is ignored, and switching the check
-  off clears it. (from #57 by gabrielaoimevbore-beep)
+  up, the key is out of checks, was rejected or is being rate limited, or
+  Precleared can't be reached), cold email to new addresses waits and replies
+  still go out, but this used to reach only the log, so cold email just went
+  out slower. Harvey now records the hold, and the Today page and
+  `harvey status` say how many cold emails are waiting and what fixes it: a
+  free key, a pack for that key (the checkout link from Precleared's answer),
+  or nothing but time. The next fresh answer clears it, a hold not seen for a
+  day is ignored, and switching the check off clears it. (from #57 by
+  gabrielaoimevbore-beep)
 
 ### Changed
 
@@ -387,11 +388,17 @@ minor versions can still change behaviour.
   have each new recipient checked before the first cold email against UK
   PECR, US CAN-SPAM, Canada's CASL, Germany's UWG and France's rules. Any
   verdict but `ok_to_email` fails that outbox item with the rule and the next
-  step. If the check can't be made (daily allowance used up, network down, a
-  malformed response), cold emails wait for a later cycle while replies still
-  go out. One check per address, cached for 30 days; changing the sender
-  country, address source or product description triggers a fresh check. The
-  receipt id is logged with each send. Native providers only. Off by default.
+  step. If the check can't be made because of Precleared (daily allowance or
+  rate limit, a bad key, network down, an unreadable answer), new addresses
+  wait for a later cycle while email to people already cleared, and replies,
+  still go out; if it fails for one address, only that email is moved back
+  six hours (failures at two different domains with no answer in between
+  hold new addresses too), and an address whose check timed out or got an
+  answer Harvey can't read is moved back as well, so it can't keep the
+  others waiting. One check per address, cached for 30 days; changing the
+  sender country, address source or product description triggers a fresh
+  check. The receipt id is logged with each send. Native providers only. Off
+  by default.
 - **`harvey setup` offers the Precleared check** (from #46 by
   gabrielaoimevbore-beep). A new optional last step
   asks whether to turn the check on, where your business is based (GB or US)
