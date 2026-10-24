@@ -20,6 +20,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 
 from harvey.public_http import public_http_client
+from harvey.startups import funding_text
 
 from harvey.collectors.ats import detect_board, matching_roles, read_board, role_keywords
 
@@ -247,6 +248,7 @@ YC_OWNED_DOMAINS = ("ycombinator.com", "workatastartup.com", "startupschool.org"
 _YC = r"(?:YC|Y[\s-]?Combinator)"
 _YC_LINK_RE = re.compile(r"ycombinator\.com\\?/companies\\?/([a-z0-9][\w-]*)", re.I)
 YC_ABOUT_PATHS = ("/about", "/about-us", "/company", "/our-story")
+FUNDING_PATHS = ("/press", "/news", "/newsroom", "/blog")
 _YC_SEASONS = {"w": "W", "winter": "W", "s": "S", "summer": "S",
                "f": "F", "fall": "F", "x": "X", "spring": "X"}
 _SEASON_WORD = r"(Winter|Summer|Fall|Spring)"
@@ -263,36 +265,86 @@ _YC_BATCH_RES = (
 # What a claim looks like. Anchored at the start of a sentence, so the
 # company is the one being described, not a customer, a team member or an
 # audience ("trusted by YC-backed startups", "we sponsored the YC dinner").
+# The same shapes serve every accelerator (ACCELERATORS below): only the
+# program's name, its cohort code and the nouns that follow "a <program>"
+# change.
 _BATCH = r"(?:W|S|F|X)\s*'?\d{2}"
-_BADGE_RE = re.compile(  # a whole line that is a badge: backing words or a batch, not a bare "YC"
-    rf"^\(?\s*(?:(?:backed|funded|supported)\s+by\s+{_YC}(?:\s*[\(\[]?\s*{_BATCH}\s*[\)\]]?)?"
-    rf"|{_YC}[\s-]+(?:backed|funded)(?:\s*[\(\[]?\s*{_BATCH}\s*[\)\]]?)?"
-    rf"|{_YC}\s*[\(\[]?\s*{_BATCH}\s*[\)\]]?)\s*\)?\.?$", re.I)
 _FILLER = r"(?:\s+(?:proudly|also|now|officially|recently|originally|first|both|all|so|were|was|are|is|been|have|has|had|very))*"
-_CLAIM_BODY = (
-    rf"{_FILLER}\s+(?:backed by|funded by|supported by|part of|a member of|members of|graduated from|"
-    rf"alumni of|alums? of|went through|joined|hatched (?:in|at)|incubated (?:in|at|by)|accepted into|"
-    rf"participated in|launched at|in)\s+(?:the\s+)?{_YC}\b"
-    rf"|{_FILLER}\s+in\s+the\s+{_SEASON_WORD}\s+\d{{4}}\s+batch\s+of\s+{_YC}\b"
-    rf"|{_FILLER}\s+(?:a|an)\s+{_YC}(?:\s+{_BATCH})?[\s-]+(?:(?:backed|funded)\s+)?"
-    rf"(?:company|startup|platform|product|business|team|tool)\b"
-    rf"|{_FILLER}\s+{_YC}[\s-]+(?:backed|funded|alumni|alums?|alumnus)\b"
-    rf"|\s*[\(\[]\s*{_YC}\s*{_BATCH}\s*[\)\]]"
-)
-# "in YC" only after a form of be ("we were in YC"), not "believe in YC".
-_IN_NEEDS_BE = re.compile(rf"(?<!\bwere)(?<!\bwas)(?<!\bare)(?<!\bis)(?<!\bbeen)\s+in\s+(?:the\s+)?{_YC}\b", re.I)
 _SELF_SUBJECT = (r"(?:we|we're|we are|we were|we've been|proud(?:ly)? to be|excited to be|honou?red to be"
                  r"|the company|our company)")
 _FOUNDED_PREFIX = r"(?:founded in \d{4},?\s+)?"
-# "<subject> ... and is backed by YC", but not "...companies that are backed by YC".
-_LATER_BACKING = (rf"[^.]{{0,80}}?(?<!\bthat)(?<!\bwhich)(?<!\bwho)\s+(?:is|are|was|were|has been|have been)"
-                  rf"\s+(?:proudly\s+)?(?:backed|funded|supported)\s+by\s+{_YC}\b")
-_INVESTORS_RE = re.compile(rf"^(?:our\s+)?investors?\s*(?:include|including|are|:)[^.]{{0,80}}\b{_YC}\b", re.I)
-_LEADING_BACKING_RE = re.compile(rf"^(?:backed|funded|supported)\s+by\s+{_YC}\b", re.I)
-# A YC program right after the mention, with no batch: not backing.
-_YC_PROGRAM_RE = re.compile(
-    rf"\b{_YC}(?:['’]s)?\s+(?:startup school|demo day|application|interview|events?|podcast|blog|news|jobs|deals?|perks?)\b",
-    re.I)
+
+
+class _ProgramClaims:
+    """The claim patterns for one program. ``prog`` is a regex for its name,
+    ``batch`` for a cohort code written right after it, ``nouns`` what may
+    follow "a <program>" ("a YC company"), ``programs`` its own events and
+    pages that are mentions, not backing (Startup School, Demo Day)."""
+
+    def __init__(self, prog: str, batch: str, nouns: str, programs: str, extra: str = ""):
+        self.mention = re.compile(rf"\b{prog}\b", re.I)
+        self.extra = extra          # more shapes after the subject (accelerators only)
+        # a whole line that is a badge: backing words or a batch, not a bare name
+        self.badge = re.compile(
+            rf"^\(?\s*(?:(?:backed|funded|supported)\s+by\s+{prog}(?:\s*[\(\[]?\s*{batch}\s*[\)\]]?)?"
+            rf"|{prog}[\s-]+(?:backed|funded)(?:\s*[\(\[]?\s*{batch}\s*[\)\]]?)?"
+            rf"|{prog}\s*[\(\[]?\s*{batch}\s*[\)\]]?)\s*\)?\.?$", re.I)
+        self.body = (
+            rf"{_FILLER}\s+(?:backed by|funded by|supported by|part of|a member of|members of|graduated from|"
+            rf"alumni of|alums? of|went through|joined|hatched (?:in|at)|incubated (?:in|at|by)|accepted into|"
+            rf"participated in|launched at|in)\s+(?:the\s+)?{prog}\b"
+            rf"|{_FILLER}\s+in\s+the\s+{_SEASON_WORD}\s+\d{{4}}\s+batch\s+of\s+{prog}\b"
+            rf"|{_FILLER}\s+(?:a|an)\s+{prog}(?:\s+{batch})?[\s-]+(?:(?:backed|funded)\s+)?"
+            rf"(?:{nouns})\b"
+            rf"|{_FILLER}\s+{prog}[\s-]+(?:backed|funded|alumni|alums?|alumnus)\b"
+            rf"|\s*[\(\[]\s*{prog}\s*{batch}\s*[\)\]]"
+        )
+        # "in YC" only after a form of be ("we were in YC"), not "believe in YC".
+        self.in_needs_be = re.compile(
+            rf"(?<!\bwere)(?<!\bwas)(?<!\bare)(?<!\bis)(?<!\bbeen)\s+in\s+(?:the\s+)?{prog}\b", re.I)
+        # "<subject> ... and is backed by YC", but not "...companies that are backed by YC".
+        self.later = (rf"[^.]{{0,80}}?(?<!\bthat)(?<!\bwhich)(?<!\bwho)\s+(?:is|are|was|were|has been|have been)"
+                      rf"\s+(?:proudly\s+)?(?:backed|funded|supported)\s+by\s+{prog}\b")
+        self.investors = re.compile(rf"^(?:our\s+)?investors?\s*(?:include|including|are|:)[^.]{{0,80}}\b{prog}\b", re.I)
+        self.leading = re.compile(rf"^(?:backed|funded|supported)\s+by\s+{prog}\b", re.I)
+        # One of its programs right after the mention, with no batch: not backing.
+        self.programs = re.compile(rf"\b{prog}(?:['’]s)?\s+(?:{programs})\b", re.I)
+
+    def claims(self, html: str, domain: str, cohort) -> list:
+        """The cohort found in each sentence that claims the program (None
+        when that sentence names none), in page order. ``cohort(sentence)``
+        finds the cohort."""
+        name = _domain_name(domain) if domain else ""
+        # The name as written on the page may have spaces or hyphens ("Acme Corp"
+        # for acmecorp.com): any separators between its letters.
+        spelled = r"[\s.-]?".join(re.escape(ch) for ch in _alnum(name)) if len(_alnum(name)) >= 3 else ""
+        subject = rf"(?:{_SELF_SUBJECT}" + (rf"|{spelled}\b" if spelled else "") + r")"
+        claim_re = re.compile(rf"^{_FOUNDED_PREFIX}{subject},?(?:{self.body}|{self.later}{self.extra})", re.I)
+        found_in = []
+        for sentence in _lines(html):
+            if not self.mention.search(sentence):
+                continue
+            found = cohort(sentence)
+            match = claim_re.search(sentence)
+            if match and self.in_needs_be.search(match.group(0)) and not re.search(
+                    r"\bin\s+the\s+\w+\s+\d{4}\s+batch|hatched in|incubated in|participated in", match.group(0), re.I):
+                match = None
+            ok = bool(self.badge.match(sentence) or match or self.investors.search(sentence)
+                      or self.leading.search(sentence))
+            if ok and not found and self.programs.search(sentence):
+                ok = False      # Startup School, Demo Day, a YC blog: a program, not backing
+            if ok:
+                found_in.append(found)
+        return found_in
+
+
+_YC_CLAIMS = _ProgramClaims(
+    _YC, _BATCH, "company|startup|platform|product|business|team|tool",
+    "startup school|demo day|application|interview|events?|podcast|blog|news|jobs|deals?|perks?")
+# The YC shapes by name, as before the generalisation.
+_BADGE_RE, _CLAIM_BODY, _IN_NEEDS_BE = _YC_CLAIMS.badge, _YC_CLAIMS.body, _YC_CLAIMS.in_needs_be
+_LATER_BACKING, _INVESTORS_RE = _YC_CLAIMS.later, _YC_CLAIMS.investors
+_LEADING_BACKING_RE, _YC_PROGRAM_RE = _YC_CLAIMS.leading, _YC_CLAIMS.programs
 _ATTR_TEXT_RE = re.compile(r"""\b(?:alt|title|aria-label)=["']([^"']{0,200})["']""", re.I)
 _BLOCK_TAG_RE = re.compile(r"(?i)</?(?:p|div|h[1-6]|li|ul|ol|br|section|footer|header|nav|article|td|tr|table|blockquote|figcaption|dt|dd)\b[^>]*>")
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|\s*[|•·]\s*|\n")
@@ -350,34 +402,294 @@ def yc_backed(html: str, domain: str = "") -> tuple[str, float] | None:
     if not html:
         return None
     link = any(_is_their_yc_page(m.group(1), domain) for m in _YC_LINK_RE.finditer(html))
-    name = _domain_name(domain) if domain else ""
-    # The name as written on the page may have spaces or hyphens ("Acme Corp"
-    # for acmecorp.com): any separators between its letters.
-    spelled = r"[\s.-]?".join(re.escape(ch) for ch in _alnum(name)) if len(_alnum(name)) >= 3 else ""
-    subject = rf"(?:{_SELF_SUBJECT}" + (rf"|{spelled}\b" if spelled else "") + r")"
-    claim_re = re.compile(rf"^{_FOUNDED_PREFIX}{subject},?(?:{_CLAIM_BODY}|{_LATER_BACKING})", re.I)
-    batch, claimed = "", False
-    for sentence in _lines(html):
-        if not re.search(rf"\b{_YC}\b", sentence, re.I):
-            continue
-        found = next((m for r in _YC_BATCH_RES for m in [r.search(sentence)] if m), None)
-        match = claim_re.search(sentence)
-        if match and _IN_NEEDS_BE.search(match.group(0)) and not re.search(
-                r"\bin\s+the\s+\w+\s+\d{4}\s+batch|hatched in|incubated in|participated in", match.group(0), re.I):
-            match = None
-        ok = bool(_BADGE_RE.match(sentence) or match or _INVESTORS_RE.search(sentence)
-                  or _LEADING_BACKING_RE.search(sentence))
-        if ok and not found and _YC_PROGRAM_RE.search(sentence):
-            ok = False      # Startup School, Demo Day, a YC blog: a program, not backing
-        if ok:
-            claimed = True
-            if found and not batch:
-                batch = _yc_batch(found)
+    found_in = _YC_CLAIMS.claims(
+        html, domain, lambda s: next((m for r in _YC_BATCH_RES for m in [r.search(s)] if m), None))
+    batch = ""
+    for found in found_in:
+        if found and not batch:
+            batch = _yc_batch(found)
     if link:
         return batch, 0.95
-    if claimed:
+    if found_in:
         return batch, 0.9 if batch else 0.85
     return None
+
+
+# ── ACCELERATOR: the other programs, the same way ──
+# Programs whose companies say "backed by X" / "a X company" on their own
+# sites. YC has its own signal (YC_BACKED) and isn't repeated here. Names
+# that are also words or places match only as written: "Antler", not
+# "antlers"; "Pioneer" but not "pioneer in" or "Pioneer Square"; "Neo" but
+# not "Neo4j" or "Neo Capital"; "AI Grant" but not "an AI grant"; "500
+# Startups" but not "500 startups". Their own sites are never prospects
+# (discover.JUNK_DOMAIN_PATTERNS).
+_NOT_NAMED = r"(?![\w-]|\.\w|\s+(?-i:[A-Z]))"     # not Neo4j, Neo.js, Neo Capital
+ACCELERATORS = (
+    ("Techstars", r"Techstars"),
+    ("500 Global", r"(?:500\s+Global|(?-i:500\s+Startups))"),
+    ("Antler", r"(?-i:Antler)(?![\w-])"),
+    ("Entrepreneur First", r"Entrepreneur\s+First"),
+    ("South Park Commons", r"South\s+Park\s+Commons"),
+    ("Neo", rf"(?-i:Neo){_NOT_NAMED}"),
+    ("AI Grant", r"(?-i:AI\s+Grant)"),
+    ("a16z speedrun", r"(?:a16z(?:['’]s)?\s+speedrun|speedrun\s+(?:by|from)\s+a16z)"),
+    ("Pioneer", rf"(?-i:Pioneer){_NOT_NAMED}"),
+    ("Plug and Play", r"(?-i:Plug\s+(?:and|&)\s+Play)"),
+)
+_ACC_BATCH = r"(?:['’]?\d{2}|20\d{2}|(?-i:SR)\s*\d{1,3})"
+_ACC_NOUNS = r"company|startup|portfolio company|alumn(?:us|i|a)"
+_ACC_EVENTS = (r"startup weekend|startup week|startup digest|summit|expo|events?|conference|podcast|blog"
+               r"|news|newsletter|jobs|applications?|mentors?|demo day|office hours")
+_CITY = r"(?:\s+(?-i:[A-Z][a-z]+)){0,2}"           # "Techstars Boulder", "Techstars Anywhere Fall"
+
+
+def _cohort_finder(prog: str):
+    """A function from a sentence to the cohort written next to ``prog``
+    ("Techstars '24", "Techstars Boulder 2023", "AI Grant batch 3",
+    "speedrun SR003"), normalised, or None."""
+    shapes = (
+        (re.compile(rf"\b{prog}(?:['’]s)?{_CITY}\s*[\(\[,]?\s*(?:class of\s+)?['’](\d{{2}})\b", re.I),
+         lambda m: f"20{m.group(1)}"),
+        (re.compile(rf"\b{prog}(?:['’]s)?{_CITY}\s*[\(\[,]?\s*(?:class of\s+)?(20\d{{2}})\b", re.I),
+         lambda m: m.group(1)),
+        (re.compile(rf"\b{prog}\s+(\d{{2}})\s*[\)\]]", re.I), lambda m: f"20{m.group(1)}"),
+        (re.compile(rf"\b{prog}(?:['’]s)?\s+(?:batch|cohort)\s*#?\s*(\d{{1,2}})\b", re.I),
+         lambda m: f"batch {int(m.group(1))}"),
+        (re.compile(rf"\b{prog}(?:['’]s)?\s*[\(\[]?\s*(?-i:SR)\s*(\d{{1,3}})\b", re.I),
+         lambda m: f"SR{int(m.group(1)):03d}"),
+    )
+
+    def find(sentence: str) -> str | None:
+        for shape, norm in shapes:
+            m = shape.search(sentence)
+            if m:
+                cohort = norm(m)
+                if cohort.startswith("20") and not 2005 <= int(cohort) <= datetime.now().year + 1:
+                    continue
+                return cohort
+        return None
+    return find
+
+
+# Two shapes seen on real About pages: founders who are alumni ("Permutive
+# was founded in 2014 by A and B, alumni of Entrepreneur First") and a
+# timeline line ("DigitalOcean founded, joins the TechStars Accelerator").
+_ACC_EXTRA = (
+    r"|\s+(?:was\s+)?founded(?:\s+in\s+\d{{4}})?(?:\s+by\s+[^.]{{0,80}}?)?,?\s+(?:(?:both|all)\s+)?"
+    r"(?:alumni|alums?|graduates)\s+of\s+(?:the\s+)?{prog}\b"
+    r"|(?:\s+founded,?)?\s+(?:joins|enters|graduates from)\s+(?:the\s+)?{prog}\b"
+)
+_ACC_CLAIMS = tuple((name, _ProgramClaims(prog, _ACC_BATCH, _ACC_NOUNS, _ACC_EVENTS, _ACC_EXTRA.format(prog=prog)),
+                     _cohort_finder(prog))
+                    for name, prog in ACCELERATORS)
+# A logo wall: a "Backed by" / "Investors" label, then the program's logo
+# (alt text, aria-label, title or a link's text) in the same section: before
+# the next heading, and with no more than a few names' worth of text in
+# between. Customers' and partners' walls don't count.
+_WALL_LABEL_RE = re.compile(
+    r"""(?:>|["'])\s*(?:(?:proudly\s+)?(?:backed|funded|supported)\s+by|(?:our\s+)?investors?"""
+    r"""(?:\s+(?:and|&)\s+partners?)?(?:\s+logos?)?)\s*:?\s*(?:<|["'])""", re.I)
+_WALL_SPAN, _WALL_TEXT = 4000, 300
+_SECTION_END_RE = re.compile(r"(?i)<h[1-6]\b|</section>")
+
+
+def _on_logo_wall(html: str, prog: str) -> bool:
+    logo = re.compile(rf"""(?:\b(?:alt|aria-label|title)=["']|>)\s*{prog}\b[^"'<]{{0,30}}(?:["']|<)""", re.I)
+    for label in _WALL_LABEL_RE.finditer(html):
+        end = label.end() + _WALL_SPAN
+        stop = _SECTION_END_RE.search(html, label.end(), end)
+        m = logo.search(html, label.end(), stop.start() if stop else end)
+        if m and len(_text(html[label.end():m.start()]).strip()) <= _WALL_TEXT:
+            return True
+    return False
+
+
+def accelerators(html: str, domain: str = "") -> list[tuple[str, str, float]]:
+    """[(program, cohort or "", confidence)] for every accelerator the page
+    says the company itself went through, in ACCELERATORS order."""
+    if not html:
+        return []
+    out = []
+    stripped = _strip_code(html)
+    for (name, claims, cohort), (_, prog) in zip(_ACC_CLAIMS, ACCELERATORS):
+        found_in = claims.claims(html, domain, cohort)
+        if found_in:
+            stated = next((c for c in found_in if c), "")
+            out.append((name, stated, 0.9 if stated else 0.85))
+        elif _on_logo_wall(stripped, prog):
+            out.append((name, "", 0.8))
+    return out
+
+
+# ── FUNDING_ROUND: a raise the company announces on its own pages ──
+# Read off the homepage, the search hit's own page, About, and a press or
+# news page. Only the company's own raise counts: "we raised", "<name>
+# raises", "announcing our seed round". Not "we help startups raise",
+# a customer's or a portfolio company's round, or a VC's new fund. The date
+# matters as much as the round (an old raise is no reason to write now), so
+# it's taken from the sentence, else from the page's own publish date.
+# "seed" only as a round: "a $1M seed", "our seed round", not "our seed prices".
+_ROUND = (r"(pre[\s-]?seed|seed(?=[\s-]+(?:round|funding|financing|investment|extension|capital)\b"
+          r"|\s*(?:[,.;:)]|$|\s+(?:led|from|with|in|on|by|to|and)\b))"
+          r"|series\s+[a-h](?![\w-])|bridge(?=\s+round)|growth(?=\s+round))")
+_AMOUNT = r"([$€£])\s?(\d[\d,]*(?:\.\d+)?)\s?(k|mm|mn|m|bn|b|million|billion|thousand)?(?!\w)"
+_MULTIPLIER = {"k": 1e3, "thousand": 1e3, "m": 1e6, "mm": 1e6, "mn": 1e6, "million": 1e6,
+               "b": 1e9, "bn": 1e9, "billion": 1e9}
+_ROUND_RANK = {"Pre-seed": 1, "Seed": 2, "Bridge": 3}
+_FUNDING_WORDS = re.compile(rf"\b(?:funding|financing|investment round|round)\b|\b{_ROUND}", re.I)
+_CLAUSE = r"(?:[^.!?]|\.(?=\d))"     # the rest of the sentence; "$4.5M" isn't its end
+_RAISE_VERB = (r"(?:raised|raises|closed|closes|secured|secures|landed|lands|completed|completes"
+               r"|announced|announces)")
+_ANNOUNCE = (r"(?:(?:today,?\s+)?we(?:['’]re|\s+are)\s+(?:\w+\s+)?(?:excited|thrilled|proud|happy|delighted|pleased)"
+             r"\s+to\s+(?:announce|share)(?:\s+that)?\s+)")
+_LEAD_IN = (r"(?:(?:today|update|news|announcement)\s*[,:]?\s+"
+            r"|(?:in|on|back in)\s+(?:[A-Za-z]+\.?\s+)?(?:\d{1,2}(?:st|nd|rd|th)?,?\s+)?\d{4},?\s+)?")
+# Whose money it was: theirs, not their clients' or a fund's.
+_NOT_THEIR_RAISE = re.compile(
+    r"\b(?:for|on behalf of|across)\s+(?:our\s+|their\s+|its\s+)?(?:clients?|customers?|founders?|startups?"
+    r"|companies|portfolio|charity|charities|nonprofits?|members?|users?|causes?|families)\b"
+    r"|(?<!\bto )\bfund\b(?!\s+(?:our|the|its|their)\b)|\bto invest\b|\bthe bar\b", re.I)
+_NOT_FUNDING_MONEY = re.compile(
+    r"\b(?:arr|mrr|revenue|sales|bookings|pipeline|contracts?|deals?|orders?|savings|grants?)\b", re.I)
+_MONTHS = {m: i for i, m in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), 1)}
+_MONTH_DATE_RE = re.compile(
+    r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sept?(?:ember)?"
+    r"|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+(?:(\d{1,2})(?:st|nd|rd|th)?,?\s+)?(20\d{2})\b", re.I)
+_ISO_DATE_RE = re.compile(r"\b(20\d{2})-(\d{2})-(\d{2})\b")
+_YEAR_RE = re.compile(r"(?:\bin\s+|\(\s*)(20\d{2})\b")
+_JSONLD_DATE_RE = re.compile(r'"datePublished"\s*:\s*"(20\d{2}-\d{2}-\d{2})')
+_META_DATE_RES = (
+    re.compile(r"""<meta[^>]+(?:property|name)=["'](?:article:published_time|date|pubdate)["'][^>]*"""
+               r"""content=["'](20\d{2}-\d{2}-\d{2})""", re.I),
+    re.compile(r"""<meta[^>]+content=["'](20\d{2}-\d{2}-\d{2})[^"']*["'][^>]*"""
+               r"""(?:property|name)=["'](?:article:published_time|date|pubdate)["']""", re.I),
+)
+_TIME_RE = re.compile(r"""<time\b[^>]*datetime=["'](20\d{2}-\d{2}-\d{2})""", re.I)
+_URL_DATE_RES = (re.compile(r"/(20\d{2})-(\d{2})-(\d{2})(?:[/-]|$)"), re.compile(r"/(20\d{2})/(\d{2})/"))
+
+
+def _sentence_date(sentence: str) -> str:
+    """The most precise date a sentence states: 2025-03-04, 2025-03, 2025, or ""."""
+    m = _ISO_DATE_RE.search(sentence)
+    if m:
+        return m.group(0)
+    m = _MONTH_DATE_RE.search(sentence)
+    if m:
+        month = _MONTHS[m.group(1).lower()[:3]]
+        return f"{m.group(3)}-{month:02d}" + (f"-{int(m.group(2)):02d}" if m.group(2) else "")
+    m = _YEAR_RE.search(sentence)
+    return m.group(1) if m else ""
+
+
+def _page_date(html: str, url: str) -> str:
+    """When the page itself was published: its structured data, its article
+    meta tag, a date in its URL, or its one <time> (a listing page full of
+    dates says nothing about any one claim)."""
+    m = _JSONLD_DATE_RE.search(html)
+    if m:
+        return m.group(1)
+    for r in _META_DATE_RES:
+        m = r.search(html)
+        if m:
+            return m.group(1)
+    for r in _URL_DATE_RES:
+        m = r.search(url or "")
+        if m:
+            return "-".join(m.groups())
+    times = set(_TIME_RE.findall(html))
+    return times.pop() if len(times) == 1 else ""
+
+
+def _amount(match) -> str:
+    """"$2,500,000" → "$2.5M", "€8m" → "€8M"."""
+    try:
+        value = float(match.group(2).replace(",", "")) * _MULTIPLIER.get((match.group(3) or "").lower(), 1)
+    except ValueError:
+        return ""
+    for div, unit in ((1e9, "B"), (1e6, "M"), (1e3, "K")):
+        if value >= div:
+            return f"{match.group(1)}{round(value / div, 2):g}{unit}"
+    return f"{match.group(1)}{value:g}"
+
+
+def _round_name(text: str) -> str:
+    text = re.sub(r"\s+", " ", text.lower())
+    if text.startswith("pre"):
+        return "Pre-seed"
+    if text.startswith("series"):
+        return "Series " + text[-1].upper()
+    return text.capitalize()
+
+
+def funding_round(html: str, domain: str = "", url: str = "") -> dict | None:
+    """{"round", "amount", "date", "conf"} for the newest raise the page
+    says the company itself made, else None. Any part it doesn't state is
+    ""; the date is the sentence's, else the page's."""
+    if not html:
+        return None
+    name = _alnum(_domain_name(domain)) if domain else ""
+    spelled = r"[\s.-]?".join(re.escape(ch) for ch in name) if len(name) >= 3 else ""
+    spelled = spelled and rf"{spelled}(?:\.[a-z]{{2,6}})?"     # "Context.dev has raised"
+    subject = r"(?:we(?:['’]ve)?|the company|our company" + (rf"|{spelled}\b" if spelled else "") + r")"
+    raised = re.compile(
+        rf"^{_LEAD_IN}{_ANNOUNCE}?{subject},?(?:\s+(?:has|have|had|just|now|recently|officially|successfully"
+        rf"|today|also|finally))*\s+{_RAISE_VERB}\b(?P<rest>{_CLAUSE}{{0,160}})", re.I)
+    owner = r"(?:our" + (rf"|{spelled}['’]s" if spelled else "") + r")"
+    announced = re.compile(
+        rf"^{_LEAD_IN}(?:(?:announcing|introducing|celebrating)\s+|{_ANNOUNCE})(?:that\s+)?{owner}\s+"
+        rf"(?P<rest>(?:{_AMOUNT}\s+)?{_ROUND}{_CLAUSE}{{0,160}})", re.I)
+    led = re.compile(
+        rf"^{owner}\s+(?P<rest>(?:{_AMOUNT}\s+)?{_ROUND}(?:\s+(?:round|funding|financing))?"
+        rf"(?:\s+(?:was|is|has been))?\s+(?:led|co-led|closed|backed)\b{_CLAUSE}{{0,160}})", re.I)
+    claims = []
+    for sentence in _lines(html):
+        m = raised.search(sentence) or announced.search(sentence) or led.search(sentence)
+        if not m:
+            continue
+        rest = m.group("rest")
+        if _NOT_THEIR_RAISE.search(rest):
+            continue
+        rnd = re.search(rf"\b{_ROUND}", rest, re.I)
+        amt = re.search(_AMOUNT, rest, re.I)
+        amount = _amount(amt) if amt else ""
+        # A big number with no round named is a raise, unless it's revenue
+        # ("we closed $5M in ARR").
+        big = amount[-1:] in ("M", "B") and not _NOT_FUNDING_MONEY.search(rest)
+        if not (rnd or big or (amount and _FUNDING_WORDS.search(rest))):
+            continue
+        claims.append({"round": _round_name(rnd.group(1)) if rnd else "", "amount": amount,
+                       "date": _sentence_date(sentence)})
+    if not claims:
+        return None
+    # The page's own date belongs to what the page announces: its only raise,
+    # or the one its title names. A seed post that links to the later Series
+    # A doesn't date the Series A.
+    page_date = _page_date(html, url)
+    if page_date:
+        undated = [c for c in claims if not c["date"]]
+        title = _page_title(html)
+        for c in undated:
+            if (len({(u["round"], u["amount"]) for u in undated}) == 1
+                    or (c["round"] and c["round"].lower() in title)
+                    or (c["amount"] and _alnum(c["amount"]) in _alnum(title))):
+                c["date"] = page_date
+    for c in claims:
+        c["conf"] = 0.9 if c["date"] else 0.85
+
+    def rank(c):
+        r = c["round"]
+        return (c["date"], _ROUND_RANK.get(r, 10 + ord(r[-1]) if r.startswith("Series") else 0), bool(c["amount"]))
+    return max(claims, key=rank)
+
+
+def _page_title(html: str) -> str:
+    """The page's <title>, og:title and first <h1>, lowercased, for telling
+    which raise the page itself is about."""
+    parts = re.findall(r"(?is)<title[^>]*>(.*?)</title>", html)[:1]
+    parts += re.findall(r"""(?i)<meta[^>]+property=["']og:title["'][^>]*content=["']([^"']*)""", html)[:1]
+    parts += re.findall(r"(?is)<h1\b[^>]*>(.*?)</h1>", html)[:1]
+    return html_unescape(re.sub(r"(?s)<[^>]+>", " ", " ".join(parts))).lower()
 
 
 class ProfileCollector:
@@ -507,6 +819,30 @@ class ProfileCollector:
                     break
             for r in roles:
                 add("HIRING_ROLE", text=r, url=curl)
+    async def _search_hit(self, company_id: str, code: str) -> bool:
+        """Is the latest reading a preset search's hit? (see state.search_hit)"""
+        if getattr(self, "state", None) is None:
+            return False
+        try:
+            return await self.state.search_hit(company_id, code)
+        except Exception:
+            return False
+
+    async def _own_hit_page(self, company_id: str, domain: str, site: str) -> str:
+        """The page a search found the company on, when it's on their own
+        site and isn't the homepage; "" otherwise. Never someone else's site."""
+        try:
+            company = await self.state.get_company(company_id)
+        except Exception:
+            return ""
+        url = (getattr(company, "source_url", "") or "").strip()
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower().removeprefix("www.")
+        if parsed.scheme not in ("http", "https") or not (host == domain or host.endswith("." + domain)):
+            return ""
+        if parsed.path.strip("/") == "" or url.rstrip("/") == site.rstrip("/"):
+            return ""
+        return url
 
     # ── individual detectors ──
 
@@ -649,27 +985,66 @@ class ProfileCollector:
         # Booking gap
         add("NO_ONLINE_BOOKING", num=0 if self._any(home, BOOKING_HINTS) else 1)
 
+        # The About page, fetched once for the startup signals below.
+        about_page: list[tuple[str, str]] = []
+
+        async def about() -> tuple[str, str]:
+            if not about_page:
+                about_page.append(await self._first_present(site, YC_ABOUT_PATHS))
+            return about_page[0]
+
         # YC-backed, as the company says on its own site: the homepage, or
         # its About page (where most say it, if anywhere).
         if self.wants("YC_BACKED"):
             yc, where = yc_backed(home, domain), site
             if yc is None:
-                about_url, about = await self._first_present(site, YC_ABOUT_PATHS)
-                if about:
-                    yc, where = yc_backed(about, domain), about_url
+                about_url, about_html = await about()
+                if about_html:
+                    yc, where = yc_backed(about_html, domain), about_url
             # Most YC companies never say it on these pages, so silence
             # doesn't erase a YC-preset search hit (collector "discover").
             # It does correct an earlier profile "yes", so a wrong tag or a
             # dropped claim doesn't last forever.
-            searched = False
-            if yc is None and getattr(self, "state", None) is not None:
-                try:
-                    searched = await self.state.yc_search_hit(company_id)
-                except Exception:
-                    searched = False
+            searched = yc is None and await self._search_hit(company_id, "YC_BACKED")
             if yc is not None or not searched:
                 add("YC_BACKED", num=1 if yc else 0, text=yc[0] if yc else "",
                     conf=yc[1] if yc else 1.0, url=where if yc else site)
+
+        # Another accelerator, the same way and with the same rule for a
+        # preset's search hit.
+        if self.wants("ACCELERATOR"):
+            programs, where = accelerators(home, domain), site
+            if not programs:
+                about_url, about_html = await about()
+                if about_html:
+                    programs, where = accelerators(about_html, domain), about_url
+            searched = not programs and await self._search_hit(company_id, "ACCELERATOR")
+            if programs or not searched:
+                add("ACCELERATOR", num=1 if programs else 0,
+                    text="; ".join(f"{p} {c}".strip() for p, c, _ in programs),
+                    conf=max(c for _, _, c in programs) if programs else 1.0,
+                    url=where if programs else site)
+
+        # A raise they announced: the homepage, the page a search found on
+        # their own site (a funding-preset hit is usually the announcement),
+        # About, then a press or news page. The newest wins.
+        if self.wants("FUNDING_ROUND"):
+            pages = [(site, home)]
+            hit = await self._own_hit_page(company_id, domain, site)
+            if hit:
+                pages.append((hit, await self._get(hit)))
+            pages.append(await about())
+            found = [(f, url) for url, html in pages if html
+                     for f in [funding_round(html, domain, url)] if f]
+            if not found:
+                url, html = await self._first_present(site, FUNDING_PATHS)
+                f = funding_round(html, domain, url) if html else None
+                found = [(f, url)] if f else []
+            if found:
+                best, where = max(found, key=lambda fu: fu[0]["date"])
+                add("FUNDING_ROUND", num=1, text=funding_text(best), conf=best["conf"], url=where)
+            else:
+                add("FUNDING_ROUND", num=0, url=site)
 
         # Incumbent agency — the compounding signal
         agency = self.detect_agency(home, domain)
