@@ -226,11 +226,14 @@ def _text(html: str) -> str:
 # the company's YC page, a batch code, or "backed by Y Combinator" on its own
 # pages is the company's own claim.
 _YC = r"(?:YC|Y[\s-]?Combinator)"
-_YC_LINK_RE = re.compile(r"""href=["']https?://(?:www\.)?ycombinator\.com/companies/[\w-]+""", re.I)
+# Their YC page, as a link or in JSON-LD sameAs (where real sites put it,
+# often with escaped slashes).
+_YC_LINK_RE = re.compile(r"ycombinator\.com\\?/companies\\?/([a-z0-9][\w-]*)", re.I)
+YC_ABOUT_PATHS = ("/about", "/about-us", "/company", "/our-story")
 _YC_SEASONS = {"w": "W", "winter": "W", "s": "S", "summer": "S",
                "f": "F", "fall": "F", "x": "X", "spring": "X"}
 _YC_BATCH_RE = re.compile(
-    rf"\b{_YC}\b(?:['’]s)?[^.\n<>;]{{0,30}}?\b(Winter|Summer|Fall|Spring|W|S|F|X)\s*'?(\d{{4}}|\d{{2}})\b",
+    rf"\b{_YC}\b(?:['’]s)?[^.\n<>;]{{0,30}}?(?<![\w&#])(Winter|Summer|Fall|Spring|W|S|F|X)\s*'?(\d{{4}}|\d{{2}})\b",
     re.I)
 _YC_BACKING_RE = re.compile(
     rf"\b(?:backed by|funded by|part of|member of|graduated from|alumni of|alums? of|"
@@ -247,16 +250,32 @@ def _yc_batch(match) -> str:
     return f"{season}{year}" if 5 <= int(year) <= 40 else ""
 
 
-def yc_backed(html: str) -> tuple[str, float] | None:
+def _alnum(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+def _is_their_yc_page(slug: str, domain: str) -> bool:
+    """A YC page link is theirs when its name matches their domain: a
+    customer logo can link to that customer's YC page."""
+    if not domain:
+        return True
+    name, label = _alnum(slug), _alnum(domain.split(".")[0])
+    if not name or not label:
+        return False
+    return name == label or (min(len(name), len(label)) >= 3 and (name in label or label in name))
+
+
+def yc_backed(html: str, domain: str = "") -> tuple[str, float] | None:
     """(batch like "W24" or "", confidence) when the page says the company is
     YC-backed, else None. Mentioning YC (Hacker News, essays, "for YC
-    founders") isn't being backed by it."""
+    founders", "powering the last YC batch") isn't being backed by it."""
     if not html:
         return None
-    readable = " ".join([_text(html), *_ATTR_TEXT_RE.findall(html)])
+    # Entities decoded: "Y Combinator&#x27;s W20" must read as the batch W20, not X27.
+    readable = html_unescape(" ".join([_text(html), *_ATTR_TEXT_RE.findall(html)]))
     batch_match = _YC_BATCH_RE.search(readable)
     batch = _yc_batch(batch_match) if batch_match else ""
-    if _YC_LINK_RE.search(html):
+    if any(_is_their_yc_page(m.group(1), domain) for m in _YC_LINK_RE.finditer(html)):
         return batch, 0.95
     if batch:
         return batch, 0.9
@@ -470,10 +489,25 @@ class ProfileCollector:
         # Booking gap
         add("NO_ONLINE_BOOKING", num=0 if self._any(home, BOOKING_HINTS) else 1)
 
-        # YC-backed, as the company says on its own homepage
-        yc = yc_backed(home)
-        add("YC_BACKED", num=1 if yc else 0, text=yc[0] if yc else "",
-            conf=yc[1] if yc else 1.0)
+        # YC-backed, as the company says on its own site: the homepage, or
+        # its About page (where most say it, if anywhere).
+        if self.wants("YC_BACKED"):
+            yc, where = yc_backed(home, domain), site
+            if yc is None:
+                about_url, about = await self._first_present(site, YC_ABOUT_PATHS)
+                if about:
+                    yc, where = yc_backed(about, domain), about_url
+            # Most YC companies never say it on these pages, so silence only
+            # counts as "no" when nothing else (a YC-preset search hit) said yes.
+            already = None
+            if yc is None and getattr(self, "state", None) is not None:
+                try:
+                    already = await self.state.yc_batch(company_id)
+                except Exception:
+                    already = None
+            if yc is not None or already is None:
+                add("YC_BACKED", num=1 if yc else 0, text=yc[0] if yc else "",
+                    conf=yc[1] if yc else 1.0, url=where if yc else site)
 
         # Incumbent agency — the compounding signal
         agency = self.detect_agency(home, domain)

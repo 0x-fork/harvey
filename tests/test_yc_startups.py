@@ -245,3 +245,100 @@ def test_the_dashboard_estimate_takes_the_preset(monkeypatch):
     assert all('"backed by Y Combinator"' in q.term for q in queries)
     with pytest.raises(ValueError):
         dash._discovery_queries({"provider": "osm", "preset": "yc"}, _config())
+
+
+# ── what real YC company sites look like (checked against live homepages) ──
+
+
+def test_a_yc_page_in_their_structured_data_counts():
+    """Resend and Airbyte list their YC page in JSON-LD sameAs, not as a link."""
+    html = ('<script type="application/ld+json">{"@type":"Organization","sameAs":'
+            '["https://github.com/resend","https://www.ycombinator.com/companies/resend"]}</script>')
+    assert yc_backed(html, domain="resend.com") == ("", 0.95)
+
+
+def test_someone_elses_yc_page_doesnt_make_them_yc():
+    """A customer logo linking to that customer's YC page isn't backing."""
+    html = '<a href="https://www.ycombinator.com/companies/acme">Acme, our customer</a>'
+    assert yc_backed(html, domain="billingtool.com") is None
+    assert yc_backed(html, domain="acme.io") == ("", 0.95)
+    assert yc_backed(html, domain="getacme.com") == ("", 0.95)        # slug inside the name
+
+
+@pytest.mark.parametrize("html", [
+    '<span>Powering a quarter of the last YC batch to 40% of the Forbes AI 50.</span>',  # Mintlify
+    '<a href="/customers/ycombinator">Y Combinator</a>',                                  # PostHog
+    '<a href="/company/ycombinator-startup-promotion">YC deal</a>',                       # Airbyte
+])
+def test_real_ways_sites_mention_yc_without_being_backed(html):
+    assert yc_backed(html, domain="example.com") is None
+
+
+@pytest.mark.asyncio
+async def test_the_about_page_is_checked_when_the_homepage_is_silent(state):
+    await seed_signal_catalog(state)
+    await state.set_signal_status("YC_BACKED", "confirmed")
+    c = ProfileCollector.__new__(ProfileCollector)
+    c.confirmed, c.site_names, c.state = await state.confirmed_signal_codes(), {}, state
+    fetched = []
+
+    async def resolve(self, domain):
+        return f"https://{domain}", "<h1>Acme</h1><p>Open-source billing.</p>"
+    c._resolve_site = resolve.__get__(c)
+
+    async def get(url):
+        fetched.append(url)
+        if url.endswith("/about"):   # a real page (the collector skips stubs under 500 bytes)
+            return ("<h2>Our story</h2><p>We went through Y Combinator in Winter 2021.</p>"
+                    + "<p>We build billing for teams that ship fast.</p>" * 12)
+        return ""
+    c._get = get
+    cid = await state.add_company(Company(name="Acme", domain="acme.com"))
+    [yes] = [o for o in await c.profile_company(cid, "acme.com") if o["signal_code"] == "YC_BACKED"]
+    assert (yes["value_num"], yes["value_text"]) == (1, "W21")
+    assert yes["evidence_url"] == "https://acme.com/about"
+
+
+def test_an_encoded_apostrophe_isnt_a_batch():
+    """posthog.com/about: "Y Combinator&#x27;s W20 batch" read as X27."""
+    html = "<p>PostHog was hatched in Y Combinator&#x27;s W20 batch.</p><p>Y Combinator&#x27;s best</p>"
+    assert yc_backed(html, domain="posthog.com") == ("W20", 0.9)
+
+
+# ── the preset's hit is evidence, and profiling doesn't erase it ──
+
+
+def test_a_preset_hit_records_that_the_search_matched():
+    from harvey.collectors.discover import Business, _observations
+    biz = Business(name="Acme", domain="acme.com", source_url="https://acme.com/blog/raise", provider="serper")
+    yc = build_queries(_config(), preset="yc")[0]
+    plain = build_queries(_config())[0]
+    rows = _observations(biz, "c1", {"YC_BACKED", "FOUND_IN_SERP"}, "r1", query=yc)
+    [hit] = [r for r in rows if r["signal_code"] == "YC_BACKED"]
+    assert hit["value_num"] == 1 and hit["confidence"] < 0.9
+    assert hit["evidence_url"] == "https://acme.com/blog/raise"
+    assert not [r for r in _observations(biz, "c1", {"YC_BACKED"}, "r1", query=plain)
+                if r["signal_code"] == "YC_BACKED"]
+    assert not _observations(biz, "c1", set(), "r1", query=yc)            # unconfirmed: nothing
+
+
+@pytest.mark.asyncio
+async def test_profiling_doesnt_overwrite_yc_evidence_with_not_stated(state):
+    await seed_signal_catalog(state)
+    await state.set_signal_status("YC_BACKED", "confirmed")
+    cid = await state.add_company(Company(name="Acme", domain="acme.com"))
+    await state.add_observation(company_id=cid, signal_code="YC_BACKED", collector="discover",
+                                value_num=1, confidence=0.7, evidence_url="https://acme.com/blog/raise")
+    c = ProfileCollector.__new__(ProfileCollector)
+    c.confirmed, c.site_names, c.state = await state.confirmed_signal_codes(), {}, state
+
+    async def resolve(self, domain):
+        return f"https://{domain}", "<h1>Acme</h1><p>Billing.</p>"
+    c._resolve_site = resolve.__get__(c)
+
+    async def get(url):
+        return ""
+    c._get = get
+    obs = await c.profile_company(cid, "acme.com")
+    assert not [o for o in obs if o["signal_code"] == "YC_BACKED"]   # silent pages aren't a "no"
+    assert await state.yc_batch(cid) == ""

@@ -340,6 +340,7 @@ class DiscoveryQuery:
     coordinate: str = ""             # "lat,lng,radius_km" for listings providers
     depth: int = 30                  # SERP depth; ignored by listings providers
     limit: int = 100                 # max records to take from one query
+    preset: str = ""                 # PRESETS key that built it, if any
 
     def keyword(self) -> str:
         return f"{self.term} {self.location}".strip()
@@ -844,7 +845,7 @@ def build_queries(config, cities: list[str] | None = None,
 
     return [
         DiscoveryQuery(term=term, location=place, depth=depth, limit=limit,
-                       coordinate=coords.get(place, ""))
+                       coordinate=coords.get(place, ""), preset=preset if spec else "")
         for term in terms
         for place in places
     ]
@@ -959,7 +960,7 @@ async def run_discovery(
                     else:
                         report.known_companies += 1
                     batch.extend(_observations(biz, company_id, confirmed,
-                                               report.run_id))
+                                               report.run_id, query=query))
 
                 # Flush every batch. The observations are the asset; buffering
                 # them until some threshold means a run that dies loses them.
@@ -1006,7 +1007,7 @@ async def _upsert(state, biz: Business, query: DiscoveryQuery) -> tuple[str, boo
 
 
 def _observations(biz: Business, company_id: str, confirmed: set[str],
-                  run_id: str) -> list[dict]:
+                  run_id: str, query: DiscoveryQuery | None = None) -> list[dict]:
     """Every fact this business gave us, as rows — and only the confirmed ones."""
     rows: list[dict] = []
 
@@ -1030,6 +1031,11 @@ def _observations(biz: Business, company_id: str, confirmed: set[str],
         add("REVIEW_RATING", num=float(biz.rating))
     if biz.review_count is not None:
         add("REVIEW_COUNT", num=float(biz.review_count))
+    if query is not None and query.preset == "yc":
+        # The search matched "backed by Y Combinator" on a page of their own
+        # site (third-party sites are filtered out above). Short of reading
+        # that page ourselves, so below the homepage's own claim.
+        add("YC_BACKED", num=1.0, conf=0.7)
     return rows
 
 
