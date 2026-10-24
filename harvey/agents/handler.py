@@ -200,6 +200,7 @@ class Handler:
         self.instantly = InstantlyClient(env.instantly_api_key)
         self.provider = get_mail_provider(config, env)
         self.skills = ""
+        self.last_read_problem = ""   # why the last mailbox read failed, for the heartbeat
 
     @property
     def is_native(self) -> bool:
@@ -603,10 +604,13 @@ class Handler:
             )
             return True  # nothing to read; the sender can't send through it either
 
+        self.last_read_problem = ""
         try:
             inbound = await self.provider.get_replies()
         except Exception as e:
             logger.error(f"Handler: fetching replies failed: {e}")
+            # Kept for the heartbeat: sending is held, and Today says why.
+            self.last_read_problem = f"{self.provider.name}: {e}"
             return False
 
         handled = 0
@@ -638,6 +642,7 @@ class Handler:
                 break
             except Exception as e:
                 logger.error(f"Handler: error processing {msg.from_email}: {e}")
+                self.last_read_problem = f"a reply from {msg.from_email} couldn't be handled ({e})"
                 complete = False
             finally:
                 if consumed:

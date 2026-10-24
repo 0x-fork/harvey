@@ -44,6 +44,13 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- **You see it when Harvey isn't sending because it couldn't read your
+  inbox.** Sending waits until replies are read, so an opt-out stops its
+  follow-up. That hold only showed in the log, so a lapsed Gmail sign-in
+  could stall sending for days unnoticed. Today now shows it first, with
+  the reason, how long, how many emails are waiting and the fix (`harvey
+  gmail auth`, `harvey microsoft auth`, or a mailbox over the read limit),
+  and so does `harvey status`. It clears itself once sending runs again.
 - **Gmail: nothing sends until the whole inbox has been read** (from #62 by
   xiaoheiai4719-collab). A failed or partial inbox read used to look like
   an empty inbox, so a follow-up could go out before an opt-out on page two

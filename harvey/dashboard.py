@@ -1873,6 +1873,14 @@ async def get_live_status():
     }
 
 
+def _require_approval_now() -> bool:
+    try:
+        from harvey.config import load_config
+        return bool(load_config(str(_resolve_config_file())).channels.email.require_approval)
+    except Exception:
+        return True
+
+
 @app.get("/api/today")
 async def get_today():
     """What needs a human, right now.
@@ -1933,6 +1941,15 @@ async def get_today():
                 "detail": (str(brain.get("reason") or "It can't be used right now.")[:300] +
                            " Replies and queued emails are untouched; Harvey resumes "
                            "once it's fixed. harvey status --check says what's wrong."),
+                "action": "Open the log", "tab": "controls",
+            })
+
+        hold = await state.current_sends_held()
+        if hold:
+            from harvey.sending_mode import held_message
+            title, detail = held_message(hold, waiting=len(approved))
+            items.append({
+                "key": "sends-held", "tone": "bad", "title": title, "detail": detail,
                 "action": "Open the log", "tab": "controls",
             })
 
@@ -2009,7 +2026,10 @@ async def get_today():
                 "key": "outbox", "tone": "warn",
                 "title": (f"{len(pending)} email waiting for approval" if len(pending) == 1
                           else f"{len(pending)} emails waiting for approval"),
-                "detail": "Nothing sends until you approve it. Read them one at a time.",
+                "detail": ("Nothing sends until you approve it. Read them one at a time."
+                           if _require_approval_now() else
+                           "Autopilot sends the rest on its own; these wait for you. "
+                           "Read them one at a time."),
                 "action": "Open the decisions desk", "tab": "outbox",
             })
 

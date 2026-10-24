@@ -229,6 +229,8 @@ class GmailProvider(MailProvider):
         are Gmail's largest (a listing is ids only), so the bound is
         MAX_INBOX_PAGES x 500 messages a week before sending is held.
         """
+        if not await self._token():
+            raise GmailError("not signed in to Gmail. Run 'harvey gmail auth'.")
         params = {"q": "in:inbox -from:me newer_than:7d",
                   "maxResults": max(1, min(500, int(limit)))}
         out = []

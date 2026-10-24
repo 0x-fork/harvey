@@ -26,3 +26,23 @@ async def sync_sending_mode(config, state) -> bool:
         logger.warning("Sending mode is now AUTOPILOT: Harvey sends on its own "
                        "(emails it holds still wait for you).")
     return True
+
+
+def held_message(hold: dict, waiting: int) -> tuple[str, str]:
+    """What Today and `harvey status` say while sending is held because
+    replies couldn't all be read: (title, detail)."""
+    reason = str(hold.get("reason") or "replies couldn't all be read").strip().rstrip(".")
+    low = reason.lower()
+    if "harvey gmail auth" in low or "gmail" in low and ("sign" in low or "authoriz" in low):
+        fix = "Run `harvey gmail auth` to sign in again."
+    elif "harvey microsoft auth" in low or "microsoft" in low and "authoriz" in low:
+        fix = "Run `harvey microsoft auth` to sign in again."
+    elif "partial read" in low or "pages" in low:
+        fix = ("The mailbox got more mail in the last week than Harvey reads, so it can't "
+               "be sure it saw every reply. Send from a dedicated mailbox, or archive old mail.")
+    else:
+        fix = "Harvey tries again every cycle; if this lasts, check the log."
+    emails = "1 email is waiting" if waiting == 1 else f"{waiting} emails are waiting"
+    return ("Harvey isn't sending: it couldn't read your inbox",
+            f"{reason}. {fix} {emails}: replies are read first, so an opt-out "
+            f"stops its follow-up before anything goes. Held since {str(hold.get('since', '?'))[:16].replace('T', ' ')} UTC.")

@@ -198,6 +198,18 @@ async def _interruptible_sleep(seconds: float, stop_event: asyncio.Event) -> boo
         return False
 
 
+async def record_send_phase(state, held_reason: str):
+    """Note why sending was held this cycle (Today and `harvey status` show
+    it), or clear the note when sending ran. Never stops the loop."""
+    try:
+        if held_reason:
+            await state.note_sends_held(held_reason)
+        else:
+            await state.clear_sends_held()
+    except Exception as e:
+        logger.warning(f"Couldn't record the send hold: {e}")
+
+
 async def heartbeat(stop_event: asyncio.Event | None = None):
     """Harvey's main loop. Wakes up, decides, acts, sleeps. Repeat."""
     if stop_event is None:
@@ -367,7 +379,11 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
                         f"Not sending this cycle: {reason} Queued emails wait "
                         "until replies can be read again."
                     )
+                    if unread and not paused:   # a paused brain has its own Today card
+                        await record_send_phase(
+                            state, getattr(handler, "last_read_problem", "") or reason)
                 else:
+                    await record_send_phase(state, "")
                     await _run_agents([(name, run()) for name, run in send_tasks])
 
             # 6. Log the action (best-effort; never kills the loop)

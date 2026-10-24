@@ -18,6 +18,7 @@ def message(message_id, sender='person@example.test', body='Hello'):
 
 def provider(responses):
     p = GmailProvider(SimpleNamespace(), SimpleNamespace())
+    p._token = AsyncMock(return_value='synthetic-token')   # never the real sign-in
     p._request = AsyncMock(side_effect=responses)
     return p
 

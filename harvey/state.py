@@ -44,6 +44,9 @@ REVIEW_NEXT_REPLY_KEY = "review_next_reply:"
 # Outbox error prefix for an email autopilot held for a human (gate.
 # autopilot_review): approve-all skips these, they're approved one by one.
 HELD_FOR_REVIEW = "held for your review: "
+# Set while the heartbeat holds sending because replies couldn't all be read
+# (JSON: since, last_seen, reason), so Today and `harvey status` can say so.
+SENDS_HELD_KEY = "sends_held"
 # Outbox error on what autopilot had approved when it was turned off.
 AUTOPILOT_OFF_REASON = "waiting for you: autopilot was turned off before it went out"
 # Outbox errors starting with this: the send was cut off and the email may
@@ -1173,6 +1176,32 @@ class StateManager:
                 )
             await db.commit()
             return cursor.rowcount
+
+    async def note_sends_held(self, reason: str):
+        """The heartbeat held sending this cycle. Keeps when it started."""
+        now = _utcnow().isoformat()
+        try:
+            since = json.loads(await self.get_setting(SENDS_HELD_KEY) or "{}").get("since") or now
+        except (json.JSONDecodeError, AttributeError):
+            since = now
+        await self.set_setting(SENDS_HELD_KEY, json.dumps(
+            {"since": since, "last_seen": now, "reason": str(reason)[:500]}))
+
+    async def clear_sends_held(self):
+        if await self.get_setting(SENDS_HELD_KEY):
+            await self.delete_setting(SENDS_HELD_KEY)
+
+    async def current_sends_held(self, max_age_hours: float = 12) -> dict | None:
+        """The hold, unless Harvey hasn't seen it for ``max_age_hours`` (it
+        stopped, or the hold lifted without a cycle saying so)."""
+        try:
+            hold = json.loads(await self.get_setting(SENDS_HELD_KEY) or "null")
+            seen = datetime.fromisoformat(hold["last_seen"])
+        except (json.JSONDecodeError, TypeError, KeyError, ValueError):
+            return None
+        if _utcnow() - seen > timedelta(hours=max_age_hours):
+            return None
+        return hold
 
     async def requeue_autopilot_approved(self) -> int:
         """Autopilot was turned off: everything it approved that hasn't gone
