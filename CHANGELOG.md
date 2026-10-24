@@ -44,7 +44,15 @@ minor versions can still change behaviour.
   *lost*, which put them back in the export, and a question from them got a
   drafted answer in the Outbox. Now their message is kept in a closed
   conversation for you to read, nothing is drafted, and no code path can
-  move a prospect off *opted out*.
+  move a prospect off *opted out*. A complaint from them still comes to you.
+- **See why someone opted out, and undo it.** Each opt-out now records the
+  rule that fired (an opt-out phrase, "no thanks", a one-word reply, or the
+  model's judgement), the words it matched and their message. **Why?** on
+  their row in Contacts (or on the conversation) shows it, and **Undo
+  opt-out** reverses a mistaken one after a confirm: they become *replied*,
+  so nothing is sent on its own and their next reply is drafted for your
+  approval. Opt-outs from before this show their last message instead, and
+  every undo is logged.
 - **`aiosmtplib` is now 5.1.3 or later** (was `>=3.0.1,<4`). Older versions
   wrote a CR/LF inside an address straight to the SMTP server, so an address
   scraped from a website could add commands of its own

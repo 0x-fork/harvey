@@ -799,6 +799,12 @@ async def get_usage():
 @app.get("/api/prospects")
 async def get_prospects():
     rows = await query_db("SELECT * FROM prospects ORDER BY created_at DESC LIMIT 200")
+    # Someone whose opt-out was undone keeps a way to see what happened.
+    undone = {r["pid"] for r in await query_db(
+        "SELECT DISTINCT json_extract(details_json, '$.prospect_id') AS pid FROM actions "
+        "WHERE action_type = 'opt_out_undone' AND json_valid(details_json)")}
+    for r in rows:
+        r["opt_out_undone"] = r.get("id") in undone
     return rows
 
 
@@ -1271,10 +1277,74 @@ async def get_campaigns():
     return rows
 
 
+@app.get("/api/prospects/{prospect_id}/opt-out")
+async def get_opt_out(prospect_id: str):
+    """Why this person is opted out: the rule, the words and their message."""
+    rows = await query_db("SELECT status FROM prospects WHERE id = ?", (prospect_id,))
+    if not rows:
+        return _refuse("unknown prospect", 404)
+    status = rows[0].get("status") or "new"
+    state = _state()
+    await state.init_db()
+    history = await state.opt_out_history(prospect_id)
+    last = next((h for h in reversed(history) if h["action"] == "opt_out"), None)
+    out = {
+        "opted_out": status == "opted_out", "status": status, "recorded": bool(last),
+        "at": None, "rule": None, "matched": "", "why": "", "message": "",
+        "conversation_id": "", "history": history,
+    }
+    if last:
+        out.update({k: last.get(k) or out[k] for k in
+                    ("rule", "matched", "why", "message", "conversation_id")})
+        out["at"] = last["at"]
+    elif status == "opted_out" or history:
+        # Opted out before Harvey kept reasons (and maybe undone since):
+        # show the last thing they wrote.
+        for c in await query_db(
+                "SELECT id, thread_json, updated_at FROM conversations "
+                "WHERE prospect_id = ? ORDER BY updated_at DESC", (prospect_id,)):
+            try:
+                thread = json.loads(c.get("thread_json") or "[]")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            theirs = [m for m in thread if isinstance(m, dict) and m.get("sender") == "prospect"]
+            if theirs:
+                out.update(message=str(theirs[-1].get("content") or ""),
+                           conversation_id=c["id"], at=theirs[-1].get("timestamp") or c.get("updated_at"))
+                break
+    return out
+
+
+@app.post("/api/prospects/{prospect_id}/opt-out/undo")
+async def undo_opt_out(prospect_id: str, request: Request):
+    """The owner says this opt-out was a mistake. Needs {"confirm": true}."""
+    try:
+        body = await request.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, dict) or body.get("confirm") is not True:
+        return _refuse('expected {"confirm": true}', 400)
+    rows = await query_db("SELECT email FROM prospects WHERE id = ?", (prospect_id,))
+    if not rows:
+        return _refuse("unknown prospect", 404)
+    state = _state()
+    await state.init_db()
+    history = await state.opt_out_history(prospect_id)
+    if not await state.undo_opt_out(prospect_id):
+        return _refuse("This person isn't opted out.")
+    last = next((h for h in reversed(history) if h["action"] == "opt_out"), {})
+    await state.log_action("opt_out_undone", "dashboard", {
+        "prospect_id": prospect_id, "prospect_email": rows[0].get("email") or "",
+        "previous_why": last.get("why", ""), "previous_at": last.get("at", ""),
+    })
+    return {"success": True, "status": "replied"}
+
+
 @app.get("/api/conversations")
 async def get_conversations():
     rows = await query_db("""
-        SELECT c.*, p.first_name, p.last_name, p.email as prospect_email, p.company
+        SELECT c.*, p.first_name, p.last_name, p.email as prospect_email, p.company,
+               p.status as prospect_status
         FROM conversations c
         LEFT JOIN prospects p ON c.prospect_id = p.id
         ORDER BY c.updated_at DESC LIMIT 100

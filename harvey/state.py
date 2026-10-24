@@ -751,6 +751,36 @@ class StateManager:
             )
             await db.commit()
 
+    async def undo_opt_out(self, prospect_id: str) -> bool:
+        """A human's undo of an opt-out: the one way off 'opted_out'.
+
+        They go to 'replied', not back into the sequence: Harvey sends
+        nothing new on its own (the sender never stages 'replied'), what the
+        opt-out cancelled stays cancelled, and their next reply is handled
+        like anyone's. False when they weren't opted out."""
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "UPDATE prospects SET status = 'replied', updated_at = ? "
+                "WHERE id = ? AND status = 'opted_out'",
+                (_utcnow().isoformat(), prospect_id),
+            )
+            await db.commit()
+            return cursor.rowcount == 1
+
+    async def opt_out_history(self, prospect_id: str) -> list[dict]:
+        """Every opt-out and undo recorded for this person, oldest first."""
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT action_type, details_json, created_at FROM actions "
+                "WHERE action_type IN ('opt_out', 'opt_out_undone') "
+                "AND json_valid(details_json) "
+                "AND json_extract(details_json, '$.prospect_id') = ? "
+                "ORDER BY created_at, rowid",
+                (prospect_id,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        return [{"action": a, "at": str(at or ""), **json.loads(d)} for a, d, at in rows]
+
     async def queue_prospect_if_unsent(self, prospect_id: str) -> bool:
         """Mark a prospect 'queued' unless something moved them on meanwhile.
 

@@ -136,16 +136,33 @@ class OurText:
         return "\n".join(kept)
 
 
-def _is_opt_out(their_text: str, own_words: str) -> bool:
-    """their_text: everything they wrote, our text removed. own_words: their
+def _opt_out_reason(their_text: str, own_words: str) -> dict | None:
+    """Which opt-out rule their reply trips, and on what words, or None.
+
+    their_text: everything they wrote, our text removed. own_words: their
     reply without the quote. Longer phrases match across a line wrap; "no
-    thanks" only within a line."""
-    if any(p in _flat(their_text) for p in OPT_OUT_PATTERNS):
-        return True
-    if any(NO_THANKS_RE.search(_flat(line)) for line in their_text.split("\n")):
-        return True
+    thanks" only within a line. The result is kept with the opt-out so a
+    human can see why Harvey stopped, and undo it if it was wrong."""
+    flat = _flat(their_text)
+    for p in OPT_OUT_PATTERNS:
+        if p in flat:
+            return {"rule": "phrase", "matched": p,
+                    "why": f'Their reply contains "{p}".'}
+    for line in their_text.split("\n"):
+        m = NO_THANKS_RE.search(_flat(line))
+        if m:
+            return {"rule": "no_thanks", "matched": m.group(0),
+                    "why": f'Their reply says "{m.group(0)}", what the opt-out line asks for.'}
     bare = _flat(_MOBILE_SIGNATURE_RE.sub("", own_words or ""))
-    return re.sub(r"[^\w\s-]", "", bare).strip() in BARE_OPT_OUTS
+    bare = re.sub(r"[^\w\s-]", "", bare).strip()
+    if bare in BARE_OPT_OUTS:
+        return {"rule": "only_words", "matched": bare,
+                "why": f'Their reply was only "{bare}".'}
+    return None
+
+
+MODEL_OPT_OUT = {"rule": "model", "matched": "",
+                 "why": "No opt-out phrase matched; the model read the reply as a request to stop."}
 
 # Phrases that mean a human must take over. Never auto-reply to these.
 ESCALATION_PATTERNS = (
@@ -384,7 +401,8 @@ class Handler:
 
         # 1. Classify intent. Hard keyword checks run FIRST and override
         # the LLM — opt-outs and legal threats must never be missed.
-        if _is_opt_out(their_text, reply_text):
+        opt_out = _opt_out_reason(their_text, reply_text)
+        if opt_out:
             intent = "unsubscribe"
         elif any(p in keyword_text for p in ESCALATION_PATTERNS):
             intent = "escalate"
@@ -446,7 +464,13 @@ class Handler:
             await self.state.log_action(
                 action_type="opt_out",
                 agent="handler",
-                details={"prospect_email": lead_email},
+                details={
+                    "prospect_id": prospect.id,
+                    "prospect_email": lead_email,
+                    **(opt_out or MODEL_OPT_OUT),
+                    "message": reply_text[:1000],
+                    "conversation_id": convo.id,
+                },
             )
             logger.info(f"Handler: {lead_email} opted out. Suppressed permanently. No reply sent.")
             return

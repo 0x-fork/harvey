@@ -258,7 +258,9 @@ function actionText(a) {
       : 'Sent email ' + escHtml(String(d.step || 1)) + ' to ' + who;
     case 'reply': return 'Answered ' + who + intent;
     case 'reply_queued': return 'Drafted a reply to ' + who + intent;
-    case 'opt_out': return who + ' opted out';
+    case 'opt_out': return who + ' opted out' + (d.why ? ' · ' + escHtml(d.why) : '');
+    case 'opt_out_undone': return 'You undid ' + (who || 'a contact') + '’s opt-out';
+    case 'reply_after_opt_out': return who + ' wrote again after opting out · no reply sent';
     case 'escalation': return 'Flagged ' + who + ' for you' + (d.reason ? ' · ' + escHtml(d.reason) : '');
     case 'bounce': return 'Email to ' + who + ' bounced';
     case 'manual_send': return 'You marked a contact as emailed by hand';
@@ -1947,11 +1949,107 @@ function renderContacts() {
       '<td>' + badge(p.status) + '</td>' +
       '<td class="muted">' + sourceLabel(p.source) + '</td>' +
       '<td class="muted" style="white-space:nowrap">' + relTime(p.created_at) + '</td>' +
-      '<td><button class="btn btn-ghost btn-sm row-action" onclick="fbProspect(' + i + ')" ' +
-        'title="Leave feedback on this contact">Feedback</button></td></tr>';
+      '<td><div class="cell-row">' + (p.status === 'opted_out' || p.opt_out_undone || _optOut.id === p.id
+        ? '<button class="btn btn-ghost btn-sm" onclick="toggleOptOut(' + i + ')" ' +
+          'aria-expanded="' + (_optOut.id === p.id) + '" title="What made Harvey stop emailing them">' +
+          (p.status === 'opted_out' ? 'Why?' : 'Opt-out history') + '</button>' : '') +
+        '<button class="btn btn-ghost btn-sm row-action" onclick="fbProspect(' + i + ')" ' +
+        'title="Leave feedback on this contact">Feedback</button></div></td></tr>';
+    if (_optOut.id === p.id) html += '<tr class="detail-row"><td colspan="8">' + optOutPanel(p) + '</td></tr>';
   }
   rowsEl.innerHTML = html + '</tbody></table></div>' +
     '<div class="table-foot">' + rows.length + ' of ' + _prospects.length + ' contacts</div>';
+}
+
+// Why someone is opted out, and undoing it. Harvey never moves anyone off
+// "opted out" on its own, so a mistaken one (a bare "stop" that meant
+// something else) needs you: see what triggered it, then undo it here.
+let _optOut = {id: null, data: null, armed: false, busy: false};
+const OPT_OUT_RULES = {
+  phrase: 'Matched an opt-out phrase',
+  no_thanks: 'Matched “no thanks”',
+  only_words: 'Their reply was only an opt-out word',
+  model: 'The model’s judgement (no phrase matched)',
+};
+
+async function toggleOptOut(i) {
+  const p = _prospects[i];
+  if (!p) return;
+  if (_optOut.id === p.id) { _optOut = {id: null, data: null, armed: false, busy: false}; renderContacts(); return; }
+  _optOut = {id: p.id, data: null, armed: false, busy: false};
+  renderContacts();
+  const data = await api('/api/prospects/' + encodeURIComponent(p.id) + '/opt-out');
+  if (_optOut.id !== p.id) return;   // closed or switched meanwhile
+  _optOut.data = data || {error: true};
+  renderContacts();
+}
+
+function optOutPanel(p) {
+  const d = _optOut.data;
+  const name = escHtml([p.first_name, p.last_name].filter(Boolean).join(' ') || p.email);
+  if (!d) return '<div class="optout-panel muted">Loading…</div>';
+  if (d.error) return '<div class="optout-panel muted">Couldn’t load the opt-out record. Try again.</div>';
+  let html = '<div class="optout-panel"><h4>' + (d.opted_out ? 'Why Harvey stopped emailing ' : 'Opt-out history for ') +
+    name + '</h4>';
+  if (d.recorded) {
+    html += '<p>' + escHtml(d.why) + '</p><div class="optout-meta">' +
+      escHtml(own(OPT_OUT_RULES, d.rule) || d.rule || '') + (d.at ? ' · ' + relTime(d.at) : '') + '</div>';
+  } else if (d.opted_out || (d.history || []).length) {
+    html += '<p>They opted out before Harvey kept a record of why.' +
+      (d.message ? ' The last thing they wrote:' : ' There’s no reply from them on file.') + '</p>';
+  }
+  if (d.message) {
+    html += '<div class="thread-msg received"><div class="sender">' + escHtml(p.first_name || 'They') +
+      (d.at ? ' &middot; ' + relTime(d.at) : '') + '</div>' + escHtml(d.message) + '</div>';
+  }
+  const undone = (d.history || []).filter(h => h.action === 'opt_out_undone');
+  if (undone.length) {
+    html += '<div class="optout-meta">' + undone.map(h => 'You undid an opt-out ' + relTime(h.at)).join(' · ') + '</div>';
+  }
+  if (!d.opted_out) {
+    html += '<div class="convo-actions"><span class="muted">Not opted out now (' +
+      escHtml(statusMeta(d.status).label) + ').</span></div>';
+  } else if (_optOut.armed) {
+    html += '<div class="convo-actions"><span class="muted">Harvey will treat them as having replied. Nothing is ' +
+      'sent automatically, emails the opt-out cancelled stay cancelled, and their next reply gets a draft ' +
+      'for your approval. Only undo it if they didn’t mean to opt out.</span>' +
+      '<button class="btn btn-primary btn-sm" onclick="undoOptOut()"' + (_optOut.busy ? ' disabled' : '') +
+        '>Confirm undo</button>' +
+      '<button class="btn btn-ghost btn-sm" onclick="_optOut.armed=false;renderContacts()">Cancel</button></div>';
+  } else {
+    html += '<div class="convo-actions"><button class="btn btn-secondary btn-sm" ' +
+      'onclick="_optOut.armed=true;renderContacts()">Undo opt-out</button></div>';
+  }
+  return html + '</div>';
+}
+
+async function undoOptOut() {
+  const id = _optOut.id;
+  if (!id || _optOut.busy) return;
+  _optOut.busy = true;
+  renderContacts();
+  const res = await api('/api/prospects/' + encodeURIComponent(id) + '/opt-out/undo', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({confirm: true}),
+  });
+  if (res && res.success) showToast('Opt-out undone. They’re marked as replied; Harvey sends nothing on its own.', 'success');
+  else showToast(failMsg(res, 'Could not undo the opt-out. Try again.'), 'error');
+  if (_optOut.id !== id) return;
+  _optOut.armed = false;
+  _optOut.busy = false;
+  _optOut.data = await api('/api/prospects/' + encodeURIComponent(id) + '/opt-out') || {error: true};
+  loadProspects();
+}
+
+// From a conversation: the contact, with the opt-out record open.
+async function showOptOut(prospectId, email) {
+  goTab('prospects');
+  _contactQuery = email || '';
+  const search = document.getElementById('contact-search');
+  if (search) search.value = _contactQuery;
+  await loadProspects();
+  const i = _prospects.findIndex(p => p.id === prospectId);
+  if (i >= 0 && _optOut.id !== prospectId) toggleOptOut(i);
 }
 
 // Opens a filled-in compose window in whatever Gmail account the browser is
@@ -2215,6 +2313,12 @@ function convoActions(c) {
   if (c.status === 'open') {
     return '<div class="convo-actions"><button class="btn btn-ghost btn-sm" onclick="setConvoStatus(' +
       jsq(c.id) + ',\'closed\')">Close conversation</button></div>';
+  }
+  if (c.status === 'closed' && c.prospect_status === 'opted_out') {
+    // Reopening wouldn't help: Harvey never answers someone who opted out.
+    return '<div class="convo-actions"><span class="muted">' + icon('alert') + 'Opted out. Harvey won’t write to them.</span>' +
+      '<button class="btn btn-secondary btn-sm" onclick="showOptOut(' + jsq(c.prospect_id) + ',' + jsq(c.prospect_email) +
+      ')">Why opted out?</button></div>';
   }
   if (c.status === 'closed') {
     return '<div class="convo-actions"><button class="btn btn-ghost btn-sm" onclick="setConvoStatus(' +

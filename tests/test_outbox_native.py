@@ -1,6 +1,7 @@
 """Tests for the native sending path: gate, outbox lifecycle, stage/drain,
 stop-on-reply, bounces, and the kill switch."""
 
+import json
 import os
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -305,6 +306,40 @@ async def test_reply_cancels_pending_outbox(state):
     assert await collect_prospects(state) == []
 
 
+async def _logged(state, action_type):
+    import aiosqlite
+    async with aiosqlite.connect(state.db_path) as db:
+        async with db.execute(
+            "SELECT details_json FROM actions WHERE action_type = ?", (action_type,)
+        ) as cursor:
+            return [json.loads(r[0]) for r in await cursor.fetchall()]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body,intent,rule,matched", [
+    ("Please remove me from your list.", "question", "phrase", "remove me"),
+    ("No thanks, we're all set for now.", "question", "no_thanks", "no thanks"),
+    ("STOP", "question", "only_words", "stop"),
+    ("Please never write to this address again.", "unsubscribe", "model", ""),
+])
+async def test_an_opt_out_records_why(state, body, intent, rule, matched):
+    pid = await seed_prospect(state, status="contacted")
+    provider = FakeProvider()
+    provider.inbound = [InboundMessage(
+        provider_id="in4", from_email="jane@acme.com", subject="Re: hi", body=body,
+    )]
+    await make_handler(state, provider, intent=intent)._run_native()
+
+    assert (await state.get_prospect(pid)).status == "opted_out"
+    [d] = await _logged(state, "opt_out")
+    assert d["prospect_id"] == pid and d["prospect_email"] == "jane@acme.com"
+    assert (d["rule"], d["matched"]) == (rule, matched)
+    assert d["message"] == body
+    assert d["why"]
+    [convo] = await state.get_conversations_by_status("closed")
+    assert d["conversation_id"] == convo.id
+
+
 class RefusingBrain(StubBrain):
     """Fails the test if anything asks the model about this reply."""
     async def think(self, *_a, **_k):
@@ -419,3 +454,20 @@ async def test_inbound_dedup(state):
     await handler._run_native()   # same message again → ignored via dedup
     second = await state.get_conversations_by_status("closed")
     assert len(first) == len(second) == 1
+
+
+@pytest.mark.asyncio
+async def test_after_an_undo_their_next_reply_is_handled_normally(state):
+    pid = await seed_prospect(state, status="opted_out")
+    assert await state.undo_opt_out(pid) is True
+    assert await state.undo_opt_out(pid) is False       # only from opted_out
+    assert (await state.get_prospect(pid)).status == "replied"
+
+    provider = FakeProvider()
+    provider.inbound = [InboundMessage(
+        provider_id="in5", from_email="jane@acme.com", subject="Re: hi",
+        body="Sorry, wrong button earlier. What does it cost?",
+    )]
+    await make_handler(state, provider)._run_native()
+    drafts = await state.get_outbox(status="pending_review")
+    assert [d["kind"] for d in drafts] == ["reply"]      # waits for approval, as any reply
