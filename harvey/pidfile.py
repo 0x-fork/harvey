@@ -14,6 +14,7 @@ a live PID with nobody holding the lock is not Harvey, and is never signalled.
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 from harvey.paths import PROJECT_ROOT
@@ -136,10 +137,14 @@ def hold_loop_lock(path: Path | None = None):
     except OSError as e:
         logger.warning("Could not open the loop lock: %s", e)
         return None
-    if not _try_lock(handle):
-        handle.close()
-        return None
-    return handle
+    # The dashboard's status check holds the lock for an instant; a loop
+    # starting in that instant waits it out rather than refusing to run.
+    for attempt in range(10):
+        if _try_lock(handle):
+            return handle
+        time.sleep(0.01 * (attempt + 1))
+    handle.close()
+    return None
 
 
 def release_loop_lock(handle) -> None:

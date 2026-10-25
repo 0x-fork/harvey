@@ -536,6 +536,10 @@ def main():
     """Entry point."""
     # Check for first-time setup
     if _needs_setup():
+        if not sys.stdin.isatty():
+            # Started by the dashboard or a service: nobody can answer the wizard.
+            print("Harvey isn't set up yet. Run `harvey setup` in a terminal first.")
+            sys.exit(1)
         print("\n  First time running Harvey? Let's get you set up.\n")
         from harvey.setup import run_setup
         asyncio.run(run_setup())

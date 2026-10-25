@@ -181,7 +181,10 @@ minor versions can still change behaviour.
   holds a lock on `data/harvey.lock`: a PID file left by a crash or a reboot
   can name an unrelated program, which is now reported as stopped and never
   signalled, and a second `harvey run` refuses to start while one is
-  running. (From #91 and #90.)
+  running. Start refuses, with the reason, until `harvey setup` has been
+  run (the loop used to sit in the setup wizard reading the dashboard's
+  terminal), and Stop says so when it couldn't end the loop instead of
+  reporting success. (From #91 and #90.)
 
 - **`{{company}}'s` reads right for names ending in "s"**: "Parkes Builders'",
   not "Parkes Builders's". (From #90.)

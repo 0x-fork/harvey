@@ -1,4 +1,4 @@
-"""Tests for the possessive merge and the dashboard's Start command."""
+"""The possessive merge: "{{company}}'s" for a name ending in s."""
 
 from types import SimpleNamespace
 

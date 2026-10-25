@@ -531,6 +531,10 @@ async def start_harvey():
 
     if _check_harvey_pid():
         return {"success": False, "message": "Harvey is already running."}
+    from harvey.main import _needs_setup
+    if _needs_setup():
+        return {"success": False,
+                "message": "Harvey isn't set up yet. Run `harvey setup` in a terminal first."}
 
     # Ensure data dir exists
     (PROJECT_ROOT / "data").mkdir(parents=True, exist_ok=True)
@@ -548,6 +552,7 @@ async def start_harvey():
             _harvey_process = subprocess.Popen(
                 [sys.executable, "-m", "harvey", "run"],
                 cwd=str(PROJECT_ROOT),
+                stdin=subprocess.DEVNULL,
                 stdout=log_handle,
                 stderr=log_handle,
                 start_new_session=True,
@@ -560,13 +565,9 @@ async def start_harvey():
         logger.warning("Failed to start Harvey: %s", e)
         return {"success": False, "message": f"Failed to start Harvey: {e}"}
     _harvey_started_at = datetime.now()
-
-    # Write PID file
-    try:
-        PID_FILE.write_text(str(_harvey_process.pid), encoding="utf-8")
-    except OSError as e:
-        logger.warning("Could not write PID file: %s", e)
-
+    # The loop writes its own PID file once it holds the loop lock. Writing
+    # the child's PID here would overwrite a running loop's record if this
+    # child then finds the lock taken and exits.
     return {"success": True, "pid": _harvey_process.pid}
 
 
@@ -579,11 +580,20 @@ async def stop_harvey():
     if not pid:
         return {"success": False, "message": "Harvey is not running."}
 
+    own = _harvey_process if _harvey_process and _harvey_process.pid == pid else None
+
+    def alive() -> bool:
+        # Our own child is reaped by poll(); left unreaped it is a zombie,
+        # which still answers signal 0.
+        if own is not None:
+            return own.poll() is None
+        return pid_alive(pid)
+
     try:
         os.kill(pid, signal.SIGTERM)
         # Wait briefly for graceful shutdown
         for _ in range(10):
-            if not pid_alive(pid):
+            if not alive():
                 break
             await asyncio.sleep(0.5)
         else:
@@ -593,8 +603,14 @@ async def stop_harvey():
                 os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
             except OSError:
                 pass
-    except OSError:
-        pass
+            await asyncio.sleep(0.5)
+    except OSError as e:
+        logger.warning("Couldn't signal Harvey (pid %s): %s", pid, e)
+
+    if alive():
+        # Started by another user, or from an elevated terminal on Windows.
+        return {"success": False,
+                "message": f"Couldn't stop Harvey (pid {pid}). Stop it where it was started."}
 
     _harvey_process = None
     _harvey_started_at = None

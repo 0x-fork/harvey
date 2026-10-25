@@ -191,19 +191,6 @@ def test_stop_never_signals_a_reused_pid(status_client, monkeypatch, tmp_path):
     assert status_client.post("/api/harvey/stop").json()["success"] is False
 
 
-def test_a_cli_loop_holding_the_lock_is_running(status_client, monkeypatch, tmp_path):
-    lock = tmp_path / "harvey.lock"
-    monkeypatch.setattr(dash, "LOCK_FILE", lock)
-    status_client.pid_file.write_text("4242")
-    monkeypatch.setattr(dash, "pid_alive", lambda pid: pid == 4242)
-    held = pidfile.hold_loop_lock(lock)
-    try:
-        data = status_client.get("/api/harvey/status").json()
-    finally:
-        pidfile.release_loop_lock(held)
-    assert data["running"] is True and data["pid"] == 4242
-
-
 def test_harvey_run_refuses_when_a_loop_is_already_running(monkeypatch, tmp_path, capsys):
     import harvey.main as main_mod
     lock = tmp_path / "harvey.lock"
@@ -226,6 +213,8 @@ def test_harvey_run_refuses_when_a_loop_is_already_running(monkeypatch, tmp_path
 
 
 def test_start_launches_the_heartbeat_not_the_cli_help(status_client, monkeypatch, tmp_path):
+    import harvey.main as main_mod
+    monkeypatch.setattr(main_mod, "_needs_setup", lambda: False)
     monkeypatch.setattr(dash, "LOCK_FILE", tmp_path / "harvey.lock")
     monkeypatch.setattr(dash, "LOG_FILE", tmp_path / "harvey.log")
     launched = {}
@@ -243,3 +232,119 @@ def test_start_launches_the_heartbeat_not_the_cli_help(status_client, monkeypatc
     monkeypatch.setattr(dash.subprocess, "Popen", FakePopen)
     assert status_client.post("/api/harvey/start").json()["success"] is True
     assert launched["cmd"][1:] == ["-m", "harvey", "run"]
+
+
+class _FakeChild:
+    """A dashboard-started loop: exits once it has been sent SIGTERM."""
+    pid = 4242
+
+    def __init__(self):
+        self.signalled = False
+
+    def poll(self):
+        return 0 if self.signalled else None
+
+
+def test_start_runs_the_loop_with_no_terminal_input(status_client, monkeypatch, tmp_path):
+    """The child must never read the dashboard's terminal (the setup wizard would)."""
+    import harvey.main as main_mod
+    monkeypatch.setattr(main_mod, "_needs_setup", lambda: False)
+    monkeypatch.setattr(dash, "LOCK_FILE", tmp_path / "harvey.lock")
+    monkeypatch.setattr(dash, "LOG_FILE", tmp_path / "harvey.log")
+    seen = {}
+
+    class FakePopen(_FakeChild):
+        def __init__(self, cmd, **kwargs):
+            super().__init__()
+            seen.update(kwargs)
+
+    monkeypatch.setattr(dash.subprocess, "Popen", FakePopen)
+    assert status_client.post("/api/harvey/start").json()["success"] is True
+    assert seen["stdin"] == dash.subprocess.DEVNULL
+
+
+def test_start_refuses_before_setup_is_done(status_client, monkeypatch, tmp_path):
+    import harvey.main as main_mod
+    monkeypatch.setattr(dash, "LOCK_FILE", tmp_path / "harvey.lock")
+    monkeypatch.setattr(main_mod, "_needs_setup", lambda: True)
+
+    def _never(*a, **k):
+        raise AssertionError("started a loop that would sit in the setup wizard")
+    monkeypatch.setattr(dash.subprocess, "Popen", _never)
+    data = status_client.post("/api/harvey/start").json()
+    assert data["success"] is False
+    assert "harvey setup" in data["message"]
+
+
+def test_harvey_run_without_a_terminal_does_not_start_the_wizard(monkeypatch, capsys):
+    import harvey.main as main_mod
+    monkeypatch.setattr(main_mod, "_needs_setup", lambda: True)
+    monkeypatch.setattr(main_mod.sys.stdin, "isatty", lambda: False, raising=False)
+
+    def _wizard():
+        raise AssertionError("the setup wizard ran with nobody to answer it")
+    import harvey.setup
+    monkeypatch.setattr(harvey.setup, "run_setup", _wizard)
+    with pytest.raises(SystemExit) as exc:
+        main_mod.main()
+    assert exc.value.code == 1
+    assert "harvey setup" in capsys.readouterr().out
+
+
+def test_stop_that_could_not_end_the_loop_says_so(status_client, monkeypatch, tmp_path):
+    """Started by another user or an elevated terminal: the signal is refused.
+    Stop must not claim success, or forget the loop it failed to stop."""
+    lock = tmp_path / "harvey.lock"
+    monkeypatch.setattr(dash, "LOCK_FILE", lock)
+    monkeypatch.setattr(dash, "pid_alive", lambda pid: True)
+    monkeypatch.setattr(dash.asyncio, "sleep", lambda s: _done())
+
+    def _refused(pid, sig):
+        raise PermissionError()
+    monkeypatch.setattr(dash.os, "kill", _refused)
+    status_client.pid_file.write_text("4242")
+    held = pidfile.hold_loop_lock(lock)
+    try:
+        data = status_client.post("/api/harvey/stop").json()
+    finally:
+        pidfile.release_loop_lock(held)
+    assert data["success"] is False
+    assert status_client.pid_file.read_text() == "4242"
+
+
+def test_stopping_the_dashboards_own_loop_needs_no_force_kill(status_client, monkeypatch, tmp_path):
+    monkeypatch.setattr(dash, "LOCK_FILE", tmp_path / "harvey.lock")
+    child = _FakeChild()
+    monkeypatch.setattr(dash, "_harvey_process", child)
+    # A zombie still answers signal 0, so pid_alive alone would say "alive".
+    monkeypatch.setattr(dash, "pid_alive", lambda pid: True)
+    sent = []
+
+    def _kill(pid, sig):
+        sent.append(sig)
+        child.signalled = True
+    monkeypatch.setattr(dash.os, "kill", _kill)
+    monkeypatch.setattr(dash.asyncio, "sleep", lambda s: _done())
+    assert status_client.post("/api/harvey/stop").json()["success"] is True
+    assert sent == [dash.signal.SIGTERM]
+
+
+async def _done():
+    return None
+
+
+def test_taking_the_lock_waits_out_a_status_probe(tmp_path):
+    """The dashboard's status check holds the lock for an instant; a loop
+    starting in that instant must not conclude another loop is running."""
+    import threading
+    import time
+    lock = tmp_path / "harvey.lock"
+    probe = pidfile.hold_loop_lock(lock)
+    threading.Timer(0.03, pidfile.release_loop_lock, args=(probe,)).start()
+    started = time.monotonic()
+    held = pidfile.hold_loop_lock(lock)
+    try:
+        assert held is not None
+        assert time.monotonic() - started < 1
+    finally:
+        pidfile.release_loop_lock(held)
