@@ -15,8 +15,9 @@ from datetime import datetime, timezone
 from harvey.brain import Brain, BrainUnavailable
 from harvey.config import (
     DEFAULT_OPT_OUT_LINE, HarveyConfig, EnvConfig, compliance_of, legacy_sending_held,
+    live_do_not_contact,
 )
-from harvey.gate import autopilot_review, pre_send_check
+from harvey.gate import autopilot_review, do_not_contact_match, pre_send_check
 from harvey.humanize import humanize, humanizer_enabled
 from harvey.integrations.instantly import InstantlyClient
 from harvey.integrations.mail_provider import (
@@ -467,8 +468,12 @@ class Handler:
         # Instantly setup can't send it, so don't spend a model call on it.
         await sync_sending_mode(self.config, self.state)
         held = not self.is_native and legacy_sending_held(self.config)
+        # Nothing can be sent to someone on the do-not-contact list, so don't
+        # spend a model call drafting; they go to you instead (step 3).
+        listed = do_not_contact_match(prospect.email or lead_email,
+                                      live_do_not_contact(self.config))
         response = ""
-        if intent in AUTO_REPLY_INTENTS and not held:
+        if intent in AUTO_REPLY_INTENTS and not held and not listed:
             response = await self._generate_response(intent, reply_text, prospect, convo)
 
         # 2c. Store the conversation in one write.
@@ -517,6 +522,19 @@ class Handler:
             logger.warning(
                 f"Handler: ESCALATED reply from {lead_email} — needs human review. No auto-reply sent."
             )
+            return
+
+        if listed:
+            await self.state.update_conversation(convo.id, status="needs_human")
+            await self.state.log_action(
+                action_type="escalation",
+                agent="handler",
+                details={"prospect_email": lead_email,
+                         "reason": f"'{listed}' is on your do-not-contact list",
+                         "reply_preview": reply_text[:200]},
+            )
+            logger.info(f"Handler: {lead_email} wrote back but is on the do-not-contact list. "
+                        "Handed to you; Harvey won't answer.")
             return
 
         if intent == "not_interested":
@@ -772,7 +790,8 @@ class Handler:
 
     def _instantly_reply_held(self, prospect, response: str) -> list[str]:
         """Why an Instantly reply must not go out by itself, or []."""
-        gate = pre_send_check(prospect.email, "Re:", response, kind="reply")
+        gate = pre_send_check(prospect.email, "Re:", response, kind="reply",
+                              do_not_contact=live_do_not_contact(self.config))
         return list(gate.reasons) + autopilot_review("", response, self.config,
                                                      recipient=prospect.email)
 

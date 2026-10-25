@@ -19,9 +19,9 @@ from datetime import date, datetime, timedelta, timezone
 from harvey.brain import Brain
 from harvey.config import (
     HarveyConfig, EnvConfig, cold_daily_cap, compliance_footer_lines, compliance_notice,
-    compliance_of, operator_timezone, send_window_of,
+    compliance_of, live_do_not_contact, operator_timezone, send_window_of,
 )
-from harvey.gate import autopilot_review, pre_send_check
+from harvey.gate import autopilot_review, do_not_contact_match, pre_send_check
 from harvey.send_window import in_window, next_send_time, recipient_zone
 from harvey.integrations.instantly import InstantlyClient
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
@@ -226,6 +226,8 @@ class Sender:
             fields = " \n".join(str(v or "") for v in (
                 p.first_name, p.last_name, p.company, p.title, p.personalization_notes))
             held = autopilot_review("", fields, self.config, recipient=p.email)
+            if listed := do_not_contact_match(p.email, live_do_not_contact(self.config)):
+                held = [f"'{listed}' is on the do-not-contact list", *held]
             if held:
                 logger.warning(f"Sender: left {p.email} out of the Instantly upload: {held}")
             else:
@@ -674,6 +676,7 @@ class Sender:
             item["to_email"], item["subject"], self._outgoing_body(item),
             prospect=prospect, allow_risky=allow_risky, kind=item["kind"],
             postal_address=compliance_of(self.config).postal_address,
+            do_not_contact=live_do_not_contact(self.config),
         )
         if not gate:
             logger.warning(

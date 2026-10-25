@@ -10,6 +10,7 @@ import csv
 import io
 import logging
 
+from harvey.gate import do_not_contact_match
 from harvey.state import StateManager
 
 logger = logging.getLogger("harvey.export")
@@ -31,6 +32,7 @@ async def collect_prospects(
     min_score: int = 0,
     statuses: list[str] | None = None,
     include_all: bool = False,
+    config=None,
 ) -> list[dict]:
     """Fetch prospects matching the filters as export-ready dicts.
 
@@ -70,6 +72,12 @@ async def collect_prospects(
         async with db.execute(sql, params) as cursor:
             rows = [dict(r) for r in await cursor.fetchall()]
 
+    if not include_all:
+        # A list for another sequencer is still contact: leave out anyone on
+        # compliance.do_not_contact, as the send gate would.
+        rows = [r for r in rows
+                if not do_not_contact_match(r.get("email") or "", _do_not_contact(config))]
+
     out = []
     for r in rows:
         out.append({
@@ -92,6 +100,22 @@ async def collect_prospects(
     return out
 
 
+def _do_not_contact(config) -> list[str]:
+    from harvey.config import (
+        ConfigError, ConfigFileNotFoundError, do_not_contact_from_file, live_do_not_contact,
+    )
+    if config is not None:
+        return live_do_not_contact(config)
+    try:
+        return do_not_contact_from_file()
+    except (ConfigFileNotFoundError, FileNotFoundError):
+        return []
+    except Exception as e:
+        # Never export the people the list was meant to keep out.
+        raise ConfigError(f"compliance.do_not_contact couldn't be read ({e}). "
+                          "Fix it before exporting.") from e
+
+
 def to_csv(rows: list[dict]) -> str:
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=CSV_COLUMNS, extrasaction="ignore")
@@ -108,6 +132,7 @@ async def export_prospects_csv(
     min_score: int = 0,
     statuses: list[str] | None = None,
     include_all: bool = False,
+    config=None,
 ) -> tuple[int, str]:
     """Export prospects to CSV. Returns (row_count, csv_text).
 
@@ -119,6 +144,7 @@ async def export_prospects_csv(
         min_score=min_score,
         statuses=statuses,
         include_all=include_all,
+        config=config,
     )
     text = to_csv(rows)
     if out_path:
