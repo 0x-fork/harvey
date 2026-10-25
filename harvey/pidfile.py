@@ -66,7 +66,7 @@ def pid_alive(pid: int) -> bool:
 def read_pid(path: Path | None = None) -> int | None:
     path = path or PID_FILE
     try:
-        return int(path.read_text().strip())
+        return int(path.read_text(encoding="utf-8").strip())
     except (OSError, ValueError):
         return None
 
@@ -76,7 +76,7 @@ def write_pid_file(path: Path | None = None) -> None:
     path = path or PID_FILE
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(str(os.getpid()))
+        path.write_text(str(os.getpid()), encoding="utf-8")
     except OSError as e:
         logger.warning("Could not write PID file: %s", e)
 

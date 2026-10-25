@@ -102,7 +102,10 @@ def status_client(monkeypatch, tmp_path):
     monkeypatch.setattr(dash, "DB_PATH", tmp_path / "harvey.db")
     monkeypatch.setattr(dash, "_harvey_process", None)
     monkeypatch.setattr(dash.os, "kill", _no_kill)
-    with TestClient(dash.app) as c:
+    dash.token_store.configure(tmp_path / "data" / "dashboard-token")
+    token = dash.token_store.get()
+    with TestClient(dash.app, base_url="http://127.0.0.1:5555",
+                    headers={"Authorization": f"Bearer {token}"}) as c:
         c.pid_file = f
         yield c
 
