@@ -49,9 +49,28 @@ One request per new address: the address, `sender_country`,
   `icp.geo_coordinates` has it). Precleared uses a default only when its own
   lookups show no country.
 
-Never both. The key goes as a bearer header. Not sent: the subject, the
-body, the person's name or title, or the company's location itself (only
-the country read from it).
+Never both.
+
+Also, when Harvey has them, the company's and the person's names:
+
+- **`company_name`**, the company record's name, else the prospect's own
+  company field.
+- **`recipient_name`**, the prospect's first and last name. A company inbox
+  (info@, hello@) has no person, so no name goes with it.
+
+For a UK recipient, Precleared searches the Companies House register by the
+company's name when the domain alone does not find the company, and checks
+the person's name against the company's officers. A company found that way
+counts only when other evidence ties it to the recipient, such as an officer
+with the person's name or the company's own website naming it. Without a
+company, a UK address can't be told from a sole trader's, so the answer is
+`consent_needed`; the names turn many of those into a confirmed company.
+Precleared does not store the person's name. Both are cut to Precleared's
+limits (160 and 120 characters).
+
+The key goes as a bearer header. Not sent: the subject, the body, the
+person's title, or the company's location itself (only the country read
+from it).
 
 ## What each verdict does
 
@@ -89,12 +108,15 @@ as `PRECLEARED_API_KEY`.
 ## Caching
 
 A definite verdict is kept for 30 days under `precleared:<address>`, with a
-fingerprint of the sender country, address source, product description and
-the country sent with it (the recipient's when Harvey was sure, else the
-default in use). Change any of those and the next email gets a fresh check.
-A three-step sequence costs one check. An address Harvey later becomes sure
-of gets one fresh check, unless Precleared had already found that same
-country itself, in which case the cached verdict stands. The country
+fingerprint of the sender country, address source, product description, the
+country sent with it (the recipient's when Harvey was sure, else the default
+in use) and the names sent with it. Change any of those and the next email
+gets a fresh check. A three-step sequence costs one check. An address Harvey
+later becomes sure of gets one fresh check, unless Precleared had already
+found that same country itself, in which case the cached verdict stands. When
+the names first come with an address whose verdict was cached without them,
+an `ok_to_email` stands, since the names only help Precleared find the
+company, and anything else gets one fresh check with them. The country
 Precleared found is kept with the verdict and feeds the send window.
 
 ## FAQ
@@ -105,6 +127,11 @@ Harvey cannot hold single emails there.
 **Why do I get unknown?** Usually the recipient's country could not be worked
 out, and Harvey was not sure of it either (see "What is sent"). If your
 prospects are all in one country, set `prospect_country`.
+
+**Why do so many UK addresses come back consent_needed?** Often Precleared
+could not find the company behind the domain on the register, so it could not
+rule out a sole trader. Harvey sends the company's and person's names to help
+it; a company record with the business's real name helps most.
 
 **Can I prove a check was made?** Each send logs the receipt id, and
 Precleared can show the signed receipt for that id later.

@@ -112,4 +112,5 @@ compliance:
     address_source: "unknown"   # published | bought | scraped | given | unknown
     prospect_country: ""        # optional, e.g. US if all your prospects are in one country
     # Harvey also tells Precleared the recipient's country when the company's
-    # location makes it certain (see docs/precleared.md).
+    # location makes it certain, and the company's and person's names when
+    # it has them (see docs/precleared.md).

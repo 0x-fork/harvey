@@ -140,6 +140,18 @@ minor versions can still change behaviour.
 
 ### Changed
 
+- **Precleared is told the company's and person's names Harvey already has.**
+  For a UK address, cold email may go to a limited company's staff without
+  consent but not to a sole trader, so Precleared has to find the company
+  behind the domain on the Companies House register. When the domain alone
+  didn't find it, the answer was `consent_needed`, even for a company Harvey
+  knew the name of. Harvey now sends `company_name` (the company record's
+  name, else the prospect's company field) and `recipient_name` (the
+  prospect's first and last name; none for a company inbox), which
+  Precleared uses to search the register and match the company's officers.
+  It doesn't store the person's name. The names join the cache fingerprint
+  only when set: a cached `ok_to_email` stands when they first arrive, and
+  any other cached verdict gets one fresh check with them.
 - **Precleared is told the recipient's country Harvey already knows.** The
   send window works out where a company is (a country, US state, Canadian
   province or Australian state in its location, or a code that is a state
