@@ -381,6 +381,43 @@ SERPER_RESPONSE = {"organic": [
      "position": 4},
 ]}
 
+TINYFISH_RESPONSE_P0 = {
+    "query": "roofer Denver",
+    "results": [
+        {
+            "position": 1,
+            "site_name": "summitroofing.example",
+            "title": "Summit Roofing — Denver Roof Replacement",
+            "snippet": "Trusted local roofers serving Denver metro...",
+            "url": "https://summitroofing.example/services",
+        },
+        {
+            "position": 2,
+            "site_name": "directory.example",
+            "title": "Top Roofers in Denver | Directory",
+            "snippet": "Find the best roofing pros...",
+            "url": "https://www.directory.example/companylist/denver/roofing",
+        },
+    ],
+    "total_results": 2,
+    "page": 0,
+}
+
+TINYFISH_RESPONSE_P1 = {
+    "query": "roofer Denver",
+    "results": [
+        {
+            "position": 3,
+            "site_name": "apexroofing.example",
+            "title": "Apex Roofing | Denver CO",
+            "snippet": "Commercial and residential roofing...",
+            "url": "https://apexroofing.example",
+        },
+    ],
+    "total_results": 3,
+    "page": 1,
+}
+
 
 def _client(handler):
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -445,6 +482,100 @@ async def test_serper_adapter():
 
 
 @pytest.mark.asyncio
+async def test_tinyfish_adapter():
+    provider = D.TinyFish()
+    assert provider.estimate([D.DiscoveryQuery(term="roofer")]) == 0.0
+
+    def handler(request):
+        assert request.headers.get("x-api-key") == "tf_key"
+        assert request.headers.get("accept") == "application/json"
+        assert request.url.params.get("query") == "roofer Denver"
+        return httpx.Response(200, json=TINYFISH_RESPONSE_P0)
+
+    async with _client(handler) as client:
+        out = await provider.fetch(client, {"tinyfish_api_key": "tf_key"},
+                                   D.DiscoveryQuery(term="roofer", location="Denver", depth=10))
+
+    assert len(out) == 2
+    assert out[0].domain == "summitroofing.example"
+    # TinyFish's own ordering, from no location: not a Google rank, so it is
+    # never recorded as SERP_RANK next to Serper's and DataForSEO's.
+    assert out[0].rank is None
+    assert out[0].provider == "tinyfish"
+    assert out[0].website == "https://summitroofing.example/services"
+    assert out[0].keyword == "roofer Denver"
+    assert out[1].domain == "directory.example"
+
+
+@pytest.mark.asyncio
+async def test_tinyfish_adapter_pagination():
+    provider = D.TinyFish()
+    pages_called = []
+
+    def handler(request):
+        page = request.url.params.get("page")
+        pages_called.append(page)
+        if page == "0":
+            items = [{"position": i + 1, "url": f"https://biz{i}.example", "title": f"Biz {i}"} for i in range(10)]
+            return httpx.Response(200, json={"results": items, "page": 0})
+        elif page == "1":
+            return httpx.Response(200, json=TINYFISH_RESPONSE_P1)
+        return httpx.Response(200, json={"results": [], "page": int(page)})
+
+    async with _client(handler) as client:
+        out = await provider.fetch(client, {"tinyfish_api_key": "tf_key"},
+                                   D.DiscoveryQuery(term="roofer", location="Denver", depth=20))
+
+    assert pages_called == ["0", "1"]
+    assert len(out) == 11
+    assert out[-1].domain == "apexroofing.example"
+
+
+@pytest.mark.asyncio
+async def test_tinyfish_rate_limit_retry():
+    provider = D.TinyFish()
+    calls = 0
+
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(429, headers={"Retry-After": "0.01"})
+        return httpx.Response(200, json=TINYFISH_RESPONSE_P0)
+
+    async with _client(handler) as client:
+        out = await provider.fetch(client, {"tinyfish_api_key": "tf_key"},
+                                   D.DiscoveryQuery(term="roofer", location="Denver", depth=10))
+    assert calls == 2
+    assert len(out) == 2
+
+
+@pytest.mark.asyncio
+async def test_tinyfish_error_handling():
+    provider = D.TinyFish()
+
+    # 401 Unauthorized
+    async with _client(lambda r: httpx.Response(401, json={"error": "unauthorized"})) as client:
+        with pytest.raises(RuntimeError, match="Invalid or missing API key"):
+            await provider.fetch(client, {"tinyfish_api_key": "bad"}, D.DiscoveryQuery(term="roofer"))
+
+    # 402 Daily allowance used
+    async with _client(lambda r: httpx.Response(402, json={"error": {"code": "INSUFFICIENT_CREDITS", "message": "Daily free Search allowance used"}})) as client:
+        with pytest.raises(RuntimeError, match="HTTP 402"):
+            await provider.fetch(client, {"tinyfish_api_key": "tf"}, D.DiscoveryQuery(term="roofer"))
+
+    # 429 Repeated failure
+    async with _client(lambda r: httpx.Response(429, headers={"Retry-After": "0.01"})) as client:
+        with pytest.raises(RuntimeError, match="rate limited"):
+            await provider.fetch(client, {"tinyfish_api_key": "tf"}, D.DiscoveryQuery(term="roofer"))
+
+    # Missing API key in env
+    async with _client(lambda r: httpx.Response(200, json={})) as client:
+        with pytest.raises(RuntimeError, match="needs TINYFISH_API_KEY in .env"):
+            await provider.fetch(client, {}, D.DiscoveryQuery(term="roofer"))
+
+
+@pytest.mark.asyncio
 async def test_dataforseo_errors_surface_the_message_not_just_the_code():
     """A bare status code costs several wrong guesses; the body usually makes
     the problem obvious."""
@@ -467,9 +598,14 @@ def test_dataforseo_sandbox_is_never_the_live_host():
 
 
 def test_provider_menu_explains_cost_and_configuration():
-    menu = {m["key"]: m for m in D.provider_menu({"serper_api_key": "k"})}
+    menu = {m["key"]: m for m in D.provider_menu({"serper_api_key": "k", "tinyfish_api_key": "tf"})}
     assert menu["osm"]["configured"] is True and not menu["osm"]["needs_key"]
     assert menu["serper"]["configured"] is True
+    assert menu["tinyfish"]["configured"] is True
+    assert menu["tinyfish"]["needs_key"] is True
+    assert menu["tinyfish"]["cost_note"] == "free"
+    assert "30 searches a minute" in menu["tinyfish"]["free_tier"]
+    assert "500 an hour" in menu["tinyfish"]["free_tier"]
     assert menu["dataforseo_listings"]["configured"] is False
     assert menu["dataforseo_listings"]["env_keys"] == [
         "DATAFORSEO_LOGIN", "DATAFORSEO_PASSWORD"]
@@ -485,11 +621,18 @@ def test_the_default_provider_needs_no_account():
 
 
 @pytest.mark.asyncio
-async def test_unconfigured_provider_says_which_key_is_missing(state, config):
+async def test_unconfigured_provider_says_which_key_is_missing(state, config, monkeypatch):
+    from harvey.config import EnvConfig
+    monkeypatch.setattr("harvey.config.load_env", lambda: EnvConfig())
     report = await D.run_discovery(state, config, "dataforseo_listings",
                                    [D.DiscoveryQuery(term="roofer")])
     assert report.stopped == "not configured"
     assert "DATAFORSEO_LOGIN" in report.errors[0]
+
+    tf_report = await D.run_discovery(state, config, "tinyfish",
+                                      [D.DiscoveryQuery(term="roofer")])
+    assert tf_report.stopped == "not configured"
+    assert "TINYFISH_API_KEY" in tf_report.errors[0]
 
 
 def test_unknown_provider_fails_loudly():
@@ -765,3 +908,127 @@ def test_homepage_prefers_stronger_brand_over_longer_partial_match():
     html = ('<meta property="og:site_name" content="Kettleman Landscaping">'
             '<title>Landscaping Professionals</title>')
     assert D.site_name_from_html(html, "kettlemanlandscaping.com") == "Kettleman Landscaping"
+
+
+def test_tinyfish_measures_no_rank_signal():
+    """A TinyFish run must not mark businesses Serper ranked as 'gone'."""
+    assert D.TinyFish().rank_codes == ()
+
+
+@pytest.mark.asyncio
+async def test_tinyfish_paces_itself_under_30_a_minute(monkeypatch):
+    provider = D.TinyFish()
+    waits = []
+
+    async def _sleep(seconds):
+        waits.append(seconds)
+    monkeypatch.setattr(D.asyncio, "sleep", _sleep)
+    items = [{"url": f"https://biz{i}.example", "title": f"Biz {i}"} for i in range(10)]
+    async with _client(lambda r: httpx.Response(200, json={"results": items})) as client:
+        await provider.fetch(client, {"tinyfish_api_key": "tf"},
+                             D.DiscoveryQuery(term="roofer", location="Denver", depth=30))
+        await provider.fetch(client, {"tinyfish_api_key": "tf"},
+                             D.DiscoveryQuery(term="plumber", location="Denver", depth=10))
+    # four requests, so three waits, each long enough for 30 a minute
+    assert len([w for w in waits if w >= D.TinyFish.MIN_INTERVAL - 0.1]) >= 3
+
+
+@pytest.mark.asyncio
+async def test_tinyfish_rate_limit_names_the_real_limits(monkeypatch):
+    async def _sleep(seconds):
+        return None
+    monkeypatch.setattr(D.asyncio, "sleep", _sleep)
+    async with _client(lambda r: httpx.Response(429, headers={"Retry-After": "1"})) as client:
+        with pytest.raises(RuntimeError) as exc:
+            await D.TinyFish().fetch(client, {"tinyfish_api_key": "tf"},
+                                     D.DiscoveryQuery(term="roofer"))
+    assert "30" in str(exc.value) and "500 an hour" in str(exc.value)
+
+
+def test_tinyfish_docs_state_the_published_limits():
+    from harvey.paths import PROJECT_ROOT
+    for name in ("README.md", "CLAUDE.md", ".env.example", "CHANGELOG.md"):
+        text = (PROJECT_ROOT / name).read_text(encoding="utf-8")
+        for claim in ("12,000 free", "12,000 queries", "12,000 searches", "12k free"):
+            assert claim not in text, (name, claim)
+
+
+# ── Review round: a provider out of allowance stops the run ──
+
+class _Exhausted(FakeProvider):
+    key = "fake"
+
+    async def fetch(self, client, env, query):
+        self.calls += 1
+        raise D.ProviderExhausted("TinyFish's 500 searches an hour are used up")
+
+
+@pytest.mark.asyncio
+async def test_a_provider_out_of_allowance_stops_the_run(state, config, register):
+    provider = register(_Exhausted([]))
+    q = [D.DiscoveryQuery(term="roofer", location=c) for c in ("a", "b", "c")]
+    report = await D.run_discovery(state, config, "fake", q, max_spend=5.0)
+    assert provider.calls == 1
+    assert "500 searches an hour" in report.stopped
+
+
+@pytest.mark.asyncio
+async def test_tinyfish_stops_before_the_hourly_allowance_is_spent():
+    provider = D.TinyFish()
+    calls = 0
+
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"results": [{"url": f"https://b{calls}.example",
+                                                      "title": "B"}]})
+    async with _client(handler) as client:
+        with pytest.raises(D.ProviderExhausted):
+            for _ in range(D.TinyFish.HOURLY_LIMIT + 5):
+                await provider.fetch(client, {"tinyfish_api_key": "tf"},
+                                     D.DiscoveryQuery(term="roofer", depth=10))
+    assert calls <= D.TinyFish.HOURLY_LIMIT
+
+
+@pytest.mark.asyncio
+async def test_tinyfish_rate_limited_twice_stops_the_run_not_the_phrase():
+    async with _client(lambda r: httpx.Response(429, headers={"Retry-After": "1"})) as client:
+        with pytest.raises(D.ProviderExhausted):
+            await D.TinyFish().fetch(client, {"tinyfish_api_key": "tf"},
+                                     D.DiscoveryQuery(term="roofer"))
+
+
+@pytest.mark.asyncio
+async def test_tinyfish_skips_a_malformed_item_and_keeps_the_rest():
+    page0 = {"results": [{"url": f"https://b{i}.example", "title": "B"} for i in range(10)]}
+    page1 = {"results": [None, "junk", {"title": "no url", "site_name": "Example Roofing"},
+                         {"url": "https://kept.example", "title": "Kept"}]}
+
+    def handler(request):
+        return httpx.Response(200, json=page0 if request.url.params.get("page") == "0" else page1)
+    async with _client(handler) as client:
+        out = await D.TinyFish().fetch(client, {"tinyfish_api_key": "tf"},
+                                       D.DiscoveryQuery(term="roofer", depth=20))
+    domains = [b.domain for b in out]
+    assert len(domains) == 11 and domains[-1] == "kept.example"
+
+
+@pytest.mark.asyncio
+async def test_tinyfish_a_non_object_body_is_an_error_not_a_crash():
+    async with _client(lambda r: httpx.Response(200, json=["not", "an", "object"])) as client:
+        with pytest.raises(RuntimeError, match="unexpected"):
+            await D.TinyFish().fetch(client, {"tinyfish_api_key": "tf"},
+                                     D.DiscoveryQuery(term="roofer"))
+
+
+def test_tinyfish_pacing_works_across_event_loops():
+    """The registry's one instance is used by runs in different loops."""
+    provider = D.TinyFish()
+    ok = httpx.Response(200, json={"results": []})
+
+    async def one():
+        async with _client(lambda r: ok) as client:
+            await provider.fetch(client, {"tinyfish_api_key": "tf"},
+                                 D.DiscoveryQuery(term="roofer"))
+    asyncio.run(one())
+    asyncio.run(one())

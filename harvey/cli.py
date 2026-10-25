@@ -562,9 +562,10 @@ def cmd_discover(args):
 
     async def _discover():
         if args.providers:
+            from harvey.config import load_env
             print("\n  Discovery providers")
             print("  " + "=" * 68)
-            for m in provider_menu():
+            for m in provider_menu(load_env().model_dump()):
                 mark = "ready" if m["configured"] else "needs setup"
                 print(f"\n  {m['label']}  [{m['key']}]  ({mark})")
                 print(f"    {m['blurb']}")
@@ -934,7 +935,7 @@ def main():
                      help="Hard cap in dollars (default: 1.00)")
     sub.add_argument("--preset", default="", choices=["", "yc", "hiring", "accelerator", "funding"],
                      help="A built-in search instead of your ICP's industries "
-                          "(each needs serper or dataforseo_serp). "
+                          "(each needs a search provider like tinyfish, serper or dataforseo_serp). "
                           "yc: startups whose own site says they're YC-backed; "
                           "hiring: companies whose own careers pages list one of "
                           "your hiring_signals roles (else ICP titles); "

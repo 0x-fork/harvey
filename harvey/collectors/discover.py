@@ -21,6 +21,7 @@ already learned.
 """
 
 import asyncio
+import time
 import base64
 import logging
 import re
@@ -436,6 +437,12 @@ def _dfs_location(query: "DiscoveryQuery", point_suffix: str) -> dict:
 # ── Provider adapters ─────────────────────────────────────────────────
 
 
+class ProviderExhausted(RuntimeError):
+    """This provider can take no more searches in this run: its allowance or
+    rate limit is used up, or it refused the key. The run stops and says why,
+    rather than failing every remaining phrase the same way."""
+
+
 class DiscoveryProvider:
     """One way of answering "who exists".
 
@@ -806,6 +813,171 @@ class Serper(DiscoveryProvider):
         return out
 
 
+class TinyFish(DiscoveryProvider):
+    """TinyFish web search: free with a key, at 30 searches a minute and
+    500 an hour. Results are TinyFish's own ordering for the phrase, from
+    no particular place, so they find businesses but are not recorded as a
+    Google rank (SERP_RANK means a Google position searched from a point).
+    """
+    key = "tinyfish"
+    label = "TinyFish"
+    kind = "serp"
+    rank_codes = ()
+    blurb = ("Free web search with a key. Finds businesses by phrase; it "
+             "records no search rank, since its ordering isn't Google's.")
+    cost_note = "free"
+    free_tier = "free with a key, no card: 30 searches a minute, 500 an hour"
+    signup_url = "https://agent.tinyfish.ai/api-keys"
+    env_keys = ("tinyfish_api_key",)
+    caveat = ("Needs TINYFISH_API_KEY in .env. Harvey paces itself to 30 searches "
+              "a minute; a depth-30 phrase is 3 searches, so about 160 phrases an "
+              "hour fit in the 500. No SERP_RANK: use Serper or DataForSEO SERP "
+              "for rank signals.")
+
+    ENDPOINT = "https://api.search.tinyfish.ai"
+    # 30 a minute, with a little room, and a little under 500 an hour.
+    MIN_INTERVAL = 2.1
+    HOURLY_LIMIT = 490
+
+    def __init__(self):
+        self._last_call = 0.0
+        self._calls: list[float] = []      # this hour's, oldest first
+        self._lock: tuple | None = None     # (event loop, its lock)
+
+    async def _pace(self):
+        """Wait for the next free slot, or stop before the hour's allowance
+        is spent. Per process: a CLI run and a dashboard run at the same
+        time each keep their own count."""
+        loop = asyncio.get_running_loop()
+        if self._lock is None or self._lock[0] is not loop:
+            # One shared instance serves every run; a lock belongs to one loop.
+            self._lock = (loop, asyncio.Lock())
+        async with self._lock[1]:
+            now = time.monotonic()
+            self._calls = [t for t in self._calls if now - t < 3600]
+            if len(self._calls) >= self.HOURLY_LIMIT:
+                minutes = int((3600 - (now - self._calls[0])) // 60) + 1
+                raise ProviderExhausted(
+                    f"TinyFish allows 500 searches an hour and this hour's are used up. "
+                    f"Run again in about {minutes} minutes.")
+            wait = self._last_call + self.MIN_INTERVAL - now
+            if self._last_call and wait > 0:
+                await asyncio.sleep(wait)
+            self._last_call = time.monotonic()
+            self._calls.append(self._last_call)
+
+    def estimate(self, queries: list[DiscoveryQuery]) -> float:
+        return 0.0
+
+    async def fetch(self, client: httpx.AsyncClient, env: dict,
+                    query: DiscoveryQuery) -> list[Business]:
+        api_key = env.get("tinyfish_api_key", "").strip()
+        if not api_key:
+            raise RuntimeError("TinyFish needs TINYFISH_API_KEY in .env")
+
+        headers = {
+            "X-API-Key": api_key,
+            "Accept": "application/json",
+        }
+
+        # TinyFish returns up to 10 results per page, with page index 0..10.
+        # depth 30 = 3 pages (pages 0, 1, 2). Max supported page is 10.
+        pages_needed = max(1, min(11, -(-query.depth // 10)))
+        out: list[Business] = []
+
+        for page in range(pages_needed):
+
+            params = {
+                "query": query.keyword(),
+                "page": page,
+            }
+
+            r = None
+            for attempt in range(2):
+                await self._pace()
+                try:
+                    r = await client.get(self.ENDPOINT, headers=headers, params=params)
+                except httpx.HTTPError as e:
+                    if attempt == 0:
+                        await asyncio.sleep(1.0)
+                        continue
+                    raise RuntimeError(f"TinyFish search unreachable: {e}") from e
+
+                if r.status_code == 429:
+                    retry_after = 2.0
+                    try:
+                        retry_after = float(r.headers.get("Retry-After", "2"))
+                    except (ValueError, TypeError):
+                        pass
+                    if attempt == 0:
+                        await asyncio.sleep(min(60.0, max(1.0, retry_after)))
+                        continue
+                    raise ProviderExhausted(
+                        "TinyFish: rate limited (it allows 30 searches a minute and 500 an "
+                        "hour). Try again later, or with fewer phrases.")
+                break
+
+            if r is None:
+                raise RuntimeError("TinyFish: Request failed.")
+
+            if r.status_code == 401:
+                raise ProviderExhausted(
+                    "TinyFish: Invalid or missing API key (HTTP 401). "
+                    "Check TINYFISH_API_KEY in .env or get a free key at https://agent.tinyfish.ai/api-keys")
+            if r.status_code == 402:
+                err_msg = ""
+                try:
+                    err_data = r.json()
+                    err = err_data.get("error")
+                    if isinstance(err, dict):
+                        err_msg = err.get("message", "")
+                    elif isinstance(err, str):
+                        err_msg = err
+                except Exception:
+                    pass
+                raise ProviderExhausted(
+                    f"TinyFish refused the search (HTTP 402). {err_msg}".strip())
+            r.raise_for_status()
+
+            try:
+                data = r.json()
+            except ValueError as e:
+                raise RuntimeError("TinyFish sent an unexpected answer (not JSON)") from e
+            if not isinstance(data, dict):
+                raise RuntimeError("TinyFish sent an unexpected answer (not an object)")
+            items = data.get("results") or []
+            if not isinstance(items, list) or not items:
+                break
+
+            keyword = query.keyword()
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                url = item.get("url") or ""
+                domain = normalize_domain(url) if isinstance(url, str) else ""
+                if not domain:
+                    continue
+                title = item.get("title") or ""
+                out.append(Business(
+                    name=business_name(title, domain),
+                    raw_title=title,
+                    domain=domain,
+                    website=url,
+                    location=query.location,
+                    rank=None,
+                    has_website=True,
+                    source_url=url,
+                    provider=self.key,
+                    keyword=keyword,
+                ))
+
+            # If this page returned fewer than 10 results, no more pages exist.
+            if len(items) < 10:
+                break
+
+        return out
+
+
 class OpenStreetMap(DiscoveryProvider):
     """Genuinely free, no account, no key. Honest about what that costs you.
 
@@ -948,6 +1120,7 @@ class OpenStreetMap(DiscoveryProvider):
 PROVIDERS: dict[str, DiscoveryProvider] = {
     p.key: p for p in (
         OpenStreetMap(),
+        TinyFish(),
         DataForSEOListings(),
         DataForSEOSerp(),
         DataForSEOMaps(),
@@ -1252,6 +1425,10 @@ async def run_discovery(
                     provider.last_cost = 0.0
                     found = await provider.fetch(client, env, query)
                     report.actual_cost += provider.last_cost
+                except ProviderExhausted as e:
+                    logger.warning("discover: %s stopped: %s", provider_key, e)
+                    report.stopped = str(e)
+                    break
                 except Exception as e:
                     # A failure is an observation about the run, not a reason
                     # to lose the queries that already succeeded.
