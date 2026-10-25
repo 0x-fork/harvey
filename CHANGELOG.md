@@ -140,6 +140,24 @@ minor versions can still change behaviour.
 
 ### Changed
 
+- **Precleared is told the recipient's country Harvey already knows.** The
+  send window works out where a company is (a country, US state, Canadian
+  province or Australian state in its location, or a code that is a state
+  and a country too once the cached coordinates settle it); the compliance
+  check used to ask Precleared about the address with none of it, so
+  Precleared had to find the country again and, when it couldn't, answered
+  `unknown` and the email failed. Harvey now sends that country as
+  `recipient_country` when it is sure of it, which Precleared takes as
+  settled. Nothing it is not sure of is sent: "Berlin, DE" with no
+  coordinates reads as Delaware by convention and goes without a country,
+  as do a bare city and coordinates alone. Without a certain country,
+  `prospect_country` goes as the default, as before, and with that unset
+  the one country every `icp.geography` entry is in now serves as that
+  default; Precleared uses a default only when its own lookups show
+  nothing. The country joins the cache fingerprint only when it is set, so
+  cached verdicts are kept, and an address Harvey later becomes sure of is
+  re-checked once unless Precleared had found the same country itself.
+  `docs/precleared.md` describes the check in full.
 - **Scout reads a company's site the way a person would.** It starts at the
   homepage and follows the site's own menu to its team, about, our-story,
   meet-the-doctors or attorneys pages (six pages at most), instead of
