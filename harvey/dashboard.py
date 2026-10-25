@@ -27,7 +27,7 @@ logger = logging.getLogger("harvey.dashboard")
 
 from harvey import dashboard_auth as auth  # noqa: E402
 from harvey.paths import PROJECT_ROOT  # noqa: E402
-from harvey.pidfile import pid_alive  # noqa: E402
+from harvey.pidfile import LOCK_FILE, loop_lock_held, pid_alive  # noqa: E402
 from harvey.textio import read_user_text  # noqa: E402
 DB_PATH = PROJECT_ROOT / "data" / "harvey.db"
 ENV_FILE = PROJECT_ROOT / ".env"
@@ -169,7 +169,9 @@ def _check_harvey_pid() -> int | None:
         except (OSError, ValueError):
             pid = None
         # pid_alive, never os.kill(pid, 0): on Windows that terminates the loop.
-        if pid is not None and pid_alive(pid):
+        # And only while a loop holds the lock: after a crash or a reboot the
+        # PID can belong to an unrelated program, which Stop must not signal.
+        if pid is not None and pid_alive(pid) and loop_lock_held(LOCK_FILE):
             return pid
         try:
             PID_FILE.unlink(missing_ok=True)

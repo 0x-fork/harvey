@@ -4,6 +4,11 @@
 Windows ``os.kill`` with any signal other than CTRL_C_EVENT/CTRL_BREAK_EVENT
 calls TerminateProcess — the "check" would kill the loop it was checking. So
 Windows asks the kernel instead (OpenProcess + GetExitCodeProcess).
+
+A PID file can outlive its loop (a crash, a reboot) and name whatever process
+later got that number, so the running loop also holds an OS lock on
+data/harvey.lock. The OS drops the lock when the loop dies, however it dies:
+a live PID with nobody holding the lock is not Harvey, and is never signalled.
 """
 
 import logging
@@ -16,6 +21,7 @@ from harvey.paths import PROJECT_ROOT
 logger = logging.getLogger("harvey.pidfile")
 
 PID_FILE = PROJECT_ROOT / "data" / "harvey.pid"
+LOCK_FILE = PROJECT_ROOT / "data" / "harvey.lock"
 
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _STILL_ACTIVE = 259
@@ -90,3 +96,72 @@ def remove_pid_file(path: Path | None = None) -> None:
             path.unlink(missing_ok=True)
         except OSError as e:
             logger.warning("Could not remove PID file: %s", e)
+
+
+def _try_lock(handle) -> bool:
+    """Take an exclusive lock on ``handle`` without waiting."""
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
+
+
+def _unlock(handle) -> None:
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+def hold_loop_lock(path: Path | None = None):
+    """Take the loop lock for this process's lifetime, or None if another
+    loop already holds it. Keep the returned handle open while running."""
+    path = path or LOCK_FILE
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(path, "a+b")
+    except OSError as e:
+        logger.warning("Could not open the loop lock: %s", e)
+        return None
+    if not _try_lock(handle):
+        handle.close()
+        return None
+    return handle
+
+
+def release_loop_lock(handle) -> None:
+    if handle is None:
+        return
+    _unlock(handle)
+    handle.close()
+
+
+def loop_lock_held(path: Path | None = None) -> bool:
+    """True while some Harvey loop holds the lock. Probing never keeps it."""
+    path = path or LOCK_FILE
+    if not path.exists():
+        return False
+    try:
+        handle = open(path, "a+b")
+    except OSError:
+        return False
+    try:
+        if _try_lock(handle):
+            _unlock(handle)
+            return False
+        return True
+    finally:
+        handle.close()

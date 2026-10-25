@@ -15,7 +15,9 @@ from harvey.config import (
     compliance_notice, send_window_of,
 )
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS
-from harvey.pidfile import remove_pid_file, write_pid_file
+from harvey.pidfile import (
+    LOCK_FILE, hold_loop_lock, read_pid, release_loop_lock, remove_pid_file, write_pid_file,
+)
 from harvey.pipeline import run_profile_stage
 from harvey.state import StateManager
 
@@ -539,7 +541,14 @@ def main():
         asyncio.run(run_setup())
         return
 
-    # Record the loop so the dashboard sees it however it was started.
+    # One loop at a time: two would both drain the same Outbox. The lock
+    # also tells the dashboard the PID file names a live loop.
+    lock = hold_loop_lock(LOCK_FILE)
+    if lock is None:
+        running = read_pid()
+        print(f"Harvey is already running{f' (pid {running})' if running else ''}. "
+              "Stop it first, from the dashboard or with Ctrl+C in its terminal.")
+        sys.exit(1)
     write_pid_file()
     try:
         asyncio.run(_run_with_signals())
@@ -547,6 +556,7 @@ def main():
         logger.info("Goodbye.")
     finally:
         remove_pid_file()
+        release_loop_lock(lock)
 
 
 if __name__ == "__main__":

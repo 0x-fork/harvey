@@ -170,6 +170,22 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- **The dashboard's Start and Stop work, on Windows and everywhere else.**
+  Start launched `python -m harvey` with no command, so the loop printed the
+  help and exited; it now runs `harvey run`, and finds `claude` in
+  `~/.local/bin` when the native installer left it off PATH. On Windows the
+  "is it running?" check was `os.kill(pid, 0)`, which there terminates the
+  process it asks about, and a stale PID file made the status and Start
+  return 500. The check now asks the OS without signalling. `harvey run`
+  records itself too, so a loop started in a terminal shows as running, and
+  holds a lock on `data/harvey.lock`: a PID file left by a crash or a reboot
+  can name an unrelated program, which is now reported as stopped and never
+  signalled, and a second `harvey run` refuses to start while one is
+  running. (From #91 and #90.)
+
+- **`{{company}}'s` reads right for names ending in "s"**: "Parkes Builders'",
+  not "Parkes Builders's". (From #90.)
+
 - **LinkedIn-profile web searches run only when LinkedIn prospecting is on**
   (from #60 by FreemanGT). Searching `site:linkedin.com/in` for your titles
   found names with no company and no email, which Harvey can never verify
