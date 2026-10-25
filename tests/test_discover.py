@@ -951,3 +951,84 @@ def test_tinyfish_docs_state_the_published_limits():
         text = (PROJECT_ROOT / name).read_text(encoding="utf-8")
         for claim in ("12,000 free", "12,000 queries", "12,000 searches", "12k free"):
             assert claim not in text, (name, claim)
+
+
+# ── Review round: a provider out of allowance stops the run ──
+
+class _Exhausted(FakeProvider):
+    key = "fake"
+
+    async def fetch(self, client, env, query):
+        self.calls += 1
+        raise D.ProviderExhausted("TinyFish's 500 searches an hour are used up")
+
+
+@pytest.mark.asyncio
+async def test_a_provider_out_of_allowance_stops_the_run(state, config, register):
+    provider = register(_Exhausted([]))
+    q = [D.DiscoveryQuery(term="roofer", location=c) for c in ("a", "b", "c")]
+    report = await D.run_discovery(state, config, "fake", q, max_spend=5.0)
+    assert provider.calls == 1
+    assert "500 searches an hour" in report.stopped
+
+
+@pytest.mark.asyncio
+async def test_tinyfish_stops_before_the_hourly_allowance_is_spent():
+    provider = D.TinyFish()
+    calls = 0
+
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"results": [{"url": f"https://b{calls}.example",
+                                                      "title": "B"}]})
+    async with _client(handler) as client:
+        with pytest.raises(D.ProviderExhausted):
+            for _ in range(D.TinyFish.HOURLY_LIMIT + 5):
+                await provider.fetch(client, {"tinyfish_api_key": "tf"},
+                                     D.DiscoveryQuery(term="roofer", depth=10))
+    assert calls <= D.TinyFish.HOURLY_LIMIT
+
+
+@pytest.mark.asyncio
+async def test_tinyfish_rate_limited_twice_stops_the_run_not_the_phrase():
+    async with _client(lambda r: httpx.Response(429, headers={"Retry-After": "1"})) as client:
+        with pytest.raises(D.ProviderExhausted):
+            await D.TinyFish().fetch(client, {"tinyfish_api_key": "tf"},
+                                     D.DiscoveryQuery(term="roofer"))
+
+
+@pytest.mark.asyncio
+async def test_tinyfish_skips_a_malformed_item_and_keeps_the_rest():
+    page0 = {"results": [{"url": f"https://b{i}.example", "title": "B"} for i in range(10)]}
+    page1 = {"results": [None, "junk", {"title": "no url", "site_name": "Example Roofing"},
+                         {"url": "https://kept.example", "title": "Kept"}]}
+
+    def handler(request):
+        return httpx.Response(200, json=page0 if request.url.params.get("page") == "0" else page1)
+    async with _client(handler) as client:
+        out = await D.TinyFish().fetch(client, {"tinyfish_api_key": "tf"},
+                                       D.DiscoveryQuery(term="roofer", depth=20))
+    domains = [b.domain for b in out]
+    assert len(domains) == 11 and domains[-1] == "kept.example"
+
+
+@pytest.mark.asyncio
+async def test_tinyfish_a_non_object_body_is_an_error_not_a_crash():
+    async with _client(lambda r: httpx.Response(200, json=["not", "an", "object"])) as client:
+        with pytest.raises(RuntimeError, match="unexpected"):
+            await D.TinyFish().fetch(client, {"tinyfish_api_key": "tf"},
+                                     D.DiscoveryQuery(term="roofer"))
+
+
+def test_tinyfish_pacing_works_across_event_loops():
+    """The registry's one instance is used by runs in different loops."""
+    provider = D.TinyFish()
+    ok = httpx.Response(200, json={"results": []})
+
+    async def one():
+        async with _client(lambda r: ok) as client:
+            await provider.fetch(client, {"tinyfish_api_key": "tf"},
+                                 D.DiscoveryQuery(term="roofer"))
+    asyncio.run(one())
+    asyncio.run(one())

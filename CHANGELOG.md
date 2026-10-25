@@ -33,7 +33,9 @@ minor versions can still change behaviour.
   --provider tinyfish` (or *TinyFish* on the Discover tab) finds businesses
   by phrase with a free `TINYFISH_API_KEY`, no card, and runs the `yc`,
   `hiring`, `accelerator` and `funding` presets. Harvey paces it to its
-  published limits, 30 searches a minute and 500 an hour. It records no
+  published limits, 30 searches a minute and 500 an hour, and a run that
+  uses up the hour (or is refused the key) stops and says why instead of
+  failing every remaining phrase. It records no
   `SERP_RANK`: TinyFish's ordering isn't Google's and its search takes no
   location, so rank signals still come from Serper or DataForSEO SERP, and
   a TinyFish run never marks a business they ranked as gone. Scout also

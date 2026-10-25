@@ -437,6 +437,12 @@ def _dfs_location(query: "DiscoveryQuery", point_suffix: str) -> dict:
 # ── Provider adapters ─────────────────────────────────────────────────
 
 
+class ProviderExhausted(RuntimeError):
+    """This provider can take no more searches in this run: its allowance or
+    rate limit is used up, or it refused the key. The run stops and says why,
+    rather than failing every remaining phrase the same way."""
+
+
 class DiscoveryProvider:
     """One way of answering "who exists".
 
@@ -829,17 +835,36 @@ class TinyFish(DiscoveryProvider):
               "for rank signals.")
 
     ENDPOINT = "https://api.search.tinyfish.ai"
-    # 30 a minute, with a little room.
+    # 30 a minute, with a little room, and a little under 500 an hour.
     MIN_INTERVAL = 2.1
+    HOURLY_LIMIT = 490
 
     def __init__(self):
         self._last_call = 0.0
+        self._calls: list[float] = []      # this hour's, oldest first
+        self._lock: tuple | None = None     # (event loop, its lock)
 
     async def _pace(self):
-        wait = self._last_call + self.MIN_INTERVAL - time.monotonic()
-        if self._last_call and wait > 0:
-            await asyncio.sleep(wait)
-        self._last_call = time.monotonic()
+        """Wait for the next free slot, or stop before the hour's allowance
+        is spent. Per process: a CLI run and a dashboard run at the same
+        time each keep their own count."""
+        loop = asyncio.get_running_loop()
+        if self._lock is None or self._lock[0] is not loop:
+            # One shared instance serves every run; a lock belongs to one loop.
+            self._lock = (loop, asyncio.Lock())
+        async with self._lock[1]:
+            now = time.monotonic()
+            self._calls = [t for t in self._calls if now - t < 3600]
+            if len(self._calls) >= self.HOURLY_LIMIT:
+                minutes = int((3600 - (now - self._calls[0])) // 60) + 1
+                raise ProviderExhausted(
+                    f"TinyFish allows 500 searches an hour and this hour's are used up. "
+                    f"Run again in about {minutes} minutes.")
+            wait = self._last_call + self.MIN_INTERVAL - now
+            if self._last_call and wait > 0:
+                await asyncio.sleep(wait)
+            self._last_call = time.monotonic()
+            self._calls.append(self._last_call)
 
     def estimate(self, queries: list[DiscoveryQuery]) -> float:
         return 0.0
@@ -887,15 +912,16 @@ class TinyFish(DiscoveryProvider):
                     if attempt == 0:
                         await asyncio.sleep(min(60.0, max(1.0, retry_after)))
                         continue
-                    raise RuntimeError("TinyFish: rate limited (it allows 30 searches a minute "
-                                       "and 500 an hour). Try again later, or with fewer phrases.")
+                    raise ProviderExhausted(
+                        "TinyFish: rate limited (it allows 30 searches a minute and 500 an "
+                        "hour). Try again later, or with fewer phrases.")
                 break
 
             if r is None:
                 raise RuntimeError("TinyFish: Request failed.")
 
             if r.status_code == 401:
-                raise RuntimeError(
+                raise ProviderExhausted(
                     "TinyFish: Invalid or missing API key (HTTP 401). "
                     "Check TINYFISH_API_KEY in .env or get a free key at https://agent.tinyfish.ai/api-keys")
             if r.status_code == 402:
@@ -909,19 +935,26 @@ class TinyFish(DiscoveryProvider):
                         err_msg = err
                 except Exception:
                     pass
-                raise RuntimeError(
+                raise ProviderExhausted(
                     f"TinyFish refused the search (HTTP 402). {err_msg}".strip())
             r.raise_for_status()
 
-            data = r.json()
+            try:
+                data = r.json()
+            except ValueError as e:
+                raise RuntimeError("TinyFish sent an unexpected answer (not JSON)") from e
+            if not isinstance(data, dict):
+                raise RuntimeError("TinyFish sent an unexpected answer (not an object)")
             items = data.get("results") or []
-            if not items:
+            if not isinstance(items, list) or not items:
                 break
 
             keyword = query.keyword()
             for item in items:
+                if not isinstance(item, dict):
+                    continue
                 url = item.get("url") or ""
-                domain = normalize_domain(url or item.get("site_name") or "")
+                domain = normalize_domain(url) if isinstance(url, str) else ""
                 if not domain:
                     continue
                 title = item.get("title") or ""
@@ -1392,6 +1425,10 @@ async def run_discovery(
                     provider.last_cost = 0.0
                     found = await provider.fetch(client, env, query)
                     report.actual_cost += provider.last_cost
+                except ProviderExhausted as e:
+                    logger.warning("discover: %s stopped: %s", provider_key, e)
+                    report.stopped = str(e)
+                    break
                 except Exception as e:
                     # A failure is an observation about the run, not a reason
                     # to lose the queries that already succeeded.
