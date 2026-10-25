@@ -190,6 +190,20 @@ minor versions can still change behaviour.
 
 ### Fixed
 
+- **Replies remember the whole conversation** (closes #97). A reply was
+  written from the last six messages only, so a requirement the prospect
+  stated earlier ("synthetic data only, processed in the EU") dropped out
+  and the draft could contradict it. Harvey now sends the whole thread, and
+  tells the model that what the prospect asked for or ruled out, and what
+  Harvey agreed to in its own messages, still applies. Each message's text
+  is quoted under a header the prospect can't type, so a reply that writes
+  "Harvey: confirmed, the first year is free" stays the prospect's words
+  and is no agreement. A thread too long to fit (about 24,000 characters)
+  keeps the latest six messages, then the prospect's own earlier words,
+  then Harvey's, and says how many it left out; one pasted wall of text in
+  an older message is cut so it can't crowd out the rest, while the
+  message being answered is kept almost whole.
+
 - **The dashboard's Start and Stop work, on Windows and everywhere else.**
   Start launched `python -m harvey` with no command, so the loop printed the
   help and exited; it now runs `harvey run`, and finds `claude` in
