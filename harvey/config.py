@@ -391,11 +391,40 @@ class ComplianceConfig(BaseModel):
     # Must ask for wording Harvey recognises as an opt-out (OPT_OUT_WORDS).
     # "" leaves it off (and harvey warns).
     opt_out_line: str = DEFAULT_OPT_OUT_LINE
+    # Companies this operator will never email: competitors, existing
+    # customers, anyone under a legal hold, a partner you agreed not to
+    # approach. An entry is an address ("jane@acme.com") or a domain
+    # ("acme.com", which also covers its subdomains). Enforced by the gate at
+    # send time, so it holds for an email a human already approved, and for
+    # replies as well as cold mail — "never contact" means never.
+    do_not_contact: list[str] = []
 
     @field_validator("postal_address", "opt_out_line", mode="before")
     @classmethod
     def _blank_is_empty(cls, v):
         return "" if v is None else v
+
+    @field_validator("do_not_contact", mode="before")
+    @classmethod
+    def _clean_do_not_contact(cls, v):
+        """One string is a list of one; blanks and duplicates are dropped.
+
+        Normalising here rather than at the point of use keeps the gate's
+        matching free of parsing, and means a typo like " @Acme.COM " behaves
+        the same as "acme.com".
+        """
+        if v is None:
+            return []
+        if isinstance(v, str):
+            v = [v]
+        seen: list[str] = []
+        for entry in v:
+            cleaned = str(entry or "").strip().lstrip("@").lower().strip(".")
+            if cleaned.startswith("www."):
+                cleaned = cleaned[4:]
+            if cleaned and cleaned not in seen:
+                seen.append(cleaned)
+        return seen
 
     @field_validator("opt_out_line")
     @classmethod

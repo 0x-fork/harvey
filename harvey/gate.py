@@ -46,6 +46,33 @@ class GateResult:
         return self.ok
 
 
+def do_not_contact_match(to_email: str, entries) -> str:
+    """The do-not-contact entry ``to_email`` matches, or "".
+
+    An entry with an "@" is one address. Anything else is a domain and covers
+    its subdomains, matched on a label boundary so "acme.com" blocks
+    "mail.acme.com" without also blocking "notacme.com" — a suffix test
+    without that boundary is the classic way a blocklist overreaches.
+
+    Entries are expected already normalised by ComplianceConfig; this lowers
+    and strips anyway so a hand-built tuple behaves the same way.
+    """
+    address = _host(to_email)
+    if not address or "@" not in address or not entries:
+        return ""
+    host = _host(address.rsplit("@", 1)[1])
+    for raw in entries:
+        entry = _host(str(raw or "").strip().lstrip("@"))
+        if not entry:
+            continue
+        if "@" in entry:
+            if entry == address:
+                return entry
+        elif host == entry or host.endswith("." + entry):
+            return entry
+    return ""
+
+
 def pre_send_check(
     to_email: str,
     subject: str,
@@ -54,10 +81,12 @@ def pre_send_check(
     allow_risky: bool = False,
     kind: str = "sequence",
     postal_address: str = "",
+    do_not_contact=(),
 ) -> GateResult:
     """Run every deterministic check. Returns ok=False with reasons on any hit.
 
     postal_address: when set, a cold (sequence) email must carry it (CAN-SPAM).
+    do_not_contact: addresses and domains that must never be emailed at all.
     """
     reasons: list[str] = []
     subject = (subject or "").strip()
@@ -67,6 +96,12 @@ def pre_send_check(
     # Recipient sanity
     if not EMAIL_RE.match(to_email):
         reasons.append(f"invalid recipient address '{to_email}'")
+    # Deliberately not limited to kind == "sequence": a reply is still contact,
+    # and a list that lets automated replies through is not a do-not-contact
+    # list. The operator can still answer by hand.
+    blocked = do_not_contact_match(to_email, do_not_contact)
+    if blocked:
+        reasons.append(f"'{blocked}' is on the do-not-contact list")
     if prospect is not None:
         if (prospect.email or "").strip().lower() != to_email:
             reasons.append("recipient does not match the prospect record")

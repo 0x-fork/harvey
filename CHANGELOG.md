@@ -9,6 +9,19 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **A do-not-contact list, enforced at send time.** `compliance.do_not_contact`
+  takes addresses and domains Harvey must never email: competitors, your
+  existing customers, anyone under a legal hold, a partner you agreed not to
+  approach. A domain covers its subdomains, matched on a label boundary, so
+  `acme.example` blocks `mail.acme.example` and leaves `notacme.example`
+  alone — a plain suffix test would catch the wrong company. The check runs
+  in `pre_send_check` rather than during discovery, so it is the last thing
+  before an email leaves and holds for one a human already approved in the
+  Outbox. It applies to replies as well as cold mail: a list that lets
+  automated replies through is not a do-not-contact list, and the operator
+  can still answer by hand. Entries are normalised when the config loads, so
+  ` @Acme.EXAMPLE ` and `acme.example` are the same entry.
+
 - **Open roles from the job board a company actually uses.** When a
   company's own site links or embeds a Greenhouse, Lever, Ashby or Workable
   board, profiling reads that board's public JSON feed (one request, capped

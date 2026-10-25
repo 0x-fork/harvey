@@ -674,6 +674,7 @@ class Sender:
             item["to_email"], item["subject"], self._outgoing_body(item),
             prospect=prospect, allow_risky=allow_risky, kind=item["kind"],
             postal_address=compliance_of(self.config).postal_address,
+            do_not_contact=compliance_of(self.config).do_not_contact,
         )
         if not gate:
             logger.warning(
