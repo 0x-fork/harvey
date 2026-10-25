@@ -381,6 +381,43 @@ SERPER_RESPONSE = {"organic": [
      "position": 4},
 ]}
 
+TINYFISH_RESPONSE_P0 = {
+    "query": "roofer Denver",
+    "results": [
+        {
+            "position": 1,
+            "site_name": "summitroofing.example",
+            "title": "Summit Roofing — Denver Roof Replacement",
+            "snippet": "Trusted local roofers serving Denver metro...",
+            "url": "https://summitroofing.example/services",
+        },
+        {
+            "position": 2,
+            "site_name": "directory.example",
+            "title": "Top Roofers in Denver | Directory",
+            "snippet": "Find the best roofing pros...",
+            "url": "https://www.directory.example/companylist/denver/roofing",
+        },
+    ],
+    "total_results": 2,
+    "page": 0,
+}
+
+TINYFISH_RESPONSE_P1 = {
+    "query": "roofer Denver",
+    "results": [
+        {
+            "position": 3,
+            "site_name": "apexroofing.example",
+            "title": "Apex Roofing | Denver CO",
+            "snippet": "Commercial and residential roofing...",
+            "url": "https://apexroofing.example",
+        },
+    ],
+    "total_results": 3,
+    "page": 1,
+}
+
 
 def _client(handler):
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -445,6 +482,99 @@ async def test_serper_adapter():
 
 
 @pytest.mark.asyncio
+async def test_tinyfish_adapter():
+    provider = D.TinyFish()
+    assert provider.estimate([D.DiscoveryQuery(term="roofer")]) == 0.0
+
+    def handler(request):
+        assert request.headers.get("x-api-key") == "tf_key"
+        assert request.headers.get("accept") == "application/json"
+        assert request.url.params.get("query") == "roofer Denver"
+        return httpx.Response(200, json=TINYFISH_RESPONSE_P0)
+
+    async with _client(handler) as client:
+        out = await provider.fetch(client, {"tinyfish_api_key": "tf_key"},
+                                   D.DiscoveryQuery(term="roofer", location="Denver", depth=10))
+
+    assert len(out) == 2
+    assert out[0].domain == "summitroofing.example"
+    assert out[0].rank == 1
+    assert out[0].provider == "tinyfish"
+    assert out[0].website == "https://summitroofing.example/services"
+    assert out[0].keyword == "roofer Denver"
+    assert out[1].domain == "directory.example"
+    assert out[1].rank == 2
+
+
+@pytest.mark.asyncio
+async def test_tinyfish_adapter_pagination():
+    provider = D.TinyFish()
+    pages_called = []
+
+    def handler(request):
+        page = request.url.params.get("page")
+        pages_called.append(page)
+        if page == "0":
+            items = [{"position": i + 1, "url": f"https://biz{i}.example", "title": f"Biz {i}"} for i in range(10)]
+            return httpx.Response(200, json={"results": items, "page": 0})
+        elif page == "1":
+            return httpx.Response(200, json=TINYFISH_RESPONSE_P1)
+        return httpx.Response(200, json={"results": [], "page": int(page)})
+
+    async with _client(handler) as client:
+        out = await provider.fetch(client, {"tinyfish_api_key": "tf_key"},
+                                   D.DiscoveryQuery(term="roofer", location="Denver", depth=20))
+
+    assert pages_called == ["0", "1"]
+    assert len(out) == 11
+    assert out[-1].domain == "apexroofing.example"
+
+
+@pytest.mark.asyncio
+async def test_tinyfish_rate_limit_retry():
+    provider = D.TinyFish()
+    calls = 0
+
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(429, headers={"Retry-After": "0.01"})
+        return httpx.Response(200, json=TINYFISH_RESPONSE_P0)
+
+    async with _client(handler) as client:
+        out = await provider.fetch(client, {"tinyfish_api_key": "tf_key"},
+                                   D.DiscoveryQuery(term="roofer", location="Denver", depth=10))
+    assert calls == 2
+    assert len(out) == 2
+
+
+@pytest.mark.asyncio
+async def test_tinyfish_error_handling():
+    provider = D.TinyFish()
+
+    # 401 Unauthorized
+    async with _client(lambda r: httpx.Response(401, json={"error": "unauthorized"})) as client:
+        with pytest.raises(RuntimeError, match="Invalid or missing API key"):
+            await provider.fetch(client, {"tinyfish_api_key": "bad"}, D.DiscoveryQuery(term="roofer"))
+
+    # 402 Daily allowance used
+    async with _client(lambda r: httpx.Response(402, json={"error": {"code": "INSUFFICIENT_CREDITS", "message": "Daily free Search allowance used"}})) as client:
+        with pytest.raises(RuntimeError, match="Daily free allowance"):
+            await provider.fetch(client, {"tinyfish_api_key": "tf"}, D.DiscoveryQuery(term="roofer"))
+
+    # 429 Repeated failure
+    async with _client(lambda r: httpx.Response(429, headers={"Retry-After": "0.01"})) as client:
+        with pytest.raises(RuntimeError, match="Rate limit exceeded"):
+            await provider.fetch(client, {"tinyfish_api_key": "tf"}, D.DiscoveryQuery(term="roofer"))
+
+    # Missing API key in env
+    async with _client(lambda r: httpx.Response(200, json={})) as client:
+        with pytest.raises(RuntimeError, match="needs TINYFISH_API_KEY in .env"):
+            await provider.fetch(client, {}, D.DiscoveryQuery(term="roofer"))
+
+
+@pytest.mark.asyncio
 async def test_dataforseo_errors_surface_the_message_not_just_the_code():
     """A bare status code costs several wrong guesses; the body usually makes
     the problem obvious."""
@@ -467,9 +597,13 @@ def test_dataforseo_sandbox_is_never_the_live_host():
 
 
 def test_provider_menu_explains_cost_and_configuration():
-    menu = {m["key"]: m for m in D.provider_menu({"serper_api_key": "k"})}
+    menu = {m["key"]: m for m in D.provider_menu({"serper_api_key": "k", "tinyfish_api_key": "tf"})}
     assert menu["osm"]["configured"] is True and not menu["osm"]["needs_key"]
     assert menu["serper"]["configured"] is True
+    assert menu["tinyfish"]["configured"] is True
+    assert menu["tinyfish"]["needs_key"] is True
+    assert menu["tinyfish"]["cost_note"] == "free (12,000 queries/day free)"
+    assert menu["tinyfish"]["free_tier"] == "12,000 queries/day free, resets at 00:00 UTC"
     assert menu["dataforseo_listings"]["configured"] is False
     assert menu["dataforseo_listings"]["env_keys"] == [
         "DATAFORSEO_LOGIN", "DATAFORSEO_PASSWORD"]
@@ -485,11 +619,18 @@ def test_the_default_provider_needs_no_account():
 
 
 @pytest.mark.asyncio
-async def test_unconfigured_provider_says_which_key_is_missing(state, config):
+async def test_unconfigured_provider_says_which_key_is_missing(state, config, monkeypatch):
+    from harvey.config import EnvConfig
+    monkeypatch.setattr("harvey.config.load_env", lambda: EnvConfig())
     report = await D.run_discovery(state, config, "dataforseo_listings",
                                    [D.DiscoveryQuery(term="roofer")])
     assert report.stopped == "not configured"
     assert "DATAFORSEO_LOGIN" in report.errors[0]
+
+    tf_report = await D.run_discovery(state, config, "tinyfish",
+                                      [D.DiscoveryQuery(term="roofer")])
+    assert tf_report.stopped == "not configured"
+    assert "TINYFISH_API_KEY" in tf_report.errors[0]
 
 
 def test_unknown_provider_fails_loudly():
