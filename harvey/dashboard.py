@@ -5,6 +5,7 @@ import ipaddress
 import json
 import logging
 import os
+import shutil
 import signal
 import stat
 import subprocess
@@ -532,15 +533,23 @@ async def start_harvey():
     # Ensure data dir exists
     (PROJECT_ROOT / "data").mkdir(parents=True, exist_ok=True)
 
+    # The native Claude CLI installer puts claude in ~/.local/bin without
+    # always adding it to PATH; the heartbeat can't think without it.
+    env = os.environ.copy()
+    local_bin = Path.home() / ".local" / "bin"
+    if not shutil.which("claude") and local_bin.is_dir():
+        env["PATH"] = str(local_bin) + os.pathsep + env.get("PATH", "")
+
     try:
         log_handle = open(LOG_FILE, "a", encoding="utf-8")
         try:
             _harvey_process = subprocess.Popen(
-                [sys.executable, "-m", "harvey"],
+                [sys.executable, "-m", "harvey", "run"],
                 cwd=str(PROJECT_ROOT),
                 stdout=log_handle,
                 stderr=log_handle,
                 start_new_session=True,
+                env=env,
             )
         finally:
             # Child holds its own copies of the fds; don't leak ours.
