@@ -20,9 +20,14 @@ minor versions can still change behaviour.
   Outbox. It applies to replies as well as cold mail: a list that lets
   automated replies through is not a do-not-contact list, and the operator
   can still answer by hand. Entries are normalised when the config loads, so
-  ` @Acme.EXAMPLE `, a pasted `https://www.acme.example/about` and
-  `acme.example` are the same entry. On Instantly, which has no Outbox,
-  listed leads are left out of the upload and a reply to one goes to you.
+  ` @Acme.EXAMPLE `, a pasted `https://www.acme.example/about`,
+  `Jane Doe <jane@acme.example>` (that address) and `acme.example` behave
+  alike; an entry that names nothing is a config error, not a silent no-op.
+  An edit counts at once in a running Harvey. A listed person who writes
+  back goes to you without a draft, and `harvey export` leaves them out. On
+  Instantly, which has no Outbox, listed leads are left out of the upload
+  and a reply to one goes to you; a lead Instantly already has must be
+  removed there.
 
 - **Open roles from the job board a company actually uses.** When a
   company's own site links or embeds a Greenhouse, Lever, Ashby or Workable
