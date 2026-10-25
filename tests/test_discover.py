@@ -498,12 +498,13 @@ async def test_tinyfish_adapter():
 
     assert len(out) == 2
     assert out[0].domain == "summitroofing.example"
-    assert out[0].rank == 1
+    # TinyFish's own ordering, from no location: not a Google rank, so it is
+    # never recorded as SERP_RANK next to Serper's and DataForSEO's.
+    assert out[0].rank is None
     assert out[0].provider == "tinyfish"
     assert out[0].website == "https://summitroofing.example/services"
     assert out[0].keyword == "roofer Denver"
     assert out[1].domain == "directory.example"
-    assert out[1].rank == 2
 
 
 @pytest.mark.asyncio
@@ -560,12 +561,12 @@ async def test_tinyfish_error_handling():
 
     # 402 Daily allowance used
     async with _client(lambda r: httpx.Response(402, json={"error": {"code": "INSUFFICIENT_CREDITS", "message": "Daily free Search allowance used"}})) as client:
-        with pytest.raises(RuntimeError, match="Daily free allowance"):
+        with pytest.raises(RuntimeError, match="HTTP 402"):
             await provider.fetch(client, {"tinyfish_api_key": "tf"}, D.DiscoveryQuery(term="roofer"))
 
     # 429 Repeated failure
     async with _client(lambda r: httpx.Response(429, headers={"Retry-After": "0.01"})) as client:
-        with pytest.raises(RuntimeError, match="Rate limit exceeded"):
+        with pytest.raises(RuntimeError, match="rate limited"):
             await provider.fetch(client, {"tinyfish_api_key": "tf"}, D.DiscoveryQuery(term="roofer"))
 
     # Missing API key in env
@@ -602,8 +603,9 @@ def test_provider_menu_explains_cost_and_configuration():
     assert menu["serper"]["configured"] is True
     assert menu["tinyfish"]["configured"] is True
     assert menu["tinyfish"]["needs_key"] is True
-    assert menu["tinyfish"]["cost_note"] == "free (12,000 queries/day free)"
-    assert menu["tinyfish"]["free_tier"] == "12,000 queries/day free, resets at 00:00 UTC"
+    assert menu["tinyfish"]["cost_note"] == "free"
+    assert "30 searches a minute" in menu["tinyfish"]["free_tier"]
+    assert "500 an hour" in menu["tinyfish"]["free_tier"]
     assert menu["dataforseo_listings"]["configured"] is False
     assert menu["dataforseo_listings"]["env_keys"] == [
         "DATAFORSEO_LOGIN", "DATAFORSEO_PASSWORD"]
@@ -906,3 +908,46 @@ def test_homepage_prefers_stronger_brand_over_longer_partial_match():
     html = ('<meta property="og:site_name" content="Kettleman Landscaping">'
             '<title>Landscaping Professionals</title>')
     assert D.site_name_from_html(html, "kettlemanlandscaping.com") == "Kettleman Landscaping"
+
+
+def test_tinyfish_measures_no_rank_signal():
+    """A TinyFish run must not mark businesses Serper ranked as 'gone'."""
+    assert D.TinyFish().rank_codes == ()
+
+
+@pytest.mark.asyncio
+async def test_tinyfish_paces_itself_under_30_a_minute(monkeypatch):
+    provider = D.TinyFish()
+    waits = []
+
+    async def _sleep(seconds):
+        waits.append(seconds)
+    monkeypatch.setattr(D.asyncio, "sleep", _sleep)
+    items = [{"url": f"https://biz{i}.example", "title": f"Biz {i}"} for i in range(10)]
+    async with _client(lambda r: httpx.Response(200, json={"results": items})) as client:
+        await provider.fetch(client, {"tinyfish_api_key": "tf"},
+                             D.DiscoveryQuery(term="roofer", location="Denver", depth=30))
+        await provider.fetch(client, {"tinyfish_api_key": "tf"},
+                             D.DiscoveryQuery(term="plumber", location="Denver", depth=10))
+    # four requests, so three waits, each long enough for 30 a minute
+    assert len([w for w in waits if w >= D.TinyFish.MIN_INTERVAL - 0.1]) >= 3
+
+
+@pytest.mark.asyncio
+async def test_tinyfish_rate_limit_names_the_real_limits(monkeypatch):
+    async def _sleep(seconds):
+        return None
+    monkeypatch.setattr(D.asyncio, "sleep", _sleep)
+    async with _client(lambda r: httpx.Response(429, headers={"Retry-After": "1"})) as client:
+        with pytest.raises(RuntimeError) as exc:
+            await D.TinyFish().fetch(client, {"tinyfish_api_key": "tf"},
+                                     D.DiscoveryQuery(term="roofer"))
+    assert "30" in str(exc.value) and "500 an hour" in str(exc.value)
+
+
+def test_tinyfish_docs_state_the_published_limits():
+    from harvey.paths import PROJECT_ROOT
+    for name in ("README.md", "CLAUDE.md", ".env.example", "CHANGELOG.md"):
+        text = (PROJECT_ROOT / name).read_text(encoding="utf-8")
+        for claim in ("12,000 free", "12,000 queries", "12,000 searches", "12k free"):
+            assert claim not in text, (name, claim)

@@ -7,7 +7,7 @@ real people/companies.
 
 Search backends (in priority order):
 1. SERP API (Serper.dev) — if SERPER_API_KEY is set, reliable and fast
-2. TinyFish Search API — if TINYFISH_API_KEY is set, fast structured web search (12k free daily)
+2. TinyFish Search API — if TINYFISH_API_KEY is set (free, 30 searches a minute)
 3. DuckDuckGo HTML — free, no rate limiting, good fallback
 4. Bing — free, less aggressive than Google
 5. Google — aggressive rate limiting, used last
@@ -434,7 +434,7 @@ class Scout:
         return results[:MAX_RESULTS_PER_QUERY]
 
     async def _search_tinyfish(self, query: str, api_key: str) -> list[tuple[str, str]]:
-        """Search via TinyFish Search API — fast structured search, 12,000 free searches/day."""
+        """Search via TinyFish Search API (free with a key, 30 searches a minute)."""
         resp = await self._fetch(
             f"https://api.search.tinyfish.ai?query={quote_plus(query)}",
             headers={"X-API-Key": api_key, "Accept": "application/json"},

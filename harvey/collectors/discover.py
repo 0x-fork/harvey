@@ -21,6 +21,7 @@ already learned.
 """
 
 import asyncio
+import time
 import base64
 import logging
 import re
@@ -807,31 +808,40 @@ class Serper(DiscoveryProvider):
 
 
 class TinyFish(DiscoveryProvider):
-    """Fast web search with rank positions and 12,000 free searches every day.
-
-    The premier free SERP choice for discovering businesses and ranking signals.
-    Free tier resets daily at 00:00 UTC with no card required, giving users
-    ample volume to discover and score prospects for free.
+    """TinyFish web search: free with a key, at 30 searches a minute and
+    500 an hour. Results are TinyFish's own ordering for the phrase, from
+    no particular place, so they find businesses but are not recorded as a
+    Google rank (SERP_RANK means a Google position searched from a point).
     """
-
     key = "tinyfish"
     label = "TinyFish"
     kind = "serp"
-    rank_codes = ("SERP_RANK",)
-    blurb = ("Fast web search with rank positions and 12,000 free queries "
-             "every day. Best free choice for discovering businesses "
-             "and ranking signals.")
-    cost_note = "free (12,000 queries/day free)"
-    free_tier = "12,000 queries/day free, resets at 00:00 UTC"
+    rank_codes = ()
+    blurb = ("Free web search with a key. Finds businesses by phrase; it "
+             "records no search rank, since its ordering isn't Google's.")
+    cost_note = "free"
+    free_tier = "free with a key, no card: 30 searches a minute, 500 an hour"
     signup_url = "https://agent.tinyfish.ai/api-keys"
     env_keys = ("tinyfish_api_key",)
-    caveat = ("Requires a free TINYFISH_API_KEY in .env. Up to 12,000 free searches "
-              "per day (resets 00:00 UTC), rate-limited to 30 requests/minute.")
+    caveat = ("Needs TINYFISH_API_KEY in .env. Harvey paces itself to 30 searches "
+              "a minute; a depth-30 phrase is 3 searches, so about 160 phrases an "
+              "hour fit in the 500. No SERP_RANK: use Serper or DataForSEO SERP "
+              "for rank signals.")
 
     ENDPOINT = "https://api.search.tinyfish.ai"
+    # 30 a minute, with a little room.
+    MIN_INTERVAL = 2.1
+
+    def __init__(self):
+        self._last_call = 0.0
+
+    async def _pace(self):
+        wait = self._last_call + self.MIN_INTERVAL - time.monotonic()
+        if self._last_call and wait > 0:
+            await asyncio.sleep(wait)
+        self._last_call = time.monotonic()
 
     def estimate(self, queries: list[DiscoveryQuery]) -> float:
-        # Free up to 12,000 requests per day.
         return 0.0
 
     async def fetch(self, client: httpx.AsyncClient, env: dict,
@@ -851,8 +861,6 @@ class TinyFish(DiscoveryProvider):
         out: list[Business] = []
 
         for page in range(pages_needed):
-            if page > 0:
-                await asyncio.sleep(0.5)
 
             params = {
                 "query": query.keyword(),
@@ -861,6 +869,7 @@ class TinyFish(DiscoveryProvider):
 
             r = None
             for attempt in range(2):
+                await self._pace()
                 try:
                     r = await client.get(self.ENDPOINT, headers=headers, params=params)
                 except httpx.HTTPError as e:
@@ -876,10 +885,10 @@ class TinyFish(DiscoveryProvider):
                     except (ValueError, TypeError):
                         pass
                     if attempt == 0:
-                        await asyncio.sleep(max(1.0, retry_after))
+                        await asyncio.sleep(min(60.0, max(1.0, retry_after)))
                         continue
-                    raise RuntimeError("TinyFish: Rate limit exceeded (30 requests/minute). "
-                                       "Please wait a moment before running more queries.")
+                    raise RuntimeError("TinyFish: rate limited (it allows 30 searches a minute "
+                                       "and 500 an hour). Try again later, or with fewer phrases.")
                 break
 
             if r is None:
@@ -901,8 +910,7 @@ class TinyFish(DiscoveryProvider):
                 except Exception:
                     pass
                 raise RuntimeError(
-                    f"TinyFish: Daily free allowance used or insufficient credits (HTTP 402). "
-                    f"{err_msg or 'Allowance resets at 00:00 UTC.'}")
+                    f"TinyFish refused the search (HTTP 402). {err_msg}".strip())
             r.raise_for_status()
 
             data = r.json()
@@ -923,7 +931,7 @@ class TinyFish(DiscoveryProvider):
                     domain=domain,
                     website=url,
                     location=query.location,
-                    rank=item.get("position"),
+                    rank=None,
                     has_website=True,
                     source_url=url,
                     provider=self.key,
