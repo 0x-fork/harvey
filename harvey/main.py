@@ -15,6 +15,9 @@ from harvey.config import (
     compliance_notice, send_window_of,
 )
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS
+from harvey.pidfile import (
+    LOCK_FILE, hold_loop_lock, read_pid, release_loop_lock, remove_pid_file, write_pid_file,
+)
 from harvey.pipeline import run_profile_stage
 from harvey.state import StateManager
 
@@ -533,15 +536,31 @@ def main():
     """Entry point."""
     # Check for first-time setup
     if _needs_setup():
+        if not sys.stdin.isatty():
+            # Started by the dashboard or a service: nobody can answer the wizard.
+            print("Harvey isn't set up yet. Run `harvey setup` in a terminal first.")
+            sys.exit(1)
         print("\n  First time running Harvey? Let's get you set up.\n")
         from harvey.setup import run_setup
         asyncio.run(run_setup())
         return
 
+    # One loop at a time: two would both drain the same Outbox. The lock
+    # also tells the dashboard the PID file names a live loop.
+    lock = hold_loop_lock(LOCK_FILE)
+    if lock is None:
+        running = read_pid()
+        print(f"Harvey is already running{f' (pid {running})' if running else ''}. "
+              "Stop it first, from the dashboard or with Ctrl+C in its terminal.")
+        sys.exit(1)
+    write_pid_file()
     try:
         asyncio.run(_run_with_signals())
     except KeyboardInterrupt:
         logger.info("Goodbye.")
+    finally:
+        remove_pid_file()
+        release_loop_lock(lock)
 
 
 if __name__ == "__main__":
