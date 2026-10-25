@@ -15,6 +15,7 @@ from harvey.config import (
     compliance_notice, send_window_of,
 )
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS
+from harvey.pidfile import remove_pid_file, write_pid_file
 from harvey.pipeline import run_profile_stage
 from harvey.state import StateManager
 
@@ -538,10 +539,14 @@ def main():
         asyncio.run(run_setup())
         return
 
+    # Record the loop so the dashboard sees it however it was started.
+    write_pid_file()
     try:
         asyncio.run(_run_with_signals())
     except KeyboardInterrupt:
         logger.info("Goodbye.")
+    finally:
+        remove_pid_file()
 
 
 if __name__ == "__main__":
