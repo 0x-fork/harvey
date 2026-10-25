@@ -91,6 +91,7 @@ ZEROBOUNCE_API_KEY=         # 100 free/mo — best for M365/Workspace catch-alls
 HUNTER_API_KEY=             # 50 free/mo + pattern lookup
 
 # --- Discovery (optional — the free OpenStreetMap source needs no key) ---
+TINYFISH_API_KEY=                         # 12,000 free searches/day — best free SERP source
 DATAFORSEO_LOGIN=  DATAFORSEO_PASSWORD=   # cheapest local-business + SERP data
 DATAFORSEO_SANDBOX=                       # any value routes to the free sandbox
 

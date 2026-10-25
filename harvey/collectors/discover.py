@@ -806,6 +806,137 @@ class Serper(DiscoveryProvider):
         return out
 
 
+class TinyFish(DiscoveryProvider):
+    """Fast web search with rank positions and 12,000 free searches every day.
+
+    The premier free SERP choice for discovering businesses and ranking signals.
+    Free tier resets daily at 00:00 UTC with no card required, giving users
+    ample volume to discover and score prospects for free.
+    """
+
+    key = "tinyfish"
+    label = "TinyFish"
+    kind = "serp"
+    rank_codes = ("SERP_RANK",)
+    blurb = ("Fast web search with rank positions and 12,000 free queries "
+             "every day. Best free choice for discovering businesses "
+             "and ranking signals.")
+    cost_note = "free (12,000 queries/day free)"
+    free_tier = "12,000 queries/day free, resets at 00:00 UTC"
+    signup_url = "https://agent.tinyfish.ai/api-keys"
+    env_keys = ("tinyfish_api_key",)
+    caveat = ("Requires a free TINYFISH_API_KEY in .env. Up to 12,000 free searches "
+              "per day (resets 00:00 UTC), rate-limited to 30 requests/minute.")
+
+    ENDPOINT = "https://api.search.tinyfish.ai"
+
+    def estimate(self, queries: list[DiscoveryQuery]) -> float:
+        # Free up to 12,000 requests per day.
+        return 0.0
+
+    async def fetch(self, client: httpx.AsyncClient, env: dict,
+                    query: DiscoveryQuery) -> list[Business]:
+        api_key = env.get("tinyfish_api_key", "").strip()
+        if not api_key:
+            raise RuntimeError("TinyFish needs TINYFISH_API_KEY in .env")
+
+        headers = {
+            "X-API-Key": api_key,
+            "Accept": "application/json",
+        }
+
+        # TinyFish returns up to 10 results per page, with page index 0..10.
+        # depth 30 = 3 pages (pages 0, 1, 2). Max supported page is 10.
+        pages_needed = max(1, min(11, -(-query.depth // 10)))
+        out: list[Business] = []
+
+        for page in range(pages_needed):
+            if page > 0:
+                await asyncio.sleep(0.5)
+
+            params = {
+                "query": query.keyword(),
+                "page": page,
+            }
+
+            r = None
+            for attempt in range(2):
+                try:
+                    r = await client.get(self.ENDPOINT, headers=headers, params=params)
+                except httpx.HTTPError as e:
+                    if attempt == 0:
+                        await asyncio.sleep(1.0)
+                        continue
+                    raise RuntimeError(f"TinyFish search unreachable: {e}") from e
+
+                if r.status_code == 429:
+                    retry_after = 2.0
+                    try:
+                        retry_after = float(r.headers.get("Retry-After", "2"))
+                    except (ValueError, TypeError):
+                        pass
+                    if attempt == 0:
+                        await asyncio.sleep(max(1.0, retry_after))
+                        continue
+                    raise RuntimeError("TinyFish: Rate limit exceeded (30 requests/minute). "
+                                       "Please wait a moment before running more queries.")
+                break
+
+            if r is None:
+                raise RuntimeError("TinyFish: Request failed.")
+
+            if r.status_code == 401:
+                raise RuntimeError(
+                    "TinyFish: Invalid or missing API key (HTTP 401). "
+                    "Check TINYFISH_API_KEY in .env or get a free key at https://agent.tinyfish.ai/api-keys")
+            if r.status_code == 402:
+                err_msg = ""
+                try:
+                    err_data = r.json()
+                    err = err_data.get("error")
+                    if isinstance(err, dict):
+                        err_msg = err.get("message", "")
+                    elif isinstance(err, str):
+                        err_msg = err
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"TinyFish: Daily free allowance used or insufficient credits (HTTP 402). "
+                    f"{err_msg or 'Allowance resets at 00:00 UTC.'}")
+            r.raise_for_status()
+
+            data = r.json()
+            items = data.get("results") or []
+            if not items:
+                break
+
+            keyword = query.keyword()
+            for item in items:
+                url = item.get("url") or ""
+                domain = normalize_domain(url or item.get("site_name") or "")
+                if not domain:
+                    continue
+                title = item.get("title") or ""
+                out.append(Business(
+                    name=business_name(title, domain),
+                    raw_title=title,
+                    domain=domain,
+                    website=url,
+                    location=query.location,
+                    rank=item.get("position"),
+                    has_website=True,
+                    source_url=url,
+                    provider=self.key,
+                    keyword=keyword,
+                ))
+
+            # If this page returned fewer than 10 results, no more pages exist.
+            if len(items) < 10:
+                break
+
+        return out
+
+
 class OpenStreetMap(DiscoveryProvider):
     """Genuinely free, no account, no key. Honest about what that costs you.
 
@@ -948,6 +1079,7 @@ class OpenStreetMap(DiscoveryProvider):
 PROVIDERS: dict[str, DiscoveryProvider] = {
     p.key: p for p in (
         OpenStreetMap(),
+        TinyFish(),
         DataForSEOListings(),
         DataForSEOSerp(),
         DataForSEOMaps(),

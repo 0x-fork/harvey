@@ -9,6 +9,7 @@ minor versions can still change behaviour.
 
 ### Added
 
+<<<<<<< HEAD
 - **A do-not-contact list, enforced at send time.** `compliance.do_not_contact`
   takes addresses and domains Harvey must never email: competitors, your
   existing customers, anyone under a legal hold, a partner you agreed not to
@@ -28,6 +29,17 @@ minor versions can still change behaviour.
   Instantly, which has no Outbox, listed leads are left out of the upload
   and a reply to one goes to you; a lead Instantly already has must be
   removed there.
+=======
+- **TinyFish Search API for free SERP discovery and owner prospecting.** A new
+  free discovery provider (`harvey discover --provider tinyfish`, or *TinyFish*
+  on the dashboard) provides fast web search with 12,000 free searches every day
+  (resets at 00:00 UTC, no credit card required). TinyFish returns organic SERP
+  rank positions (`SERP_RANK`), making it an accessible zero-cost choice for
+  discovering companies and scoring search rankings without paid SERP APIs.
+  Supports all startup and hiring search presets (`yc`, `hiring`, `accelerator`,
+  `funding`). Scout also uses TinyFish as a search backend when
+  `TINYFISH_API_KEY` is set, speeding up website and owner resolution.
+>>>>>>> pr-95
 
 - **Open roles from the job board a company actually uses.** When a
   company's own site links or embeds a Greenhouse, Lever, Ashby or Workable
