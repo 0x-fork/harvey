@@ -391,11 +391,46 @@ class ComplianceConfig(BaseModel):
     # Must ask for wording Harvey recognises as an opt-out (OPT_OUT_WORDS).
     # "" leaves it off (and harvey warns).
     opt_out_line: str = DEFAULT_OPT_OUT_LINE
+    # Companies this operator will never email: competitors, existing
+    # customers, anyone under a legal hold, a partner you agreed not to
+    # approach. An entry is an address ("jane@acme.example") or a domain
+    # ("acme.example", which also covers its subdomains). Enforced by the gate at
+    # send time, so it holds for an email a human already approved, and for
+    # replies as well as cold mail — "never contact" means never.
+    do_not_contact: list[str] = []
 
     @field_validator("postal_address", "opt_out_line", mode="before")
     @classmethod
     def _blank_is_empty(cls, v):
         return "" if v is None else v
+
+    @field_validator("do_not_contact", mode="before")
+    @classmethod
+    def _clean_do_not_contact(cls, v):
+        """One string is a list; blanks and duplicates are dropped.
+
+        Normalising here rather than at the point of use keeps the gate's
+        matching free of parsing, and means " @Acme.EXAMPLE " or a pasted
+        "https://www.acme.example/" behaves the same as "acme.example". An
+        entry that names no address or domain is an error, not a no-op.
+        """
+        from harvey.gate import do_not_contact_entries
+        if v is None:
+            return []
+        if isinstance(v, str):
+            v = [v]
+        if not isinstance(v, (list, tuple)):
+            raise ValueError("must be a list of email addresses and domains")
+        seen: list[str] = []
+        for item in v:
+            if item is None:
+                continue
+            if not isinstance(item, str):
+                raise ValueError(f"{item!r} is not an email address or a domain")
+            for cleaned in do_not_contact_entries(item):
+                if cleaned not in seen:
+                    seen.append(cleaned)
+        return seen
 
     @field_validator("opt_out_line")
     @classmethod
@@ -838,6 +873,56 @@ def refresh_sending_mode(config, path=None) -> bool:
         return False
     config.channels.email.require_approval = value
     return True
+
+
+_dnc_cache: dict[str, tuple[tuple, list[str] | None]] = {}
+
+
+def live_do_not_contact(config) -> list[str]:
+    """The do-not-contact list as the config file says it is now.
+
+    Someone who sees an approved email to a company they must not contact
+    adds it to the list while Harvey runs; waiting for a restart would let
+    that email go. Re-read only when the file changed (as refresh_sending_mode
+    does). A file that can't be read, or a list with a mistake in it, keeps
+    the last good list: never an empty one.
+    """
+    compliance = compliance_of(config)
+    path = getattr(config, "_source_path", None)
+    if not path:
+        return compliance.do_not_contact
+    try:
+        target = Path(path).resolve()
+        st = target.stat()
+        stamp = (st.st_mtime_ns, st.st_size, st.st_ino, st.st_ctime_ns)
+        cached = _dnc_cache.get(str(target))
+        if cached and cached[0] == stamp:
+            value = cached[1]
+        else:
+            value = None
+            try:
+                value = do_not_contact_from_file(target)
+            except Exception as e:
+                logger.warning(f"compliance.do_not_contact in {target.name} couldn't be read "
+                               f"({e}); still using the last good list.")
+            _dnc_cache[str(target)] = (stamp, value)
+    except OSError:
+        return compliance.do_not_contact
+    if value is None:
+        return compliance.do_not_contact
+    if value != compliance.do_not_contact and isinstance(
+            getattr(config, "compliance", None), ComplianceConfig):
+        config.compliance.do_not_contact = value
+    return value
+
+
+def do_not_contact_from_file(path=None) -> list[str]:
+    """Just ``compliance.do_not_contact`` from a config file, validated.
+    Raises on a file that can't be read or a list with a mistake in it."""
+    data = yaml.safe_load(read_user_text(path or _find_config_file()))
+    section = data.get("compliance") if isinstance(data, dict) else None
+    raw = section.get("do_not_contact") if isinstance(section, dict) else None
+    return ComplianceConfig(do_not_contact=raw).do_not_contact
 
 
 def _find_config_file() -> str:

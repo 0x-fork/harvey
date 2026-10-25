@@ -106,6 +106,16 @@ compliance:
   postal_address: ""
   # Keep wording Harvey recognises as an opt-out ("no thanks", "unsubscribe").
   opt_out_line: 'Not interested? Reply "no thanks" and I won''t email again.'
+  # Never email these, cold or in reply: competitors, your existing customers,
+  # anyone under a legal hold. An entry is an address or a domain, and a domain
+  # covers its subdomains ("acme.example" also blocks "mail.acme.example", but
+  # not "notacme.example"). Checked by the gate at send time, so it holds even
+  # for an email you already approved in the Outbox, and picked up by a running
+  # Harvey at once. If you trained Harvey, set it in harvey.local.yaml instead:
+  # that file wins.
+  do_not_contact: []
+  #   - "competitor.example"
+  #   - "jane@acme.example"
   precleared:
     enabled: false
     sender_country: ""          # GB or US: where your business is based
