@@ -22,7 +22,7 @@ from harvey.config import (
     compliance_of, operator_timezone, send_window_of,
 )
 from harvey.gate import autopilot_review, pre_send_check
-from harvey.send_window import in_window, next_send_time, recipient_zone
+from harvey.send_window import in_window, next_send_time, recipient_country, recipient_zone
 from harvey.integrations.instantly import InstantlyClient
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
 from harvey.integrations.precleared import PreclearedClient, clear_hold, record_hold
@@ -101,32 +101,47 @@ class Sender:
             and self.provider is not None
         )
 
-    async def _send_zone(self, prospect, country: str = "") -> str:
+    async def _send_zone(self, prospect, country: str = "", given: str = "") -> str:
         """The time zone this recipient's send window is in: their own when
         it can be told (with recipient_timezone on), otherwise the zone in
-        usage.quiet_hours, as before."""
+        usage.quiet_hours, as before. ``country`` is the recipient's country
+        from Precleared, ``given`` the one Harvey gave the check (see
+        _recipient_country), which a cached verdict is keyed on."""
         window = send_window_of(self.config)
         if window is not None and window.recipient_timezone:
             if not country and self.precleared is not None and prospect is not None:
                 # A country Precleared already found counts on every check,
                 # not only on the one that asked it.
-                country = await self.precleared.known_country(prospect.email, self.state)
+                country = await self.precleared.known_country(prospect.email, self.state, given)
             zone = await recipient_zone(self.state, prospect, self.config, country)
             if zone:
                 return zone
         return operator_timezone(self.config)
 
-    async def _zone_or_default(self, prospect, country: str = "") -> str:
+    async def _zone_or_default(self, prospect, country: str = "", given: str = "") -> str:
         """_send_zone, but a failure to work the zone out falls back to
         usage.quiet_hours.timezone for this one email instead of stopping
         the whole drain (replies included)."""
         try:
-            return await self._send_zone(prospect, country)
+            return await self._send_zone(prospect, country, given)
         except Exception as e:
             logger.warning(
                 f"Sender: couldn't work out the time zone for "
                 f"{getattr(prospect, 'email', '?')}, using quiet_hours.timezone: {e}")
             return operator_timezone(self.config)
+
+    async def _recipient_country(self, prospect) -> str:
+        """The recipient's country when Harvey is sure of it, for the
+        compliance check (see send_window.recipient_country). A failure to
+        work it out means none for this one email, which Precleared then
+        works out itself, instead of stopping the drain."""
+        try:
+            return await recipient_country(self.state, prospect)
+        except Exception as e:
+            logger.warning(
+                f"Sender: couldn't work out the country for "
+                f"{getattr(prospect, 'email', '?')}, leaving it to Precleared: {e}")
+            return ""
 
     async def cold_due_in_window(self) -> bool:
         """Quiet hours: whether a cold email is due, inside its recipient's
@@ -788,10 +803,14 @@ class Sender:
             if order:
                 await self.state.update_outbox_item(item["id"], status=order[0], error=order[1])
                 continue
+            # The recipient's country when Harvey is sure of it: it goes with
+            # the compliance check, and a cached verdict is keyed on it.
+            country = await self._recipient_country(prospect) if needs_check else ""
             # Cold email waits for the recipient's send window, however
             # late it was approved; replies don't.
             if (window is not None and item["kind"] == "sequence"
-                    and await self._outside_window(item, await self._zone_or_default(prospect), window)):
+                    and await self._outside_window(
+                        item, await self._zone_or_default(prospect, given=country), window)):
                 outside_window += 1
                 continue
 
@@ -799,7 +818,7 @@ class Sender:
             # address, before the first cold email. Replies are never checked.
             receipt_id = ""
             if needs_check:
-                clearance = await self.precleared.clear(item["to_email"], self.state)
+                clearance = await self.precleared.clear(item["to_email"], self.state, country)
                 if clearance.held:
                     compliance_paused = True
                     hold = clearance

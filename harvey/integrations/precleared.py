@@ -9,13 +9,17 @@ id is logged with the send so the decision can be shown later.
 
 One check per address: a definite verdict is cached in the settings table for
 CACHE_DAYS, together with a fingerprint of the facts it was decided on (sender
-country, address source, product description and, if set, prospect country). A
-cached verdict is reused only while those facts are unchanged, so a three-step
-sequence costs one check but a config change forces a fresh one. Replies are
-never checked. Precleared receives the recipient's address, your sender
-country, the address source you configure, your product description (used to
-judge relevance under CASL and French rules) and, if you set one, your
-prospects' country, which it uses only when it can't work out the recipient's
+country, address source, product description and, if set, the recipient's or
+the prospects' country). A cached verdict is reused only while those facts are
+unchanged, so a three-step sequence costs one check but a config change forces
+a fresh one. Replies are never checked. Precleared receives the recipient's
+address, your sender country, the address source you configure, your product
+description (used to judge relevance under CASL and French rules) and the
+recipient's country when Harvey is sure of it from the company's location
+(``send_window.recipient_country``), which Precleared takes as settled.
+Otherwise it receives, if there is one, your prospects' country (the
+configured ``prospect_country``, or the one country every ``icp.geography``
+entry is in), which it uses only when it can't work out the recipient's
 country from the address, company records or the company's website.
 
 A response Precleared can't vouch for (network trouble, daily allowance used
@@ -45,6 +49,7 @@ from urllib.parse import unquote, urlsplit
 import httpx
 
 from harvey.config import normalize_prospect_country
+from harvey.send_window import icp_country
 
 logger = logging.getLogger("harvey.precleared")
 
@@ -112,6 +117,7 @@ class PreclearedClient:
         address_source: str = "unknown",
         pitch: str = "",
         prospect_country: str = "",
+        default_country: str = "",
         transport: httpx.AsyncBaseTransport | None = None,
     ):
         self.sender_country = sender_country
@@ -119,6 +125,10 @@ class PreclearedClient:
         self.address_source = address_source
         self.pitch = (pitch or "").strip()[:200]
         self.prospect_country = normalize_prospect_country(prospect_country)
+        # The country sent as the default when nothing names the recipient's:
+        # prospect_country, else default_country (from_config passes the one
+        # country the ICP geography is in).
+        self.default_country = self.prospect_country or normalize_prospect_country(default_country)
         self._transport = transport  # tests inject httpx.MockTransport
 
     @classmethod
@@ -135,6 +145,7 @@ class PreclearedClient:
             address_source=settings.address_source,
             pitch=getattr(product, "description", ""),
             prospect_country=getattr(settings, "prospect_country", ""),
+            default_country=icp_country(config),
         )
 
     def _redact(self, text: str) -> str:
@@ -145,11 +156,12 @@ class PreclearedClient:
                 return "***REDACTED***"
         return text or ""
 
-    def _fingerprint(self) -> str:
+    def _fingerprint(self, country: str = "") -> str:
         """Hash of the facts Precleared decides on, apart from the address.
 
         These are exactly the fields _check sends with the address, so a
-        cached verdict is only reused for the same question.
+        cached verdict is only reused for the same question. ``country`` is
+        the recipient's country when Harvey is sure of it, as for _check.
         """
         facts = {
             "v": CACHE_VERSION,
@@ -158,22 +170,35 @@ class PreclearedClient:
             "pitch": self.pitch,
             "existing_customer": False,
         }
-        if self.prospect_country:
+        if country:
+            # Only when set, so a verdict cached without one still matches
+            # while the address has none (and see _cached once it has).
+            facts["recipient_country"] = country
+        elif self.prospect_country:
             # Only when set, so cached verdicts from before the setting existed
             # still match.
             facts["prospect_country"] = self.prospect_country
+        elif self.default_country:
+            # The ICP's country stands in for prospect_country; only while it
+            # does, for the same reason.
+            facts["icp_country"] = self.default_country
         return hashlib.sha256(json.dumps(facts, sort_keys=True).encode()).hexdigest()
 
-    async def clear(self, to_email: str, state) -> Clearance:
-        """Return the verdict for one address, from the cache when possible."""
+    async def clear(self, to_email: str, state, country: str = "") -> Clearance:
+        """Return the verdict for one address, from the cache when possible.
+
+        ``country`` is the recipient's country when Harvey is sure of it
+        (``send_window.recipient_country``); Precleared takes it as settled.
+        Anything but a two-letter code counts as none."""
         email = (to_email or "").strip().lower()
+        country = _country(country)
         key = SETTINGS_PREFIX + email
-        inputs = self._fingerprint()
-        cached = _from_cache(await state.get_setting(key), inputs)
+        inputs = self._fingerprint(country)
+        cached = self._cached(await state.get_setting(key), country)
         if cached is not None:
             return cached
 
-        result = await self._check(email)
+        result = await self._check(email, country)
         if not result.held and result.verdict in DEFINITE_VERDICTS:
             # One entry per address: a fresh verdict replaces any earlier
             # one, including legacy entries written without a fingerprint.
@@ -187,15 +212,29 @@ class PreclearedClient:
             }))
         return result
 
-    async def known_country(self, to_email: str, state) -> str:
+    async def known_country(self, to_email: str, state, country: str = "") -> str:
         """The recipient's country from a cached verdict, or "". Never asks
-        Precleared."""
+        Precleared. ``country`` is what clear() was given for this address,
+        since the verdict is keyed on it."""
         email = (to_email or "").strip().lower()
-        cached = _from_cache(await state.get_setting(SETTINGS_PREFIX + email),
-                             self._fingerprint())
+        cached = self._cached(await state.get_setting(SETTINGS_PREFIX + email), _country(country))
         return cached.country if cached is not None else ""
 
-    async def _check(self, email: str) -> Clearance:
+    def _cached(self, raw: str, country: str) -> Clearance | None:
+        """The cached verdict for the question _check would ask, or None.
+
+        A verdict decided without the country, for which Precleared found
+        that same country itself, answers the same question, so it is kept
+        rather than asked for again.
+        """
+        cached = _from_cache(raw, self._fingerprint(country))
+        if cached is None and country:
+            earlier = _from_cache(raw, self._fingerprint())
+            if earlier is not None and earlier.country == country:
+                return earlier
+        return cached
+
+    async def _check(self, email: str, country: str = "") -> Clearance:
         payload = {
             "recipient_email": email,
             "sender_country": self.sender_country,
@@ -204,10 +243,14 @@ class PreclearedClient:
         }
         if self.pitch:
             payload["pitch"] = self.pitch
-        if self.prospect_country:
+        if country:
+            # Harvey is sure of it from the company's location, and Precleared
+            # takes it as settled; so never a guess, and never both fields.
+            payload["recipient_country"] = country
+        elif self.default_country:
             # Precleared uses this only when the address, company records and
             # the company's website don't show the recipient's country.
-            payload["default_recipient_country"] = self.prospect_country
+            payload["default_recipient_country"] = self.default_country
         headers = {
             "Content-Type": "application/json",
             "User-Agent": "harvey (+https://github.com/ethanplusai/harvey)",
@@ -285,7 +328,7 @@ class PreclearedClient:
 
 
 def _country(value) -> str:
-    """A two-letter country code from Precleared's facts, or ""."""
+    """A two-letter country code, from Precleared's facts or the sender, or ""."""
     code = value.strip().upper() if isinstance(value, str) else ""
     return code if len(code) == 2 and code.isascii() and code.isalpha() else ""
 
