@@ -9,6 +9,26 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **A do-not-contact list, enforced at send time.** `compliance.do_not_contact`
+  takes addresses and domains Harvey must never email: competitors, your
+  existing customers, anyone under a legal hold, a partner you agreed not to
+  approach. A domain covers its subdomains, matched on a label boundary, so
+  `acme.example` blocks `mail.acme.example` and leaves `notacme.example`
+  alone — a plain suffix test would catch the wrong company. The check runs
+  in `pre_send_check` rather than during discovery, so it is the last thing
+  before an email leaves and holds for one a human already approved in the
+  Outbox. It applies to replies as well as cold mail: a list that lets
+  automated replies through is not a do-not-contact list, and the operator
+  can still answer by hand. Entries are normalised when the config loads, so
+  ` @Acme.EXAMPLE `, a pasted `https://www.acme.example/about`,
+  `Jane Doe <jane@acme.example>` (that address) and `acme.example` behave
+  alike; an entry that names nothing is a config error, not a silent no-op.
+  An edit counts at once in a running Harvey. A listed person who writes
+  back goes to you without a draft, and `harvey export` leaves them out. On
+  Instantly, which has no Outbox, listed leads are left out of the upload
+  and a reply to one goes to you; a lead Instantly already has must be
+  removed there.
+
 - **Open roles from the job board a company actually uses.** When a
   company's own site links or embeds a Greenhouse, Lever, Ashby or Workable
   board, profiling reads that board's public JSON feed (one request, capped
@@ -187,6 +207,25 @@ minor versions can still change behaviour.
   Gmail's history marker has expired, and once a day as a backstop.
 
 ### Fixed
+
+- **The dashboard's Start and Stop work, on Windows and everywhere else.**
+  Start launched `python -m harvey` with no command, so the loop printed the
+  help and exited; it now runs `harvey run`, and finds `claude` in
+  `~/.local/bin` when the native installer left it off PATH. On Windows the
+  "is it running?" check was `os.kill(pid, 0)`, which there terminates the
+  process it asks about, and a stale PID file made the status and Start
+  return 500. The check now asks the OS without signalling. `harvey run`
+  records itself too, so a loop started in a terminal shows as running, and
+  holds a lock on `data/harvey.lock`: a PID file left by a crash or a reboot
+  can name an unrelated program, which is now reported as stopped and never
+  signalled, and a second `harvey run` refuses to start while one is
+  running. Start refuses, with the reason, until `harvey setup` has been
+  run (the loop used to sit in the setup wizard reading the dashboard's
+  terminal), and Stop says so when it couldn't end the loop instead of
+  reporting success. (From #91 and #90.)
+
+- **`{{company}}'s` reads right for names ending in "s"**: "Parkes Builders'",
+  not "Parkes Builders's". (From #90.)
 
 - **LinkedIn-profile web searches run only when LinkedIn prospecting is on**
   (from #60 by FreemanGT). Searching `site:linkedin.com/in` for your titles
