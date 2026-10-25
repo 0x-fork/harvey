@@ -393,8 +393,8 @@ class ComplianceConfig(BaseModel):
     opt_out_line: str = DEFAULT_OPT_OUT_LINE
     # Companies this operator will never email: competitors, existing
     # customers, anyone under a legal hold, a partner you agreed not to
-    # approach. An entry is an address ("jane@acme.com") or a domain
-    # ("acme.com", which also covers its subdomains). Enforced by the gate at
+    # approach. An entry is an address ("jane@acme.example") or a domain
+    # ("acme.example", which also covers its subdomains). Enforced by the gate at
     # send time, so it holds for an email a human already approved, and for
     # replies as well as cold mail — "never contact" means never.
     do_not_contact: list[str] = []
@@ -410,18 +410,17 @@ class ComplianceConfig(BaseModel):
         """One string is a list of one; blanks and duplicates are dropped.
 
         Normalising here rather than at the point of use keeps the gate's
-        matching free of parsing, and means a typo like " @Acme.COM " behaves
-        the same as "acme.com".
+        matching free of parsing, and means " @Acme.EXAMPLE " or a pasted
+        "https://www.acme.example/" behaves the same as "acme.example".
         """
+        from harvey.gate import do_not_contact_entry
         if v is None:
             return []
         if isinstance(v, str):
             v = [v]
         seen: list[str] = []
         for entry in v:
-            cleaned = str(entry or "").strip().lstrip("@").lower().strip(".")
-            if cleaned.startswith("www."):
-                cleaned = cleaned[4:]
+            cleaned = do_not_contact_entry(entry)
             if cleaned and cleaned not in seen:
                 seen.append(cleaned)
         return seen

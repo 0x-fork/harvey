@@ -772,7 +772,8 @@ class Handler:
 
     def _instantly_reply_held(self, prospect, response: str) -> list[str]:
         """Why an Instantly reply must not go out by itself, or []."""
-        gate = pre_send_check(prospect.email, "Re:", response, kind="reply")
+        gate = pre_send_check(prospect.email, "Re:", response, kind="reply",
+                              do_not_contact=compliance_of(self.config).do_not_contact)
         return list(gate.reasons) + autopilot_review("", response, self.config,
                                                      recipient=prospect.email)
 

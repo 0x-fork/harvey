@@ -46,12 +46,28 @@ class GateResult:
         return self.ok
 
 
+def do_not_contact_entry(raw) -> str:
+    """One do-not-contact entry as an address or a bare domain, or "".
+
+    People paste what the browser shows, so "https://www.acme.example/about",
+    "mailto:jane@acme.example", "*.acme.example" and "acme.example:443" all reduce to
+    what they name. Left alone, each would quietly match nothing.
+    """
+    entry = str(raw or "").strip().lower()
+    entry = re.sub(r"^(?:[a-z][a-z0-9+.-]*://|mailto:)", "", entry)
+    entry = re.split(r"[/?#]", entry, maxsplit=1)[0]
+    entry = entry.lstrip("@").removeprefix("*.")
+    if "@" not in entry:
+        entry = entry.split(":", 1)[0]
+    return _host(entry)
+
+
 def do_not_contact_match(to_email: str, entries) -> str:
     """The do-not-contact entry ``to_email`` matches, or "".
 
     An entry with an "@" is one address. Anything else is a domain and covers
-    its subdomains, matched on a label boundary so "acme.com" blocks
-    "mail.acme.com" without also blocking "notacme.com" — a suffix test
+    its subdomains, matched on a label boundary so "acme.example" blocks
+    "mail.acme.example" without also blocking "notacme.example" — a suffix test
     without that boundary is the classic way a blocklist overreaches.
 
     Entries are expected already normalised by ComplianceConfig; this lowers
@@ -62,7 +78,7 @@ def do_not_contact_match(to_email: str, entries) -> str:
         return ""
     host = _host(address.rsplit("@", 1)[1])
     for raw in entries:
-        entry = _host(str(raw or "").strip().lstrip("@"))
+        entry = do_not_contact_entry(raw)
         if not entry:
             continue
         if "@" in entry:

@@ -108,8 +108,8 @@ compliance:
   opt_out_line: 'Not interested? Reply "no thanks" and I won''t email again.'
   # Never email these, cold or in reply: competitors, your existing customers,
   # anyone under a legal hold. An entry is an address or a domain, and a domain
-  # covers its subdomains ("acme.com" also blocks "mail.acme.com", but not
-  # "notacme.com"). Checked by the gate at send time, so it holds even for an
+  # covers its subdomains ("acme.example" also blocks "mail.acme.example", but
+  # not "notacme.example"). Checked by the gate at send time, so it holds even for an
   # email you already approved in the Outbox.
   do_not_contact: []
   #   - "competitor.example"

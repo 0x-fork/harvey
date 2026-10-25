@@ -136,3 +136,50 @@ async def test_an_unlisted_recipient_still_sends(state):
     await sender._drain_due()
 
     assert len(provider.sent) == 1
+
+
+# ── Entries pasted the way people copy them ──
+
+@pytest.mark.parametrize("pasted", [
+    "https://acme.example/",
+    "http://www.acme.example/about",
+    "acme.example/contact",
+    "*.acme.example",
+    "acme.example:443",
+])
+def test_a_pasted_url_or_wildcard_still_blocks_the_domain(pasted):
+    """A URL copied from the browser bar must not silently match nothing."""
+    cfg = ComplianceConfig(do_not_contact=[pasted])
+    assert cfg.do_not_contact == ["acme.example"]
+    assert do_not_contact_match("jane@acme.example", cfg.do_not_contact) == "acme.example"
+
+
+def test_a_mailto_link_is_one_address():
+    cfg = ComplianceConfig(do_not_contact=["mailto:Jane@Acme.example"])
+    assert cfg.do_not_contact == ["jane@acme.example"]
+
+
+# ── Instantly has no Outbox, so the list is applied before anything leaves ──
+
+@pytest.mark.asyncio
+async def test_listed_leads_are_left_out_of_the_instantly_upload(state):
+    from harvey.agents.sender import Sender
+    from harvey.models.prospect import Prospect
+    from tests.test_outbox_native import Cfg, Env
+    cfg = Cfg()
+    cfg.compliance = ComplianceConfig(do_not_contact=["acme.example"])
+    sender = Sender(brain=None, state=state, config=cfg, env=Env())
+    kept = Prospect(first_name="Al", last_name="B", company="Co", email="al@other.example")
+    listed = Prospect(first_name="Jo", last_name="C", company="Acme", email="jo@acme.example")
+    assert sender._reviewed_leads([kept, listed]) == [kept]
+
+
+@pytest.mark.asyncio
+async def test_an_instantly_reply_to_a_listed_address_goes_to_you(state):
+    from harvey.agents.handler import Handler
+    from tests.test_outbox_native import Cfg, Env
+    cfg = Cfg()
+    cfg.compliance = ComplianceConfig(do_not_contact=["acme.example"])
+    handler = Handler(brain=None, state=state, config=cfg, env=Env())
+    held = handler._instantly_reply_held(_prospect("jane@acme.example"), BODY)
+    assert any("do-not-contact" in r for r in held)
