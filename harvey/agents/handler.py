@@ -190,6 +190,52 @@ ESCALATION_PATTERNS = (
 )
 
 
+# The conversation a reply is written from. Cold-email threads are short, so
+# the whole thread normally fits; the budget only bites on a very long one.
+HISTORY_BUDGET_CHARS = 24_000
+HISTORY_MESSAGE_CAP = 4_000
+HISTORY_ALWAYS_RECENT = 6
+
+
+def conversation_history(thread, prospect_name: str) -> str:
+    """The thread as the reply prompt shows it, oldest first.
+
+    Everything, when it fits. Otherwise the latest messages, then the
+    prospect's own earlier words (where requirements and constraints live,
+    issue #97), then Harvey's, each newest first, with a note saying how
+    many were left out. One pasted wall of text is cut, so it can't
+    crowd out the rest.
+    """
+    def line(m) -> str:
+        content = m.content or ""
+        if len(content) > HISTORY_MESSAGE_CAP:
+            content = content[:HISTORY_MESSAGE_CAP].rstrip() + " [...cut]"
+        return f"{'Harvey' if m.sender == 'harvey' else prospect_name}: {content}"
+
+    lines = [line(m) for m in thread]
+    if sum(len(x) + 1 for x in lines) <= HISTORY_BUDGET_CHARS:
+        return "\n".join(lines)
+
+    newest_first = list(range(len(lines) - 1, -1, -1))
+    recent = newest_first[:HISTORY_ALWAYS_RECENT]
+    theirs = [i for i in newest_first[HISTORY_ALWAYS_RECENT:] if thread[i].sender != "harvey"]
+    ours = [i for i in newest_first[HISTORY_ALWAYS_RECENT:] if thread[i].sender == "harvey"]
+    kept: set[int] = set()
+    used = 0
+    for i in recent + theirs + ours:
+        cost = len(lines[i]) + 1
+        if used + cost > HISTORY_BUDGET_CHARS and kept:
+            continue
+        kept.add(i)
+        used += cost
+
+    left_out = len(lines) - len(kept)
+    plural = "message" if left_out == 1 else "messages"
+    note = (f"[{left_out} earlier {plural} not shown: this conversation has {len(lines)}, "
+            "too many to include whole. What follows is in the order it was written.]")
+    return "\n".join([note] + [text for i, text in enumerate(lines) if i in kept])
+
+
 class Handler:
     def __init__(
         self,
@@ -888,11 +934,7 @@ Respond with ONLY the category label, nothing else."""
         self, intent: str, reply_text: str, prospect, convo: Conversation
     ) -> str:
         """Generate an appropriate response based on intent."""
-        # Build conversation history for context
-        history = "\n".join(
-            f"{'Harvey' if m.sender == 'harvey' else prospect.full_name()}: {m.content}"
-            for m in convo.thread[-6:]  # Last 6 messages for context
-        )
+        history = conversation_history(convo.thread, prospect.full_name())
 
         objection_context = ""
         if intent == "objection":
@@ -924,6 +966,10 @@ Product: {self.config.product.name} — {self.config.product.description}"""
 
 Conversation so far:
 {fence(history, "the conversation")}
+
+Anything the prospect asked for or ruled out earlier in the conversation,
+and anything you agreed to, still apply: don't contradict them or quietly
+drop them.
 
 {UNTRUSTED_RULE}
 
