@@ -672,6 +672,7 @@ async function loadSetupStatus() {
         '<div class="check-label ' + (c.done ? 'done' : '') + '">' + escHtml(c.label) +
           (optional ? '<span class="optional-tag">optional</span>' : '') + '</div>' +
         (!c.done ? '<div class="check-help">' + escHtml(c.help) + '</div>' : '') +
+        (!c.done && c.id === 'warmup_service' ? warmupServiceActions(c) : '') +
       '</div></div>';
 
   const required = data.checks.filter(c => c.required);
@@ -690,6 +691,44 @@ async function loadSetupStatus() {
           optional.map(c => renderCheck(c, true)).join('') + '</div></details>'
         : '') +
     '</div>';
+}
+
+// The warmup step: get TrulyInbox, paste its key, or say you use another service.
+function warmupServiceActions(c) {
+  return '<div class="btn-group warmup-actions">' +
+      '<a class="btn btn-primary btn-sm" href="' + safeHref(c.link) + '" target="_blank" ' +
+        'rel="noopener sponsored">Get TrulyInbox</a>' +
+      '<input class="form-input" id="trulyinbox-key" type="password" autocomplete="off" ' +
+        'placeholder="Paste your TrulyInbox API key" aria-label="TrulyInbox API key" ' +
+        'onkeydown="if (event.key === \'Enter\') connectTrulyInbox()">' +
+      '<button class="btn btn-secondary btn-sm" id="trulyinbox-go" onclick="connectTrulyInbox()">Connect</button>' +
+      '<button class="btn btn-ghost btn-sm" onclick="useOtherWarmup()">I use another service</button>' +
+    '</div>' +
+    '<div class="check-help affiliate-note">Affiliate link</div>';
+}
+
+async function connectTrulyInbox() {
+  const input = document.getElementById('trulyinbox-key');
+  const go = document.getElementById('trulyinbox-go');
+  if (!input || !input.value.trim()) return;
+  if (go) go.disabled = true;
+  const data = await api('/api/trulyinbox/connect', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({key: input.value.trim()}),
+  });
+  if (go) go.disabled = false;
+  if (data && data.success) {
+    input.value = '';
+    showToast(data.message || 'TrulyInbox connected', 'success');
+    loadSetupStatus();
+  } else {
+    showToast((data && data.message) || 'Could not connect TrulyInbox', 'error');
+  }
+}
+
+async function useOtherWarmup() {
+  const data = await api('/api/trulyinbox/other', {method: 'POST'});
+  if (data && data.success) loadSetupStatus();
 }
 
 // ── Signals: Harvey proposes, you confirm ──

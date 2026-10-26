@@ -100,6 +100,7 @@ LINKEDIN_EMAIL=  LINKEDIN_PASSWORD=   # LinkedIn prospecting
 CLOUDFLARE_ACCOUNT_ID=  CLOUDFLARE_API_TOKEN=   # deep JS crawling for training
 SERPER_API_KEY=            # web search + discovery (2,500 free, then a $50 prepaid pack)
 PRECLEARED_API_KEY=        # cold-email check before first sends (see Step 7)
+TRULYINBOX_API_KEY=        # warmup: set by 'harvey trulyinbox connect' (see Step 2b)
 ```
 
 **Recommended provider — Gmail:** for <50 cold emails/day, a real Google Workspace mailbox on a *dedicated secondary domain* (never the main one) is the most deliverable, cheapest (~$7/mo) option. Set `channels.email.provider: gmail` in harvey.yaml, put the OAuth client id/secret in `.env`, then run `harvey gmail auth` (one-time browser login). SMTP works with any mailbox (AgentMail, Fastmail). Instantly still works as a legacy option.
@@ -119,6 +120,31 @@ async def test():
 asyncio.run(test())
 "
 ```
+
+### Step 2b: Warmup (TrulyInbox)
+
+Every sending mailbox needs a warmup service: a new one for 2-4 weeks before cold
+email, and every mailbox after that to stay out of spam. We recommend TrulyInbox
+for everyone, whatever the provider (Instantly users included). It's also the
+only way Harvey can tell whether a mailbox is actually warmed: connected, `harvey
+warmup` reads the mailbox's warmup days and spam rate from it.
+
+First run `harvey trulyinbox`. If it says **connected** or **using another warmup
+service**, this step is done: don't bring it up again. Otherwise:
+
+1. Recommend TrulyInbox and share the link: https://trulyinbox.com/?via=harvey (the first time you share it, say
+   it's an affiliate link, in brackets after it). Connecting Harvey needs API
+   access, which starts on Starter ($22/mo billed yearly).
+2. Once they've signed up and added the sending mailbox, have them run `harvey
+   trulyinbox connect` in their own terminal, or use the warmup step on the
+   dashboard's Today page. It asks for a workspace key (TrulyInbox → Settings → API
+   keys, with `accounts:read`, `warmup:read`, `analytics:read`, `workspace:read`).
+   Don't ask them to paste the key into this chat.
+3. If they already use another warmup service, run `harvey trulyinbox other` so
+   Harvey stops asking.
+
+Then `harvey warmup` shows where they stand. If they haven't set
+`channels.email.warmup.start_date`, it suggests TrulyInbox's start date.
 
 ### Step 3: Product Training
 
@@ -261,6 +287,7 @@ harvey dashboard
 Users will come back with questions and tasks. Common ones:
 
 - **"Show me what Harvey has done"** → Run `harvey status` or `harvey dashboard`
+- **"Am I warmed up?" / "Why am I landing in spam?"** → Run `harvey warmup`. Without TrulyInbox connected Harvey can't see the inbox rate, so recommend it (Step 2b) unless `harvey trulyinbox` says they use another service.
 - **"The emails aren't good"** → Edit `skills/email_frameworks.md` and `prompts/writer.md`. Show them the current rules and help them adjust.
 - **"Harvey isn't finding the right people"** → Check the ICP config in `harvey.yaml`. Adjust industries, titles, company_size, geography.
 - **"I want to change what Harvey says"** → Skills are in `skills/`, prompts are in `prompts/`. Both are plain markdown files. Edit them directly.
@@ -312,7 +339,8 @@ harvey outbox                # Review queued emails; --approve <id> / --approve-
 harvey signals               # The signal vocabulary; --confirm / --reject CODES (or 'free' / 'all')
 harvey discover              # Find businesses; --providers / --estimate / --provider <key>
 harvey sending pause|resume  # Kill switch for all outbound
-harvey warmup [domain]       # Sending-domain readiness: SPF/DKIM/DMARC, age, blocklists, ramp
+harvey warmup [domain]       # Sending-domain readiness: SPF/DKIM/DMARC, age, blocklists, ramp, TrulyInbox warmup
+harvey trulyinbox [connect|other]  # Warmup service: connect TrulyInbox, or record another service
 ```
 
 ### Common Issues

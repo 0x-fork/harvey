@@ -9,6 +9,13 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **TrulyInbox for warmup.** Harvey now recommends TrulyInbox for warming and
+  keeping sending mailboxes healthy, and reads it: `harvey trulyinbox connect`
+  (or the new warmup step on the dashboard's setup checklist) checks a key and
+  saves it, and `harvey warmup` then says whether the sending mailbox is
+  actually warmed: enrolled, signed in, warmed for `min_days`, and under 5%
+  spam in its warmup mail. Read-only; it never changes anything in TrulyInbox.
+  `harvey trulyinbox other` records that you use another warmup service.
 - **A do-not-contact list, enforced at send time.** `compliance.do_not_contact`
   takes addresses and domains Harvey must never email: competitors, your
   existing customers, anyone under a legal hold, a partner you agreed not to

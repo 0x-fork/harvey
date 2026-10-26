@@ -1018,3 +1018,8 @@ table.clip td { max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
 .mode-confirm .form-input { width: 12rem; }
 .mode-card .convo-actions .btn-ghost { margin-left: 0; }
 .mode-banner:not(.wait) { background: var(--surface); border-color: var(--line); }
+
+/* Setup checklist: the warmup step's actions */
+.warmup-actions { margin-top: var(--sp-2); align-items: center; }
+.warmup-actions .form-input { flex: 1 1 200px; height: 28px; min-width: 0; }
+.affiliate-note { font-size: 11px; }
