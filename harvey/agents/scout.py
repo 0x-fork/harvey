@@ -56,6 +56,9 @@ SCRAPE_TIMEOUT = 12.0
 MAX_RETRIES = 3
 BACKOFF_BASE = 1.5  # seconds; grows exponentially per attempt
 MAX_RESULTS_PER_QUERY = 20
+# Serper free accounts reject num > 10 with HTTP 400
+# "Query pattern not allowed for free accounts" (verified 2026-10-26).
+SERPER_MAX_NUM = 10
 MAX_COMPANIES_PER_CYCLE = 10
 MAX_PROSPECTS_PER_CYCLE = 25
 
@@ -357,7 +360,7 @@ class Scout:
         resp = await self._fetch(
             "https://google.serper.dev/search",
             method="POST",
-            json_body={"q": query, "num": MAX_RESULTS_PER_QUERY},
+            json_body={"q": query, "num": min(MAX_RESULTS_PER_QUERY, SERPER_MAX_NUM)},
             headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
             retries=2,
         )
@@ -1795,6 +1798,18 @@ Respond ONLY with the JSON array."""
             "g2.com", "capterra.com", "clutch.co",
             "trustpilot.com", "getapp.com", "producthunt.com",
             "youtu.be", "goo.gl", "bit.ly", "t.co",
+            # job boards & Indian directories/marketplaces — mirrors
+            # JUNK_DOMAIN_PATTERNS in collectors/discover.py (2026-10-24 run
+            # was full of these; see reports/2026-10-26-pipeline-review.md)
+            "naukri.com", "jobrapido.com", "jobsora.com", "empleos.com",
+            "shine.com", "foundit.in", "timesjobs.com", "freelancer.com",
+            "indiamart.com", "justdial.com", "tradeindia.com",
+            "exportersindia.com", "sulekha.com", "urbanpro.com",
+            "olx.in", "quikr.com", "flipkart.com", "snapdeal.com",
+            "myntra.com", "etsy.com", "ebay.com", "aliexpress.com",
+            "boardgamegeek.com", "team-bhp.com", "hackaday.com",
+            "instructables.com", "thingiverse.com", "printables.com",
+            "cults3d.com", "grabcad.com",
         }
         if domain in noise:
             return True

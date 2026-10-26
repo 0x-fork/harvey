@@ -492,6 +492,83 @@ async def test_unconfigured_provider_says_which_key_is_missing(state, config):
     assert "DATAFORSEO_LOGIN" in report.errors[0]
 
 
+@pytest.mark.asyncio
+async def test_empty_api_key_runs_nothing_and_says_so(state, config,
+                                                      register, monkeypatch):
+    """The 2026-10-24 bug: an empty SERPER_API_KEY placeholder "succeeded"
+    with 0 observations and exit code 0. It must stop with a named error."""
+    monkeypatch.setattr("harvey.config.load_env",
+                        lambda: EnvConfig(serper_api_key=""))
+    fake = register(D.Serper())   # fresh instance — don't mutate the singleton
+
+    async def must_not_fetch(client, env, query):
+        raise AssertionError("an unconfigured provider must not be called")
+    fake.fetch = must_not_fetch
+
+    report = await D.run_discovery(state, config, "serper",
+                                   [D.DiscoveryQuery(term="roofer")])
+    assert report.stopped == "not configured"
+    assert report.queries_ran == 0
+    assert "SERPER_API_KEY" in report.errors[0]
+
+
+@pytest.mark.asyncio
+async def test_template_placeholder_key_is_treated_as_missing(state, config,
+                                                              register,
+                                                              monkeypatch):
+    monkeypatch.setattr("harvey.config.load_env",
+                        lambda: EnvConfig(serper_api_key="your_api_key_here"))
+    fake = register(D.Serper())   # fresh instance — don't mutate the singleton
+
+    async def must_not_fetch(client, env, query):
+        raise AssertionError("a placeholder key must not be sent to the API")
+    fake.fetch = must_not_fetch
+
+    report = await D.run_discovery(state, config, "serper",
+                                   [D.DiscoveryQuery(term="roofer")])
+    assert report.stopped == "not configured"
+    assert report.queries_ran == 0
+
+
+@pytest.mark.parametrize("value,missing", [
+    ("", True), ("   ", True), ("your_api_key_here", True),
+    ("PLACEHOLDER", True), ("<serper-key>", True), ("xxxxxx", True),
+    ("change-me", True), ("example_key", True),
+    ("a1b2c3d4e5f67890abcdef", False),   # a live-looking key
+    ("you@example.com", False),           # DataForSEO logins are emails
+])
+def test_missing_keys_flags_template_placeholders_not_real_keys(value, missing):
+    assert bool(D.PROVIDERS["serper"].missing_keys(
+        {"serper_api_key": value})) is missing
+
+
+@pytest.mark.asyncio
+async def test_queries_ran_reports_what_actually_executed(state, config,
+                                                          register):
+    fake = register(FakeProvider([[biz(domain="a.com")],
+                                  [biz(domain="b.com")]]))
+    report = await D.run_discovery(state, config, "fake", [
+        D.DiscoveryQuery(term="roofer", location="Denver"),
+        D.DiscoveryQuery(term="roofer", location="Aurora"),
+    ])
+    assert report.queries == 2
+    assert report.queries_ran == 2
+    assert report.as_dict()["queries_ran"] == 2
+
+
+@pytest.mark.asyncio
+async def test_queries_ran_is_zero_when_stopped_before_any_fetch(state, config,
+                                                                 register):
+    await state.set_setting("discovery_paused", "stopped by hand")
+    fake = register(FakeProvider([[biz(domain="a.com")]]))
+    report = await D.run_discovery(state, config, "fake",
+                                   [D.DiscoveryQuery(term="roofer")])
+    assert report.stopped == "paused"
+    assert report.queries_ran == 0
+    assert report.as_dict()["queries_ran"] == 0
+    assert fake.calls == 0
+
+
 def test_unknown_provider_fails_loudly():
     with pytest.raises(ValueError, match="unknown discovery provider"):
         import asyncio

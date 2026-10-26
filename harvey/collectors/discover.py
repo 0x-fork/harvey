@@ -51,9 +51,19 @@ JUNK_DOMAIN_PATTERNS = tuple(re.compile(p, re.I) for p in (
     r"(^|\.)(yelp|yellowpages|superpages|manta|bbb|angi|angieslist|homeadvisor)\.",
     r"(^|\.)(thumbtack|houzz|porch|buildzoom|networx|modernize|nextdoor)\.",
     r"(^|\.)(facebook|instagram|twitter|x|linkedin|youtube|tiktok|pinterest)\.",
+    r"(^|\.)(meetup|eventbrite)\.",
     r"(^|\.)(indeed|glassdoor|ziprecruiter|craigslist|zillow|realtor)\.",
     r"(^|\.)(mapquest|foursquare|tripadvisor|trustpilot|birdeye|expertise)\.",
     r"(directory|listings?|find-?a-|top\d+|best-?of)\.",
+    # job boards & aggregators — the 2026-10-24 serper run surfaced these
+    # constantly for India B2B queries (see reports/2026-10-26-pipeline-review.md)
+    r"(^|\.)(naukri|jobrapido|jobsora|empleos|shine|foundit|timesjobs|freelancer|upwork)\.",
+    r"(^|\.)(jobs?|careers?|vacancies|walkins?)\.",
+    # Indian directories & marketplaces
+    r"(^|\.)(indiamart|justdial|tradeindia|exportersindia|sulekha|urbanpro|yet5)\.",
+    r"(^|\.)(olx|quikr|flipkart|snapdeal|myntra|shopclues|etsy|ebay|alibaba|aliexpress)\.",
+    # hobby communities & model repositories — never a prospect
+    r"(^|\.)(boardgamegeek|team-bhp|hackaday|instructables|thingiverse|printables|cults3d|thangs|grabcad)\.",
     # media & reference
     r"(^|\.)(wikipedia|reddit|quora|medium|substack|forbes|inc|entrepreneur)\.",
     r"(news|magazine|journal|gazette|tribune|herald)\.(com|org|net)$",
@@ -345,6 +355,16 @@ class DiscoveryQuery:
 # ── Provider adapters ─────────────────────────────────────────────────
 
 
+# Values users paste straight from .env.example. Deliberately narrow — none
+# of these can appear in a live key (a Serper key is opaque alphanumerics),
+# and "example[_-]" needs the separator so a real DataForSEO login like
+# you@example.com is not flagged.
+_PLACEHOLDER_RE = re.compile(
+    r"(?i)(placeholder|change[-_]?me|your[_-]|_here\b|paste[_-]"
+    r"|xxx{2,}|<[a-z_ -]+>|todo|fixme|example[_-])"
+)
+
+
 class DiscoveryProvider:
     """One way of answering "who exists".
 
@@ -363,8 +383,24 @@ class DiscoveryProvider:
     env_keys: tuple[str, ...] = ()
     caveat: str = ""
 
+    def missing_keys(self, env: dict) -> list[str]:
+        """Env keys that are absent, empty, or still the template placeholder.
+
+        An empty ``SERPER_API_KEY=`` line used to pass the truthiness check,
+        the run then "succeeded" with zero queries, and the process exited 0
+        — a silent no-op that reads as success. Name the bad keys here,
+        before any money or time is spent.
+        """
+        def _missing(value) -> bool:
+            if not isinstance(value, str):
+                return not value
+            value = value.strip()
+            return (not value) or bool(_PLACEHOLDER_RE.search(value))
+
+        return [k for k in self.env_keys if _missing(env.get(k))]
+
     def configured(self, env: dict) -> bool:
-        return all(env.get(k) for k in self.env_keys)
+        return not self.missing_keys(env)
 
     def estimate(self, queries: list[DiscoveryQuery]) -> float:
         """Projected spend, in dollars, before anything is called."""
@@ -558,7 +594,9 @@ class Serper(DiscoveryProvider):
             "https://google.serper.dev/search",
             headers={"X-API-KEY": env["serper_api_key"],
                      "Content-Type": "application/json"},
-            json={"q": query.keyword(), "num": min(query.depth, 100)},
+            # Free accounts reject num > 10 (HTTP 400 "Query pattern not
+            # allowed for free accounts"), verified 2026-10-26.
+            json={"q": query.keyword(), "num": min(query.depth, 10)},
         )
         r.raise_for_status()
         data = r.json()
@@ -764,6 +802,7 @@ class DiscoveryReport:
 
     provider: str = ""
     queries: int = 0
+    queries_ran: int = 0     # attempts made — 0 means nothing was collected
     estimated_cost: float = 0.0
     actual_cost: float = 0.0
     found: int = 0
@@ -778,6 +817,7 @@ class DiscoveryReport:
     def as_dict(self) -> dict:
         return {
             "provider": self.provider, "queries": self.queries,
+            "queries_ran": self.queries_ran,
             "estimated_cost": round(self.estimated_cost, 4),
             "actual_cost": round(self.actual_cost, 4),
             "found": self.found, "junk": self.junk,
@@ -847,10 +887,12 @@ async def run_discovery(
         return report
 
     env = load_env().model_dump()
-    if not provider.configured(env):
-        missing = ", ".join(k.upper() for k in provider.env_keys
-                            if not env.get(k))
-        report.errors.append(f"{provider.label} needs {missing} in .env")
+    missing = provider.missing_keys(env)
+    if missing:
+        names = ", ".join(k.upper() for k in missing)
+        report.errors.append(
+            f"{provider.label} is not ready: {names} is empty or still the "
+            f"template placeholder in .env")
         report.stopped = "not configured"
         return report
 
@@ -891,6 +933,7 @@ async def run_discovery(
                     await asyncio.sleep(OpenStreetMap.MIN_INTERVAL)
 
                 try:
+                    report.queries_ran += 1
                     provider.last_cost = 0.0
                     found = await provider.fetch(client, env, query)
                     report.actual_cost += provider.last_cost
@@ -994,8 +1037,14 @@ def _observations(biz: Business, company_id: str, confirmed: set[str],
 
 
 def provider_menu(env: dict | None = None) -> list[dict]:
-    """The menu the dashboard renders: what each provider does, and its cost."""
-    env = env or {}
+    """The menu the dashboard renders: what each provider does, and its cost.
+
+    The CLI calls this bare; without a load, every keyed provider would show
+    "needs setup" even with a working key in .env.
+    """
+    if env is None:
+        from harvey.config import load_env
+        env = load_env().model_dump()
     return [
         {
             "key": p.key, "label": p.label, "kind": p.kind, "blurb": p.blurb,
