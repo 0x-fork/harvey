@@ -224,9 +224,9 @@ def test_another_warmup_service_is_respected():
 def test_the_link_lives_in_one_constant():
     from harvey.paths import PROJECT_ROOT
     src = [p for p in (PROJECT_ROOT / "harvey").rglob("*") if p.suffix in (".py", ".js", ".html")]
-    assert [p.name for p in src if "trulyinbox.com/?via" in p.read_text()] == ["trulyinbox.py"]
+    assert [p.name for p in src if "trulyinbox.com/?via" in p.read_text(encoding="utf-8")] == ["trulyinbox.py"]
     for name in ("README.md", "CLAUDE.md", "harvey.yaml"):
-        text = (PROJECT_ROOT / name).read_text()
+        text = (PROJECT_ROOT / name).read_text(encoding="utf-8")
         assert ti.AFFILIATE_URL in text, name
         # every link to the site carries the referral
         assert text.count("trulyinbox.com/") - text.count("dev.trulyinbox.com/") \
