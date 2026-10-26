@@ -1032,3 +1032,52 @@ def test_tinyfish_pacing_works_across_event_loops():
                                  D.DiscoveryQuery(term="roofer"))
     asyncio.run(one())
     asyncio.run(one())
+
+
+# ── The do-not-contact list ──
+
+
+@pytest.mark.asyncio
+async def test_a_forbidden_company_never_becomes_a_row(state, config, register):
+    """Applied before the upsert, so a forbidden company costs nothing to
+    enrich and never turns up in a cohort.
+
+    Counted apart from `junk` deliberately: junk asks whether a result is a
+    business at all, this asks whether we are allowed to approach one.
+    """
+    # Clear the source path FIRST: live_do_not_contact re-reads the config file
+    # when there is one and writes the file's value back over the field, so
+    # setting the field before clearing the path would lose it.
+    config._source_path = None
+    config.compliance.do_not_contact = ["rival.example", "jane@other.example"]
+    register(FakeProvider([[
+        biz(domain="rival.example"),         # listed by domain
+        biz(domain="shop.rival.example"),    # subdomain of a listed domain
+        biz(domain="other.example"),         # only an ADDRESS there is listed
+        biz(domain="notrival.example"),      # lookalike, a different company
+        biz(domain="real.example"),
+    ]]))
+    report = await D.run_discovery(state, config, "fake",
+                                   [D.DiscoveryQuery(term="roofer")])
+    assert report.excluded == 2
+    assert report.junk == 0
+    assert report.new_companies == 3
+    assert not await state.company_exists("rival.example")
+    assert not await state.company_exists("shop.rival.example")
+    # An address entry bars a mailbox, not the company: still discoverable.
+    assert await state.company_exists("other.example")
+    assert await state.company_exists("notrival.example")
+
+
+@pytest.mark.asyncio
+async def test_an_empty_list_changes_discovery_not_at_all(state, config, register):
+    """The positive control. Without it, the test above could pass because
+    nothing was admitted rather than because the right two were refused."""
+    config._source_path = None
+    config.compliance.do_not_contact = []
+    register(FakeProvider([[biz(domain="rival.example"), biz(domain="real.example")]]))
+    report = await D.run_discovery(state, config, "fake",
+                                   [D.DiscoveryQuery(term="roofer")])
+    assert report.excluded == 0
+    assert report.new_companies == 2
+    assert await state.company_exists("rival.example")

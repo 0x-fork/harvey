@@ -625,6 +625,10 @@ def cmd_discover(args):
         print(f"    {r.get('new_companies', 0)} new companies, "
               f"{r.get('known_companies', 0)} already known")
         print(f"    {r.get('junk', 0)} filtered out as directories/aggregators")
+        # Only when it happened: a "0 skipped" line every run teaches people to
+        # stop reading the block, and this is the line worth noticing.
+        if r.get("excluded"):
+            print(f"    {r['excluded']} skipped — on your do-not-contact list")
         print(f"    {r.get('observations', 0)} observations recorded")
         print(f"    actual cost: ${r.get('actual_cost', 0):.4f}")
         if r.get("stopped"):
