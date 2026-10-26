@@ -42,9 +42,14 @@ RUN installer="$(mktemp)" \
     && rm "$installer" \
     && python -c "from harvey.claude_runtime import check_cli; print(check_cli())"
 
-# Healthy = the heartbeat loop has touched the database recently
-# (2h window tolerates long heartbeat intervals and quiet-hour idling).
-HEALTHCHECK --interval=5m --timeout=10s --start-period=3m --retries=3 \
-    CMD python -c "import os,sys,time; p='/app/data/harvey.db'; sys.exit(0 if os.path.exists(p) and time.time()-os.path.getmtime(p) < 7200 else 1)"
+# Healthy = the dashboard is accepting connections on its loopback port. The
+# heartbeat loop is started from the dashboard on demand, so database activity
+# is not a reliable liveness signal for the container's main process.
+HEALTHCHECK --interval=1m --timeout=10s --start-period=1m --retries=3 \
+  CMD python -c "import socket; socket.create_connection(('127.0.0.1', 5555), timeout=5).close()"
 
-CMD ["python", "-m", "harvey.main"]
+# WebUI first: `docker run` serves the dashboard; it starts/stops the
+# heartbeat loop itself. Any arguments replace the default command, so
+# `docker compose run --rm harvey setup` runs the setup wizard.
+ENTRYPOINT ["python", "-m", "harvey"]
+CMD ["dashboard"]

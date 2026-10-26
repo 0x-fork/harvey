@@ -148,6 +148,61 @@ harvey dashboard          # prints a private link to http://127.0.0.1:5555
 harvey run
 ```
 
+### Or deploy with Docker (Linux)
+
+The compose file runs the dashboard as the container's main process; you start
+and stop the heartbeat loop from the dashboard's Actions card, and its logs go
+to `data/logs/`. The dashboard only ever listens on 127.0.0.1 (by design —
+anyone with its unlock link can use it), so the container uses host networking
+to put that bind on your machine's loopback. That makes Docker deployments
+**Linux-only**; on macOS or Windows, use the pip install above.
+
+```bash
+# 1. Get the code
+git clone https://github.com/ethanplusai/harvey.git && cd harvey
+
+# 2. Create .env — compose requires it (env_file), and first-run setup writes
+#    your answers back into it through a bind mount, so a rebuilt container
+#    keeps its configuration.
+cp .env.example .env
+
+# 3. Build, then run the interactive setup wizard in the container.
+#    `docker compose run` attaches a terminal, so the wizard can ask its
+#    questions; what it writes lands in ./.env and ./harvey.yaml on the host.
+docker compose build
+docker compose run --rm harvey setup
+
+# 4. Start the dashboard and open the unlock link it printed
+docker compose up -d
+docker compose logs harvey | grep 127.0.0.1:5555
+```
+
+Notes:
+
+- **Codex isn't available in Docker.** The image ships the Claude CLI only
+  (see the Codex section below). If you want to run Harvey on a ChatGPT plan,
+  install it on the host with pip instead — a container can't use the Codex
+  CLI on your machine.
+- **Permissions.** The container runs as uid 1000 (`harvey`), so `./data`,
+  `./.env` and `./harvey.yaml` must be writable by that uid on the host
+  (`chown -R 1000:1000 data` if `docker compose run --rm harvey setup` fails
+  with a permission error).
+- **Port.** The dashboard listens on 5555. To change it, edit the `command`
+  line in `docker-compose.yml` (`--port`) and the port in the Dockerfile's
+  `HEALTHCHECK`.
+- **Persisting a trained product.** `harvey train` writes
+  `harvey.local.yaml` inside the container, which a rebuild discards. To keep
+  it, copy it out and enable its bind mount (commented out in
+  `docker-compose.yml`):
+
+  ```bash
+  docker compose run --rm --entrypoint cat harvey /app/harvey.local.yaml > harvey.local.yaml
+  ```
+
+  Don't create that file empty by hand: an existing `harvey.local.yaml` wins
+  over `harvey.yaml` when config loads, and an empty one reads as an empty
+  config.
+
 ---
 
 ## You confirm what it looks for
