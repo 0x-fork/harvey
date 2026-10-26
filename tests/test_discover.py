@@ -842,3 +842,73 @@ def test_homepage_prefers_stronger_brand_over_longer_partial_match():
     html = ('<meta property="og:site_name" content="Kettleman Landscaping">'
             '<title>Landscaping Professionals</title>')
     assert D.site_name_from_html(html, "kettlemanlandscaping.com") == "Kettleman Landscaping"
+
+
+# --- CLI startup key guard (ClickUp 14ypx6242jj) -----------------------
+#
+# `harvey discover --provider serper` with an empty or placeholder
+# SERPER_API_KEY used to exit 0 and record zero observations. cmd_discover
+# must refuse at startup - before the estimate, before any call - in both
+# collect and estimate mode, and never block the keyless default provider.
+
+from types import SimpleNamespace
+
+from harvey.cli import cmd_discover
+
+
+def _cli_args(**over):
+    base = dict(provider="serper", providers=False, estimate=False,
+                city="", depth=30, limit=100, max_spend=1.0, no_profile=True)
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def _fake_env(monkeypatch, **values):
+    from harvey import config as cfg
+    monkeypatch.setattr(
+        cfg, "load_env",
+        lambda: SimpleNamespace(model_dump=lambda: dict(values)))
+
+
+@pytest.mark.parametrize("estimate", [False, True])
+def test_missing_key_fails_loudly_at_startup(monkeypatch, capsys, estimate):
+    _fake_env(monkeypatch, serper_api_key="")
+    with pytest.raises(SystemExit) as ei:
+        cmd_discover(_cli_args(estimate=estimate))
+    assert ei.value.code == 1
+    out = capsys.readouterr().out
+    assert "provider skipped: missing key" in out
+    assert "SERPER_API_KEY" in out
+    assert "0 queries can run" in out
+    # The guard fires before the estimate is even attempted.
+    assert "Estimated cost" not in out
+
+
+def test_placeholder_key_is_treated_as_missing(monkeypatch, capsys):
+    _fake_env(monkeypatch, serper_api_key="your_key_here")
+    with pytest.raises(SystemExit) as ei:
+        cmd_discover(_cli_args())
+    assert ei.value.code == 1
+    assert "provider skipped: missing key" in capsys.readouterr().out
+
+
+def test_absent_key_is_treated_as_missing(monkeypatch, capsys):
+    _fake_env(monkeypatch)
+    with pytest.raises(SystemExit) as ei:
+        cmd_discover(_cli_args())
+    assert ei.value.code == 1
+    assert "SERPER_API_KEY" in capsys.readouterr().out
+
+
+def test_keyless_default_provider_is_never_blocked(monkeypatch, capsys):
+    # osm has no env_keys, so the startup guard must pass through. Reaching
+    # load_config (patched to raise) proves the guard let the command by.
+    _fake_env(monkeypatch)
+    from harvey import config as cfg
+
+    def _boom():
+        raise RuntimeError("reached-load-config")
+
+    monkeypatch.setattr(cfg, "load_config", _boom)
+    with pytest.raises(RuntimeError, match="reached-load-config"):
+        cmd_discover(_cli_args(provider="osm"))
