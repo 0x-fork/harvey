@@ -767,6 +767,7 @@ def cmd_warmup(args):
          + (d.check_ip_blocklists(smtp_host) if smtp_host else [])),
         ("Warmup & sending", [d.check_warmup(email.warmup, email.max_daily_sends,
                                              provider=email.provider),
+                              _warmup_service_check(sender, email.warmup),
                               d.check_send_history(*asyncio.run(_history()))]),
     ]
     icons = {d.OK: "OK  ", d.WARN: "WARN", d.FAIL: "FAIL", d.INFO: "info"}
@@ -792,10 +793,98 @@ def cmd_warmup(args):
     print("    - Google Postmaster Tools: https://postmaster.google.com - add the domain;")
     print("      it shows Gmail's spam rate and domain reputation once you send volume.")
     print("    - Inbox placement: send one email to a seed test (mail-tester.com is free)")
-    print("      and aim for 9/10+. Your warmup service's dashboard shows its inbox rate;")
-    print("      wait for ~95%+ inbox for a week before relying on cold sends.\n")
+    print("      and aim for 9/10+. TrulyInbox shows the warmup inbox rate, and with it")
+    print("      connected (harvey trulyinbox connect) Harvey reads it into this report.")
+    print("      Wait for ~95%+ inbox for a week before relying on cold sends.\n")
     if failed or unknown:
         raise SystemExit(1)
+
+
+def _warmup_service_check(address: str, warmup):
+    """The 'Warmup service' line: TrulyInbox's view of the mailbox, or the recommendation."""
+    from harvey import deliverability as d
+    from harvey.integrations import trulyinbox as ti
+    from harvey.state import StateManager
+
+    async def _run():
+        state = StateManager()
+        await state.init_db()
+        health, error = await ti.current_health(address)
+        other = health is None and not error and await ti.get_choice(state) == "other"
+        return d.check_warmup_service(health, warmup, error=error, other_service=other)
+    return asyncio.run(_run())
+
+
+def cmd_trulyinbox(args):
+    """Connect TrulyInbox, record another warmup service, or show the status."""
+    import getpass
+
+    from dotenv import load_dotenv
+
+    from harvey import deliverability as d
+    from harvey.config import ConfigError, load_config
+    from harvey.integrations import trulyinbox as ti
+    from harvey.paths import PROJECT_ROOT
+    from harvey.state import StateManager
+
+    load_dotenv(PROJECT_ROOT / ".env")
+    try:
+        config = load_config()
+    except ConfigError as e:
+        print(f"\n  {e}\n")
+        raise SystemExit(1)
+    address = ti.sending_address(config)
+    warmup = config.channels.email.warmup
+
+    async def _run():
+        state = StateManager()
+        await state.init_db()
+        if args.trulyinbox_action == "other":
+            await ti.set_choice(state, "other")
+            print("\n  Noted: you use another warmup service. Harvey won't ask about "
+                  "TrulyInbox again.\n")
+            return 0
+        if args.trulyinbox_action == "connect":
+            print(f"\n  Connect TrulyInbox. Don't have it yet? {ti.AFFILIATE_URL} {ti.AFFILIATE_TAG}")
+            print("  You need Starter or higher. In TrulyInbox, open Settings > API keys and")
+            print("  create a workspace key with accounts:read, warmup:read, analytics:read")
+            print("  and workspace:read.\n")
+            if not address:
+                print(f"\n  {ti.NO_ADDRESS}\n")
+                return 1
+            key = getpass.getpass("  TrulyInbox API key (hidden): ").strip()
+            if not key:
+                print("\n  No key entered.\n")
+                return 1
+            workspace = ti.key_from_env()[1]
+            ti.forget_rejected(key)
+            try:
+                client = ti.TrulyInbox(key, workspace)
+                health = await client.mailbox_health(address)
+            except ti.TrulyInboxError as e:
+                print(f"\n  {e}\n")
+                return 1
+            from harvey.dashboard import _write_env_file
+            updates = {"TRULYINBOX_API_KEY": key}
+            if not workspace:
+                updates["TRULYINBOX_WORKSPACE_ID"] = client.workspace_id
+            try:
+                _write_env_file(updates)
+            except OSError as e:
+                print(f"\n  The key works, but Harvey couldn't save it to .env: {e}\n")
+                return 1
+            await ti.set_choice(state, "connected")
+            print("\n  Connected. " + d.check_warmup_service(health, warmup).detail + "\n")
+            return 0
+        choice = await ti.get_choice(state)
+        health, error = await ti.current_health(address)
+        print(f"\n  TrulyInbox: {ti.describe_status(health, error, choice)}")
+        check = d.check_warmup_service(health, warmup, error=error,
+                                       other_service=choice == "other")
+        print(f"  {check.detail}\n")
+        return 0
+
+    raise SystemExit(asyncio.run(_run()))
 
 
 def cmd_sending(args):
@@ -976,6 +1065,14 @@ def main():
     sub.add_argument("domain", nargs="?", default="",
                      help="Domain to check (default: your sending mailbox's domain)")
     sub.set_defaults(func=cmd_warmup)
+
+    sub = subparsers.add_parser(
+        "trulyinbox", help="Warmup service: connect TrulyInbox so Harvey can read the inbox rate")
+    sub.add_argument("trulyinbox_action", nargs="?", default="status",
+                     choices=["status", "connect", "other"],
+                     help="connect a key, 'other' if you use another warmup service, "
+                          "or show the status (default)")
+    sub.set_defaults(func=cmd_trulyinbox)
 
     # harvey usage
     sub = subparsers.add_parser("usage", help="Show brain usage and quota (Claude or Codex)")

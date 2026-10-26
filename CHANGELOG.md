@@ -9,6 +9,13 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **TrulyInbox for warmup.** Harvey now recommends TrulyInbox for warming and
+  keeping sending mailboxes healthy, and reads it: `harvey trulyinbox connect`
+  (or the new warmup step on the dashboard's setup checklist) checks a key and
+  saves it, and `harvey warmup` then says whether the sending mailbox is
+  actually warmed: enrolled, signed in, warmed for `min_days`, and under 5%
+  spam in its warmup mail. Read-only; it never changes anything in TrulyInbox.
+  `harvey trulyinbox other` records that you use another warmup service.
 - **A do-not-contact list, enforced at send time.** `compliance.do_not_contact`
   takes addresses and domains Harvey must never email: competitors, your
   existing customers, anyone under a legal hold, a partner you agreed not to
@@ -172,6 +179,9 @@ minor versions can still change behaviour.
 
 ### Changed
 
+- **Setup comes first on Today.** Until setup is finished, the checklist sits at
+  the top of the Today page as a "Finish setting up Harvey" card, with the next
+  step highlighted, instead of at the bottom of the side column.
 - **Scout reads a company's site the way a person would.** It starts at the
   homepage and follows the site's own menu to its team, about, our-story,
   meet-the-doctors or attorneys pages (six pages at most), instead of

@@ -293,6 +293,29 @@ async def get_setup_status():
         "help": "Optional. For JavaScript-rendered website crawling during training.",
     })
 
+    # 9. Warmup service: TrulyInbox connected, or another service the user named
+    from harvey.integrations import trulyinbox as ti
+    try:
+        state = _state()
+        await state.init_db()
+        choice = await ti.get_choice(state)
+    except Exception:
+        choice = ""
+    if _has("TRULYINBOX_API_KEY"):
+        choice = "connected"
+    checks.append({
+        "id": "warmup_service",
+        "label": {"connected": "Warmup: TrulyInbox connected",
+                  "other": "Warmup: your own warmup service"}.get(choice, "Warm up your mailbox"),
+        "done": bool(choice),
+        # Instantly warms its own accounts, so there it's a suggestion, not a step.
+        "required": provider != "instantly",
+        "help": ("A new mailbox needs 2-4 weeks of warmup before cold email, and warmup "
+                 "keeps it out of spam after that. We recommend TrulyInbox: connect it and "
+                 "Harvey shows whether your mailbox is warmed."),
+        "link": ti.AFFILIATE_URL,
+    })
+
     required_checks = [c for c in checks if c["required"]]
     completed_required = sum(1 for c in required_checks if c["done"])
 
@@ -409,6 +432,61 @@ async def save_env_settings(request: Request):
             except Exception as e:
                 logger.warning("Failed to write .env: %s", e)
                 return {"success": False, "message": "Could not write .env file."}
+    return {"success": True}
+
+
+@app.post("/api/trulyinbox/connect")
+async def trulyinbox_connect(request: Request):
+    """Check a TrulyInbox key against the sending mailbox, then save it to .env."""
+    from harvey import deliverability as d
+    from harvey.integrations import trulyinbox as ti
+    try:
+        data = await request.json()
+    except Exception:
+        data = None
+    key = data.get("key") if isinstance(data, dict) else None
+    if not isinstance(key, str) or not key.strip() or len(key) > 512:
+        return JSONResponse({"success": False, "message": "Paste your TrulyInbox API key."},
+                            status_code=400)
+    key = key.strip()
+    try:
+        from harvey.config import load_config
+        config = load_config()
+        address, warmup = ti.sending_address(config), config.channels.email.warmup
+    except Exception:
+        address, warmup = "", None
+    if not address:
+        return JSONResponse({"success": False, "message": ti.NO_ADDRESS}, status_code=400)
+    workspace = (_read_env_file().get("TRULYINBOX_WORKSPACE_ID", "")
+                 or os.getenv("TRULYINBOX_WORKSPACE_ID", "")).strip()
+    ti.forget_rejected(key)
+    try:
+        client = ti.TrulyInbox(key, workspace)
+        health = await client.mailbox_health(address)
+    except ti.TrulyInboxError as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=400)
+    updates = {"TRULYINBOX_API_KEY": key}
+    if not workspace:
+        updates["TRULYINBOX_WORKSPACE_ID"] = client.workspace_id
+    async with _env_lock:
+        try:
+            _write_env_file(updates)
+        except Exception as e:
+            logger.warning("Failed to write .env: %s", e)
+            return {"success": False, "message": "Could not write .env file."}
+    state = _state()
+    await state.init_db()
+    await ti.set_choice(state, "connected")
+    return {"success": True, "message": d.check_warmup_service(health, warmup).detail}
+
+
+@app.post("/api/trulyinbox/other")
+async def trulyinbox_other():
+    """The user warms their mailbox with another service: stop recommending one."""
+    from harvey.integrations import trulyinbox as ti
+    state = _state()
+    await state.init_db()
+    await ti.set_choice(state, "other")
     return {"success": True}
 
 

@@ -664,14 +664,17 @@ async function loadSetupStatus() {
   // Finished setup disappears completely rather than greeting you forever.
   if (pct === 100) { el.innerHTML = ''; return; }
 
+  // The first unfinished required step is the one to do now.
+  const next = data.checks.find(c => c.required && !c.done);
   const renderCheck = (c, optional) =>
-    '<div class="check-item">' +
+    '<div class="check-item' + (c === next ? ' current' : '') + '">' +
       (c.done ? '<span class="check-icon done">' + icon('check') + '</span>'
               : '<span class="check-icon pending"></span>') +
       '<div class="check-info">' +
         '<div class="check-label ' + (c.done ? 'done' : '') + '">' + escHtml(c.label) +
           (optional ? '<span class="optional-tag">optional</span>' : '') + '</div>' +
         (!c.done ? '<div class="check-help">' + escHtml(c.help) + '</div>' : '') +
+        (!c.done && c.id === 'warmup_service' ? warmupServiceActions(c) : '') +
       '</div></div>';
 
   const required = data.checks.filter(c => c.required);
@@ -679,8 +682,10 @@ async function loadSetupStatus() {
   const done = required.filter(c => c.done).length;
 
   el.innerHTML =
-    '<div class="subhead">Setup <span class="setup-pct">' + done + ' of ' + required.length + ' done</span></div>' +
-    '<div class="card">' +
+    '<div class="card setup-card">' +
+      '<div class="setup-head"><div><h3>Finish setting up Harvey</h3>' +
+        '<p class="muted">Harvey starts finding prospects and sending once these are done.</p></div>' +
+        '<span class="setup-pct">' + done + ' of ' + required.length + ' done</span></div>' +
       '<div class="bar thick" style="margin-bottom:8px"><span style="width:' + pct + '%;background:var(--accent)"></span></div>' +
       required.map(c => renderCheck(c, false)).join('') +
       (optional.length
@@ -690,6 +695,43 @@ async function loadSetupStatus() {
           optional.map(c => renderCheck(c, true)).join('') + '</div></details>'
         : '') +
     '</div>';
+}
+
+// The warmup step: get TrulyInbox, paste its key, or say you use another service.
+function warmupServiceActions(c) {
+  return '<div class="btn-group warmup-actions">' +
+      '<a class="btn btn-primary btn-sm" href="' + safeHref(c.link) + '" target="_blank" ' +
+        'rel="noopener sponsored">Get TrulyInbox</a>' +
+      '<input class="form-input" id="trulyinbox-key" type="password" autocomplete="off" ' +
+        'placeholder="Paste your TrulyInbox API key" aria-label="TrulyInbox API key" ' +
+        'onkeydown="if (event.key === \'Enter\') connectTrulyInbox()">' +
+      '<button class="btn btn-secondary btn-sm" id="trulyinbox-go" onclick="connectTrulyInbox()">Connect</button>' +
+      '<button class="btn btn-ghost btn-sm" onclick="useOtherWarmup()">I use another service</button>' +
+    '</div>';
+}
+
+async function connectTrulyInbox() {
+  const input = document.getElementById('trulyinbox-key');
+  const go = document.getElementById('trulyinbox-go');
+  if (!input || !input.value.trim()) return;
+  if (go) go.disabled = true;
+  const data = await api('/api/trulyinbox/connect', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({key: input.value.trim()}),
+  });
+  if (go) go.disabled = false;
+  if (data && data.success) {
+    input.value = '';
+    showToast(data.message || 'TrulyInbox connected', 'success');
+    loadSetupStatus();
+  } else {
+    showToast((data && data.message) || 'Could not connect TrulyInbox', 'error');
+  }
+}
+
+async function useOtherWarmup() {
+  const data = await api('/api/trulyinbox/other', {method: 'POST'});
+  if (data && data.success) loadSetupStatus();
 }
 
 // ── Signals: Harvey proposes, you confirm ──
