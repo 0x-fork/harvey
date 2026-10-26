@@ -664,8 +664,10 @@ async function loadSetupStatus() {
   // Finished setup disappears completely rather than greeting you forever.
   if (pct === 100) { el.innerHTML = ''; return; }
 
+  // The first unfinished required step is the one to do now.
+  const next = data.checks.find(c => c.required && !c.done);
   const renderCheck = (c, optional) =>
-    '<div class="check-item">' +
+    '<div class="check-item' + (c === next ? ' current' : '') + '">' +
       (c.done ? '<span class="check-icon done">' + icon('check') + '</span>'
               : '<span class="check-icon pending"></span>') +
       '<div class="check-info">' +
@@ -680,8 +682,10 @@ async function loadSetupStatus() {
   const done = required.filter(c => c.done).length;
 
   el.innerHTML =
-    '<div class="subhead">Setup <span class="setup-pct">' + done + ' of ' + required.length + ' done</span></div>' +
-    '<div class="card">' +
+    '<div class="card setup-card">' +
+      '<div class="setup-head"><div><h3>Finish setting up Harvey</h3>' +
+        '<p class="muted">Harvey starts finding prospects and sending once these are done.</p></div>' +
+        '<span class="setup-pct">' + done + ' of ' + required.length + ' done</span></div>' +
       '<div class="bar thick" style="margin-bottom:8px"><span style="width:' + pct + '%;background:var(--accent)"></span></div>' +
       required.map(c => renderCheck(c, false)).join('') +
       (optional.length
@@ -703,8 +707,7 @@ function warmupServiceActions(c) {
         'onkeydown="if (event.key === \'Enter\') connectTrulyInbox()">' +
       '<button class="btn btn-secondary btn-sm" id="trulyinbox-go" onclick="connectTrulyInbox()">Connect</button>' +
       '<button class="btn btn-ghost btn-sm" onclick="useOtherWarmup()">I use another service</button>' +
-    '</div>' +
-    '<div class="check-help affiliate-note">Affiliate link</div>';
+    '</div>';
 }
 
 async function connectTrulyInbox() {
