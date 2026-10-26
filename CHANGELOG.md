@@ -179,6 +179,9 @@ minor versions can still change behaviour.
 
 ### Changed
 
+- **Setup comes first on Today.** Until setup is finished, the checklist sits at
+  the top of the Today page as a "Finish setting up Harvey" card, with the next
+  step highlighted, instead of at the bottom of the side column.
 - **Scout reads a company's site the way a person would.** It starts at the
   homepage and follows the site's own menu to its team, about, our-story,
   meet-the-doctors or attorneys pages (six pages at most), instead of

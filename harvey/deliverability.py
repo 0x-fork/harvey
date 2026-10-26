@@ -245,8 +245,8 @@ def check_warmup(warmup, ceiling: int, today: date | None = None,
                  "Keep the warmup service running alongside Harvey.")
 
 
-# Upbird's rule: warmup spam at or above this, over enough mail to judge,
-# means the mailbox isn't ready whatever the day count says.
+# Warmup spam at or above this, over enough mail to judge, means the mailbox
+# isn't ready whatever the day count says.
 MAX_WARMUP_SPAM = 0.05
 MIN_WARMUP_SAMPLE = 20
 
