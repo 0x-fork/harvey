@@ -24,6 +24,7 @@ import asyncio
 import time
 import base64
 import logging
+import math
 import re
 from html import unescape
 from dataclasses import dataclass, field, replace
@@ -513,6 +514,10 @@ class DiscoveryProvider:
     # Shared helper: providers report their own per-query spend so the run log
     # records what actually happened, not what was projected.
     last_cost: float = 0.0
+    last_error: str = ""
+    stop_reason: str = ""
+    complete: bool = True
+    remaining_budget: float = math.inf
 
 
 class DataForSEOListings(DiscoveryProvider):
@@ -1151,6 +1156,255 @@ class OpenStreetMap(DiscoveryProvider):
         return out
 
 
+class ScavioProvider(DiscoveryProvider):
+    """Shared plumbing for the two Scavio adapters: one key, one credit price.
+
+    Scavio bills 1 credit per page. A page that fails after earlier pages
+    succeeded ends the query with what it already has, the same rule the run
+    loop applies between queries. A failure on the first page raises:
+    returning [] would make an expired key look like an empty market.
+    """
+
+    signup_url = "https://scavio.dev"
+    env_keys = ("scavio_api_key",)
+    free_tier = "50 credits on signup, no card"
+
+    API = "https://api.scavio.dev/api/v2/google"
+    # Conservative pay-as-you-go price; subscription credits can cost less.
+    CREDIT_PRICE = 0.01
+    MIN_INTERVAL = 1.05  # free accounts allow one request per second
+
+    def __init__(self):
+        self._last_call = 0.0
+
+    async def _post(self, client, env, path: str, body: dict) -> dict:
+        if self.last_cost + self.CREDIT_PRICE > self.remaining_budget + 1e-12:
+            raise ProviderExhausted("Scavio: budget reached before the next page")
+        wait = self._last_call + self.MIN_INTERVAL - time.monotonic()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        self._last_call = time.monotonic()
+        try:
+            r = await client.post(
+                f"{self.API}{path}",
+                headers={"Authorization": f"Bearer {env['scavio_api_key']}",
+                         "Content-Type": "application/json"},
+                json=body,
+            )
+        except httpx.HTTPError:
+            raise RuntimeError("Scavio: request failed; try again later") from None
+        # Never put response bodies in logs: upstream errors may echo secrets.
+        if r.status_code in (401, 402, 403, 429):
+            reasons = {401: "invalid API key", 402: "insufficient credits",
+                       403: "access refused", 429: "rate limit reached"}
+            raise ProviderExhausted(f"Scavio {r.status_code}: {reasons[r.status_code]}")
+        if r.status_code >= 400:
+            raise RuntimeError(f"Scavio {r.status_code}: request failed")
+        # A successful response is billable even if its body is malformed.
+        self.last_cost += self.CREDIT_PRICE
+        try:
+            data = r.json()
+        except ValueError:
+            raise RuntimeError("Scavio: invalid JSON response") from None
+        if not isinstance(data, dict) or data.get("error"):
+            raise RuntimeError("Scavio: invalid response")
+        credits = data.get("credits_used", 1)
+        if (isinstance(credits, (int, float)) and not isinstance(credits, bool)
+                and math.isfinite(credits) and credits >= 0):
+            self.last_cost += (credits - 1) * self.CREDIT_PRICE
+        return data
+
+    async def _pages(self, client, env, query, path: str, body: dict,
+                     results_key: str, page_size: int, pages: int
+                     ) -> list[tuple[int, dict]]:
+        """Every result as (offset of its page, item), page by page."""
+        self.last_cost = 0.0
+        self.last_error = self.stop_reason = ""
+        self.complete = True
+        rows: list[tuple[int, dict]] = []
+        for page in range(pages):
+            start = page * page_size
+            try:
+                data = await self._post(client, env, path, dict(body, start=start))
+                items = data.get(results_key)
+                if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+                    raise RuntimeError("Scavio: invalid results list")
+                for item in items:
+                    for field in ("title", "website", "link", "phone", "address", "type", "place_id"):
+                        if item.get(field) is not None and not isinstance(item[field], str):
+                            raise RuntimeError("Scavio: invalid result field")
+                    for field in ("rating", "reviews", "position"):
+                        value = item.get(field)
+                        if value is not None and (isinstance(value, bool)
+                                or not isinstance(value, (int, float))
+                                or not math.isfinite(value) or value < 0):
+                            raise RuntimeError("Scavio: invalid numeric result field")
+                last_page = self._last_page(data, items, page_size)
+            except Exception as e:
+                self.complete = False
+                self.last_error = str(e)
+                if isinstance(e, ProviderExhausted):
+                    self.stop_reason = str(e)
+                if not rows:
+                    raise
+                logger.warning("%s: page %d of %r failed, keeping %d results: %s",
+                               self.key, page + 1, query.keyword(), len(rows), e)
+                break
+            rows.extend((start, item) for item in items)
+            if last_page:
+                break
+        return rows
+
+    def _last_page(self, data: dict, items: list, page_size: int) -> bool:
+        return len(items) < page_size
+
+
+class ScavioMaps(ScavioProvider):
+    """Google Maps listings, the source issue #28 asked for.
+
+    Every place Google Maps shows for a search around a point, with phone,
+    website, category, rating and review count. Businesses with no website
+    are kept, like the other listings providers.
+    """
+
+    key = "scavio_maps"
+    needs_coordinates = True
+    label = "Scavio Google Maps"
+    kind = "listings"
+    blurb = ("Google Maps results around each city: phone, website, category, "
+             "rating and review count for every place. Up to 120 businesses "
+             "per search.")
+    cost_note = "1 credit per page (up to 20 listings); estimates use $0.01/credit"
+    caveat = ("Google Maps does not say whether a listing is claimed, so the "
+              "unclaimed-listing signal stays empty. Same key as Scavio Google "
+              "Search.")
+
+    PAGE_SIZE = 20
+    MAX_PAGES = 6        # the API accepts start up to 100
+
+    def _page_count(self, query: DiscoveryQuery) -> int:
+        return max(1, min(self.MAX_PAGES, -(-query.limit // self.PAGE_SIZE)))
+
+    def estimate(self, queries):
+        return sum(self.CREDIT_PRICE * self._page_count(q) for q in queries)
+
+    @staticmethod
+    def map_center(coordinate: str) -> str:
+        """"39.7392,-104.9903,40" -> "@39.7392,-104.9903,10z".
+
+        Google Maps takes a center and a zoom, not a radius. A zoom-z view
+        spans roughly 40,000 km / 2^z, so a 40 km radius is zoom 10 (one
+        metro area) and 5 km is zoom 13.
+        """
+        parts = [p.strip() for p in coordinate.split(",")]
+        if len(parts) < 2 or not all(parts[:2]):
+            return ""
+        try:
+            lat, lng = float(parts[0]), float(parts[1])
+            if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+                return ""
+        except ValueError:
+            return ""
+        try:
+            radius_km = float(parts[2]) if len(parts) > 2 and parts[2] else 40.0
+        except ValueError:
+            radius_km = 40.0
+        if not math.isfinite(radius_km) or radius_km <= 0:
+            radius_km = 40.0
+        zoom = round(math.log2(40000 / max(radius_km, 0.5)))
+        return f"@{parts[0]},{parts[1]},{max(3, min(zoom, 16))}z"
+
+    async def fetch(self, client, env, query):
+        # The map center picks the area, as it does in the Maps app. Without
+        # one the API falls back to a default city for the country, so the
+        # place name has to ride in the query instead.
+        center = self.map_center(query.coordinate) if query.coordinate else ""
+        body = {"query": query.term, "ll": center} if center else {"query": query.keyword()}
+
+        out = []
+        for _, item in await self._pages(
+                client, env, query, "/maps/search", body, "local_results",
+                self.PAGE_SIZE, self._page_count(query)):
+            name = item.get("title") or ""
+            if not name:
+                continue
+            site = item.get("website") or ""
+            place_id = item.get("place_id") or ""
+            out.append(Business(
+                name=name,
+                domain=normalize_domain(site),
+                website=site,
+                phone=item.get("phone") or "",
+                address=item.get("address") or "",
+                location=query.location,
+                category=item.get("type") or "",
+                rating=item.get("rating"),
+                review_count=item.get("reviews"),
+                has_website=bool(site),
+                # A Maps list position is not an organic rank, so rank stays
+                # None and no SERP_RANK is recorded for it.
+                external_id=f"gmaps:{place_id}" if place_id else "",
+                source_url=(f"https://www.google.com/maps/place/?q=place_id:{place_id}"
+                            if place_id else site),
+                provider=self.key,
+            ))
+        return out
+
+
+class ScavioSearch(ScavioProvider):
+    """Google organic results with rank, from the same key as Scavio Maps."""
+
+    key = "scavio_search"
+    rank_codes = ("SERP_RANK",)
+    label = "Scavio Google Search"
+    kind = "serp"
+    blurb = ("Google organic results with rank positions. One Scavio key "
+             "covers this and Google Maps listings.")
+    cost_note = "1 credit per page (up to 10 results); depth 30 estimated at $0.03"
+    caveat = ("Results come from google.com in English (US) unless the search "
+              "names another place. Depth 20-30 is the sweet spot.")
+
+    PAGE_SIZE = 10
+
+    def estimate(self, queries):
+        return sum(self.CREDIT_PRICE * max(1, -(-q.depth // self.PAGE_SIZE))
+                   for q in queries)
+
+    def _last_page(self, data, items, page_size):
+        # Google often shows fewer than 10 organic results on a page (a local
+        # pack or videos take the space), so a short page is not the end.
+        # The end is when Google offers no next page.
+        pagination = data.get("pagination") or {}
+        if not isinstance(pagination, dict):
+            raise RuntimeError("Scavio: invalid pagination")
+        return not items or not pagination.get("next")
+
+    async def fetch(self, client, env, query):
+        out = []
+        for start, item in await self._pages(
+                client, env, query, "", {"query": query.keyword()},
+                "organic_results", self.PAGE_SIZE,
+                max(1, -(-query.depth // self.PAGE_SIZE))):
+            domain = normalize_domain(item.get("link") or "")
+            if not domain:
+                continue
+            position = item.get("position")
+            out.append(Business(
+                name=business_name(item.get("title") or "", domain),
+                raw_title=item.get("title") or "",
+                domain=domain,
+                website=item.get("link") or "",
+                location=query.location,
+                # `position` restarts at 1 on every page, so page 2's first
+                # result is rank 11, not rank 1.
+                rank=start + position if isinstance(position, int) and position > 0 else None,
+                has_website=True,
+                source_url=item.get("link") or "",
+                provider=self.key,
+            ))
+        return out
+
+
 PROVIDERS: dict[str, DiscoveryProvider] = {
     p.key: p for p in (
         OpenStreetMap(),
@@ -1159,6 +1413,8 @@ PROVIDERS: dict[str, DiscoveryProvider] = {
         DataForSEOSerp(),
         DataForSEOMaps(),
         Serper(),
+        ScavioMaps(),
+        ScavioSearch(),
     )
 }
 
@@ -1476,9 +1732,11 @@ async def run_discovery(
                 try:
                     report.queries_ran += 1
                     provider.last_cost = 0.0
+                    provider.last_error = provider.stop_reason = ""
+                    provider.complete = True
+                    provider.remaining_budget = max(0.0, max_spend - report.actual_cost)
                     found = await provider.fetch(client, env, query)
                     report.queries_succeeded += 1
-                    report.actual_cost += provider.last_cost
                 except ProviderExhausted as e:
                     logger.warning("discover: %s stopped: %s", provider_key, e)
                     report.stopped = str(e)
@@ -1490,7 +1748,11 @@ async def run_discovery(
                                    provider_key, query.keyword(), e)
                     report.errors.append(f"{query.keyword()}: {e}")
                     continue
+                finally:
+                    report.actual_cost += provider.last_cost
 
+                if provider.last_error:
+                    report.errors.append(f"{query.keyword()}: {provider.last_error}")
                 report.found += len(found)
                 batch = []
                 for biz in found:
@@ -1554,7 +1816,7 @@ async def run_discovery(
                 # it this run has found, is no longer ranked (within depth) or
                 # no longer in the pack. Say so, so the latest reading is true.
                 phrase = query.keyword()
-                for code in provider.rank_codes:
+                for code in provider.rank_codes if provider.complete else ():
                     if code not in confirmed:
                         continue
                     found_now = ranked_in_run.setdefault((code, phrase), set())
@@ -1571,6 +1833,9 @@ async def run_discovery(
                 if batch:
                     report.observations += await state.add_observations(
                         batch, run_id=report.run_id)
+                if provider.stop_reason:
+                    report.stopped = provider.stop_reason
+                    break
 
         await state.finish_run(report.run_id, status="completed",
                                records=report.new_companies + report.known_companies,

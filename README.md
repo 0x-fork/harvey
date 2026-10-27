@@ -264,6 +264,8 @@ harvey discover               # go
 | **DataForSEO SERP** | $0.006 / search at depth 30 (Live, $0.002 per 10 results) | $1 credit + free sandbox | Organic rank as the buying signal, plus who holds the local 3-pack, searched from the city centre. |
 | **DataForSEO Google Maps** | $0.002 / search (up to 100 results) | $1 credit + free sandbox | Map rank, rating, category and claimed status, including businesses with no website. |
 | **Serper** | ~$0.30–1.00 / 1,000 | 2,500 free, no card | The easiest paid one to try. |
+| **Scavio Google Maps** | $0.01 / page (up to 20 listings) | 50 credits, no card | Google Maps listings around each city: phone, website, category, rating and reviews, including businesses with no website. |
+| **Scavio Google Search** | ~$0.03 / depth-30 search | same 50 credits | Rank as the signal, on the same key as Scavio Google Maps. |
 
 **Selling to startups?** Harvey has a built-in startup skill, made of three
 parts:

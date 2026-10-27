@@ -9,6 +9,12 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Scavio discovery providers** (`scavio_maps`, `scavio_search`). Google Maps
+  listings around each city, with phone, website, category, rating and review
+  count, and Google organic results with rank, both from one
+  `SCAVIO_API_KEY`. Maps is 1 credit per 20 businesses and Search 1 credit per
+  10 results; estimates use the $0.01 pay-as-you-go credit price. Off unless
+  you pick one in `harvey discover` or the dashboard. Closes #28.
 - **TrulyInbox for warmup.** Harvey now recommends TrulyInbox for warming and
   keeping sending mailboxes healthy, and reads it: `harvey trulyinbox connect`
   (or the new warmup step on the dashboard's setup checklist) checks a key and

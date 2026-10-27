@@ -230,7 +230,7 @@ const SOURCE_LABELS = {
   scraped_mailto: 'Published address', hunter_domain_search: 'Hunter', linkedin_search: 'LinkedIn',
   job_board: 'Job board', web_search: 'Web search', company_inbox: 'Company inbox',
   osm: 'OpenStreetMap', dataforseo_listings: 'DataForSEO', dataforseo_serp: 'DataForSEO SERP', dataforseo_maps: 'DataForSEO Maps',
-  serper: 'Serper', tinyfish: 'TinyFish',
+  serper: 'Serper', tinyfish: 'TinyFish', scavio_maps: 'Scavio Maps', scavio_search: 'Scavio Search',
 };
 function sourceLabel(s) {
   if (!s) return '';
