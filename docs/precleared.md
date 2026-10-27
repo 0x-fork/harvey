@@ -40,8 +40,9 @@ One request per new address: the address, `sender_country`,
   once the coordinates discovery cached for that place settle it. Precleared
   takes it as settled, so a reading Harvey is not sure of is never sent: that
   same code with no coordinates (Delaware by convention), a city on its own,
-  or coordinates alone. The zone already stored on a prospect counts too,
-  when it did not come from coordinates alone.
+  or coordinates alone. A stored time zone alone never establishes the
+  country, because it may come from approximate or stale location data.
+  Coordinates far from both readings of an ambiguous code do not settle it.
 - **`default_recipient_country`**, otherwise, if there is one:
   `prospect_country`, or the one country every entry in `icp.geography` is
   certainly in ("Austin, TX" and "Denver, Colorado" give `US`; "Denver, CO"
@@ -68,8 +69,11 @@ the country read from it).
 ## When the check is held up
 
 If Precleared cannot answer (free checks used up, key out of checks or
-rejected, or it cannot be reached), cold email waits for a later cycle.
-Replies still go out. The Today page and `harvey status` say how many cold
+rejected, or it cannot be reached), new checks wait for a later cycle.
+Valid cached verdicts still apply, using the same recipient-country facts
+as a fresh check. Replies still go out. Address-specific failures postpone
+that email six hours; failures at two distinct domains without a fresh answer
+pause further checks. The Today page and `harvey status` say how many cold
 emails are waiting and what fixes it. The next answered check clears the
 notice, and so does switching the check off.
 
