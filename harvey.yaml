@@ -60,6 +60,9 @@ channels:
     # start_sends by daily_increase a day up to max_daily_sends. Replies are
     # never held. Gmail/Microsoft/SMTP only (Instantly has its own warmup).
     # Check readiness any time with `harvey warmup`.
+    # We recommend TrulyInbox for warmup: https://trulyinbox.com/?via=harvey
+    # Connect it (`harvey trulyinbox connect`) and `harvey warmup` reads
+    # whether this mailbox is actually warmed.
     warmup:
       start_date: ""            # YYYY-MM-DD; blank = no ramp
       min_days: 14
@@ -106,6 +109,16 @@ compliance:
   postal_address: ""
   # Keep wording Harvey recognises as an opt-out ("no thanks", "unsubscribe").
   opt_out_line: 'Not interested? Reply "no thanks" and I won''t email again.'
+  # Never email these, cold or in reply: competitors, your existing customers,
+  # anyone under a legal hold. An entry is an address or a domain, and a domain
+  # covers its subdomains ("acme.example" also blocks "mail.acme.example", but
+  # not "notacme.example"). Checked by the gate at send time, so it holds even
+  # for an email you already approved in the Outbox, and picked up by a running
+  # Harvey at once. If you trained Harvey, set it in harvey.local.yaml instead:
+  # that file wins.
+  do_not_contact: []
+  #   - "competitor.example"
+  #   - "jane@acme.example"
   precleared:
     enabled: false
     sender_country: ""          # GB or US: where your business is based

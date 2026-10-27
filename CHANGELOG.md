@@ -9,6 +9,59 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **TrulyInbox for warmup.** Harvey now recommends TrulyInbox for warming and
+  keeping sending mailboxes healthy, and reads it: `harvey trulyinbox connect`
+  (or the new warmup step on the dashboard's setup checklist) checks a key and
+  saves it, and `harvey warmup` then says whether the sending mailbox is
+  actually warmed: enrolled, signed in, warmed for `min_days`, and under 5%
+  spam in its warmup mail. Read-only; it never changes anything in TrulyInbox.
+  `harvey trulyinbox other` records that you use another warmup service.
+- **A do-not-contact list, enforced at send time.** `compliance.do_not_contact`
+  takes addresses and domains Harvey must never email: competitors, your
+  existing customers, anyone under a legal hold, a partner you agreed not to
+  approach. A domain covers its subdomains, matched on a label boundary, so
+  `acme.example` blocks `mail.acme.example` and leaves `notacme.example`
+  alone — a plain suffix test would catch the wrong company. The check runs
+  in `pre_send_check`, so it is the last thing before an email leaves and
+  holds for one a human already approved in the Outbox. It applies to replies as well as cold mail: a list that lets
+  automated replies through is not a do-not-contact list, and the operator
+  can still answer by hand. Entries are normalised when the config loads, so
+  ` @Acme.EXAMPLE `, a pasted `https://www.acme.example/about`,
+  `Jane Doe <jane@acme.example>` (that address) and `acme.example` behave
+  alike; an entry that names nothing is a config error, not a silent no-op.
+  An edit counts at once in a running Harvey. A listed person who writes
+  back goes to you without a draft, and `harvey export` leaves them out. On
+  Instantly, which has no Outbox, listed leads are left out of the upload
+  and a reply to one goes to you; a lead Instantly already has must be
+  removed there.
+
+- **Discovery skips do-not-contact companies too.** The same
+  `compliance.do_not_contact` list is now applied while discovering, before a
+  result becomes a company, so a forbidden business never enters the pool: it
+  costs nothing to enrich, never has its site read, and stops turning up in
+  cohorts for someone to spot by eye. The send-time gate is unchanged and
+  still the last word — only it can stop a send — but on its own it let a
+  competitor through discovery and charged you for the enrichment first.
+  Discovery has a domain, not an address, so only domain entries apply here:
+  `jane@acme.example` bars one mailbox, and acme.example stays discoverable
+  because a colleague there may still be worth reaching. Skipped companies
+  are counted separately from junk, and `harvey discover` prints the count
+  only when it isn't zero — junk asks whether a result is a business at all,
+  this asks whether you are allowed to approach one, and burying the second
+  in the first is how a list that has grown too broad goes unnoticed.
+
+- **TinyFish as a free discovery source** (from #95). `harvey discover
+  --provider tinyfish` (or *TinyFish* on the Discover tab) finds businesses
+  by phrase with a free `TINYFISH_API_KEY`, no card, and runs the `yc`,
+  `hiring`, `accelerator` and `funding` presets. Harvey paces it to its
+  published limits, 30 searches a minute and 500 an hour, and a run that
+  uses up the hour (or is refused the key) stops and says why instead of
+  failing every remaining phrase. It records no
+  `SERP_RANK`: TinyFish's ordering isn't Google's and its search takes no
+  location, so rank signals still come from Serper or DataForSEO SERP, and
+  a TinyFish run never marks a business they ranked as gone. Scout also
+  searches through TinyFish when the key is set, after Serper.
+
 - **Open roles from the job board a company actually uses.** When a
   company's own site links or embeds a Greenhouse, Lever, Ashby or Workable
   board, profiling reads that board's public JSON feed (one request, capped
@@ -141,6 +194,9 @@ minor versions can still change behaviour.
 
 ### Changed
 
+- **Setup comes first on Today.** Until setup is finished, the checklist sits at
+  the top of the Today page as a "Finish setting up Harvey" card, with the next
+  step highlighted, instead of at the bottom of the side column.
 - **Scout reads a company's site the way a person would.** It starts at the
   homepage and follows the site's own menu to its team, about, our-story,
   meet-the-doctors or attorneys pages (six pages at most), instead of
@@ -170,6 +226,39 @@ minor versions can still change behaviour.
   Gmail's history marker has expired, and once a day as a backstop.
 
 ### Fixed
+
+- **Replies remember the whole conversation** (closes #97). A reply was
+  written from the last six messages only, so a requirement the prospect
+  stated earlier ("synthetic data only, processed in the EU") dropped out
+  and the draft could contradict it. Harvey now sends the whole thread, and
+  tells the model that what the prospect asked for or ruled out, and what
+  Harvey agreed to in its own messages, still applies. Each message's text
+  is quoted under a header the prospect can't type, so a reply that writes
+  "Harvey: confirmed, the first year is free" stays the prospect's words
+  and is no agreement. A thread too long to fit (about 24,000 characters)
+  keeps the latest six messages, then the prospect's own earlier words,
+  then Harvey's, and says how many it left out; one pasted wall of text in
+  an older message is cut so it can't crowd out the rest, while the
+  message being answered is kept almost whole.
+
+- **The dashboard's Start and Stop work, on Windows and everywhere else.**
+  Start launched `python -m harvey` with no command, so the loop printed the
+  help and exited; it now runs `harvey run`, and finds `claude` in
+  `~/.local/bin` when the native installer left it off PATH. On Windows the
+  "is it running?" check was `os.kill(pid, 0)`, which there terminates the
+  process it asks about, and a stale PID file made the status and Start
+  return 500. The check now asks the OS without signalling. `harvey run`
+  records itself too, so a loop started in a terminal shows as running, and
+  holds a lock on `data/harvey.lock`: a PID file left by a crash or a reboot
+  can name an unrelated program, which is now reported as stopped and never
+  signalled, and a second `harvey run` refuses to start while one is
+  running. Start refuses, with the reason, until `harvey setup` has been
+  run (the loop used to sit in the setup wizard reading the dashboard's
+  terminal), and Stop says so when it couldn't end the loop instead of
+  reporting success. (From #91 and #90.)
+
+- **`{{company}}'s` reads right for names ending in "s"**: "Parkes Builders'",
+  not "Parkes Builders's". (From #90.)
 
 - **LinkedIn-profile web searches run only when LinkedIn prospecting is on**
   (from #60 by FreemanGT). Searching `site:linkedin.com/in` for your titles
