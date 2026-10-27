@@ -777,9 +777,8 @@ async def get_stats():
         action_count = actions[0]["count"] if actions else 0
 
         # usage_log rows are keyed by the LOCAL date (increment_usage /
-        # get_usage_today use date.today()); SQLite's date('now') is UTC, so
-        # this read missed every row logged since local midnight until 05:30
-        # IST (00:00-05:30 in any UTC+ zone).
+        # get_usage_today use date.today()); SQLite's date('now') is UTC and
+        # can select a different day's counts on either side of UTC midnight.
         usage = await query_db(
             "SELECT claude_calls, codex_calls FROM usage_log WHERE date = ?",
             (date.today().isoformat(),),
