@@ -17,6 +17,8 @@ from pydantic import ValidationError
 
 from harvey.config import PreclearedConfig
 from harvey.integrations.precleared import SETTINGS_PREFIX, PreclearedClient
+from harvey.models.company import Company
+from harvey.models.prospect import COMPANY_INBOX_SOURCE, Prospect
 from harvey.state import StateManager
 from tests.test_outbox_native import (
     Cfg,
@@ -189,12 +191,14 @@ async def test_prospect_country_is_sent_as_a_fallback_only_when_set(state):
     without = PreclearedClient("US", transport=mock_precleared(calls, OK_BODY))
     await without.clear("jane@acme.com", state)
     assert "default_recipient_country" not in calls[0]["json"]
+    assert "recipient_country" not in calls[0]["json"]
 
     with_country = PreclearedClient(
         "US", prospect_country="US", transport=mock_precleared(calls, OK_BODY),
     )
     await with_country.clear("john@acme.com", state)
     assert calls[1]["json"]["default_recipient_country"] == "US"
+    assert "recipient_country" not in calls[1]["json"]
 
 
 @pytest.mark.asyncio
@@ -238,6 +242,279 @@ def test_prospect_country_changes_the_cache_fingerprint_only_when_set():
     assert PreclearedClient("US", prospect_country="US")._fingerprint() != base
 
 
+# ── the recipient's country ──
+
+
+FOUND_GB = {**OK_BODY, "facts": {"recipient_country": "GB", "country_source": "domain"}}
+
+
+@pytest.mark.asyncio
+async def test_confident_country_is_sent_as_recipient_country(state):
+    calls = []
+    client = PreclearedClient("GB", prospect_country="GB", transport=mock_precleared(calls, OK_BODY))
+    await client.clear("jane@acme.com", state, country="US")
+    assert calls[0]["json"]["recipient_country"] == "US"
+    # Never both: the default is for when nobody knows the country.
+    assert "default_recipient_country" not in calls[0]["json"]
+    await client.clear("john@acme.com", state, country="us")
+    assert calls[1]["json"]["recipient_country"] == "US"
+
+
+def _config(geography, prospect_country=""):
+    return SimpleNamespace(
+        compliance=SimpleNamespace(precleared=PreclearedConfig(
+            enabled=True, sender_country="US", prospect_country=prospect_country)),
+        product=SimpleNamespace(description=""),
+        icp=SimpleNamespace(geography=geography, geo_coordinates={}),
+    )
+
+
+def test_icp_country_is_the_default_when_prospect_country_is_unset():
+    env = SimpleNamespace(precleared_api_key="")
+    one = PreclearedClient.from_config(_config(["Austin, TX", "Denver, Colorado"]), env)
+    assert one.default_country == "US" and one.prospect_country == ""
+    assert PreclearedClient.from_config(_config(["Austin, TX", "Toronto, ON"]), env).default_country == ""
+    assert PreclearedClient.from_config(_config([]), env).default_country == ""
+    # prospect_country wins when both exist.
+    both = PreclearedClient.from_config(_config(["Austin, TX"], prospect_country="GB"), env)
+    assert both.prospect_country == "GB" and both.default_country == "GB"
+    # Built directly (the tests' configs have no ICP), the same normalising.
+    assert PreclearedClient("US", default_country="uk").default_country == "GB"
+    assert PreclearedClient("US", prospect_country="GB", default_country="US").default_country == "GB"
+
+
+@pytest.mark.asyncio
+async def test_icp_country_is_sent_as_the_default(state):
+    calls = []
+    client = PreclearedClient("US", default_country="US", transport=mock_precleared(calls, OK_BODY))
+    await client.clear("jane@acme.com", state)
+    assert calls[0]["json"]["default_recipient_country"] == "US"
+    assert "recipient_country" not in calls[0]["json"]
+    await client.clear("john@acme.com", state, country="GB")
+    assert calls[1]["json"]["recipient_country"] == "GB"
+    assert "default_recipient_country" not in calls[1]["json"]
+
+
+def test_country_changes_the_fingerprint_only_when_set():
+    client = PreclearedClient("US")
+    base = client._fingerprint()
+    assert client._fingerprint("") == base
+    assert client._fingerprint("GB") != base
+    assert client._fingerprint("GB") != client._fingerprint("US")
+    # A default is no part of the question once the country is known.
+    assert PreclearedClient("US", prospect_country="GB")._fingerprint("US") == client._fingerprint("US")
+    # The ICP's country counts only while it stands in for prospect_country,
+    # so verdicts cached under prospect_country are untouched by it.
+    assert PreclearedClient("US", default_country="US")._fingerprint() != base
+    assert (PreclearedClient("US", prospect_country="GB", default_country="US")._fingerprint()
+            == PreclearedClient("US", prospect_country="GB")._fingerprint())
+
+
+@pytest.mark.asyncio
+async def test_a_verdict_cached_without_a_country_is_kept_when_there_is_still_none(state):
+    calls = []
+    client = PreclearedClient("US", transport=mock_precleared(calls, OK_BODY))
+    await client.clear("jane@acme.com", state)
+    await client.clear("jane@acme.com", state)
+    assert (await client.clear("jane@acme.com", state, country="")).cached
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_new_confident_country_forces_one_fresh_check_then_caches(state):
+    # OK_BODY names no country, so a country now known is a new question:
+    # one more check, then cached again.
+    calls = []
+    client = PreclearedClient("US", transport=mock_precleared(calls, OK_BODY))
+    await client.clear("jane@acme.com", state)
+    await client.clear("jane@acme.com", state, country="GB")
+    await client.clear("jane@acme.com", state, country="GB")
+    assert len(calls) == 2
+    assert calls[1]["json"]["recipient_country"] == "GB"
+
+
+@pytest.mark.asyncio
+async def test_a_verdict_precleared_decided_for_the_same_country_is_kept(state):
+    # Cached before Harvey sent countries, with the one Precleared found
+    # itself: Harvey now knowing the same one asks the same question.
+    calls = []
+    client = PreclearedClient("US", transport=mock_precleared(calls, FOUND_GB))
+    await client.clear("jane@acme.com", state)
+    again = await client.clear("jane@acme.com", state, country="GB")
+    assert again.cached and again.country == "GB" and len(calls) == 1
+    assert await client.known_country("jane@acme.com", state, "GB") == "GB"
+    # A different country is a different question.
+    await client.clear("jane@acme.com", state, country="IE")
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_known_country_uses_the_same_fingerprint_as_clear(state):
+    calls = []
+    found_us = {**OK_BODY, "facts": {"recipient_country": "US"}}
+    client = PreclearedClient("GB", transport=mock_precleared(calls, found_us))
+    await client.clear("jane@acme.com", state, country="US")
+    assert await client.known_country("jane@acme.com", state, "US") == "US"
+    assert await client.known_country("jane@acme.com", state) == ""   # a different question
+    assert await client.known_country("jane@acme.com", state, "GB") == ""
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", ["GBR", "g b", None, 12, "G1", " "])
+async def test_bad_country_values_are_dropped_not_raised(state, bad):
+    calls = []
+    client = PreclearedClient("US", transport=mock_precleared(calls, FOUND_GB))
+    assert (await client.clear("jane@acme.com", state, country=bad)).allowed
+    assert "recipient_country" not in calls[0]["json"]
+    # Treated as no country throughout, so the cached verdict is found.
+    assert await client.known_country("jane@acme.com", state, bad) == "GB"
+
+
+# ── the company's and person's names ──
+
+
+@pytest.mark.asyncio
+async def test_names_are_sent_when_harvey_has_them(state):
+    calls = []
+    client = PreclearedClient("GB", transport=mock_precleared(calls, OK_BODY))
+    await client.clear("jane@acme.com", state, company="Acme Widgets Ltd", name="Jane Doe")
+    assert calls[0]["json"]["company_name"] == "Acme Widgets Ltd"
+    assert calls[0]["json"]["recipient_name"] == "Jane Doe"
+    await client.clear("john@acme.com", state)
+    assert "company_name" not in calls[1]["json"] and "recipient_name" not in calls[1]["json"]
+
+
+@pytest.mark.asyncio
+async def test_names_are_tidied_and_cut_to_precleareds_limits(state):
+    calls = []
+    client = PreclearedClient("GB", transport=mock_precleared(calls, OK_BODY))
+    await client.clear("a@acme.com", state, company="  Acme \n Widgets\tLtd ", name=" Jane   Doe ")
+    assert calls[0]["json"]["company_name"] == "Acme Widgets Ltd"
+    assert calls[0]["json"]["recipient_name"] == "Jane Doe"
+    await client.clear("b@acme.com", state, company="C" * 300, name="N" * 300)
+    assert calls[1]["json"]["company_name"] == "C" * 160
+    assert calls[1]["json"]["recipient_name"] == "N" * 120
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [None, 12, "", "   ", ["Acme"]])
+async def test_empty_or_odd_names_are_left_out(state, bad):
+    calls = []
+    client = PreclearedClient("GB", transport=mock_precleared(calls, OK_BODY))
+    assert (await client.clear("jane@acme.com", state, company=bad, name=bad)).allowed
+    assert "company_name" not in calls[0]["json"] and "recipient_name" not in calls[0]["json"]
+
+
+def test_names_change_the_fingerprint_only_when_set():
+    client = PreclearedClient("GB")
+    base = client._fingerprint()
+    assert client._fingerprint("", "", "") == base
+    assert client._fingerprint("", "Acme") != base
+    assert client._fingerprint("", "", "Jane Doe") != base
+    assert client._fingerprint("", "Acme", "Jane Doe") != client._fingerprint("", "Acme", "John Roe")
+    assert client._fingerprint("GB", "Acme") != client._fingerprint("", "Acme")
+
+
+@pytest.mark.asyncio
+async def test_a_cached_ok_without_names_stands_when_the_names_arrive(state):
+    # The names only help Precleared find the company, so an answer that
+    # already allows the email isn't worth a second check.
+    calls = []
+    client = PreclearedClient("GB", transport=mock_precleared(calls, OK_BODY))
+    await client.clear("jane@acme.com", state)
+    again = await client.clear("jane@acme.com", state, company="Acme", name="Jane Doe")
+    assert again.allowed and again.cached and len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_cached_hold_without_names_is_asked_again_once_with_them(state):
+    calls = []
+    client = PreclearedClient("GB", transport=mock_precleared(calls, CONSENT_BODY))
+    await client.clear("jane@acme.com", state)
+    await client.clear("jane@acme.com", state, company="Acme", name="Jane Doe")
+    assert len(calls) == 2
+    assert calls[1]["json"]["company_name"] == "Acme"
+    assert calls[1]["json"]["recipient_name"] == "Jane Doe"
+    # Then cached under the names, so the rest of the sequence costs nothing.
+    assert (await client.clear("jane@acme.com", state, company="Acme", name="Jane Doe")).cached
+    assert len(calls) == 2
+    # Different names are a different question.
+    await client.clear("jane@acme.com", state, company="Acme", name="John Roe")
+    assert len(calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_a_verdict_with_names_keeps_the_country_precleared_found(state):
+    calls = []
+    client = PreclearedClient("GB", transport=mock_precleared(calls, FOUND_GB))
+    await client.clear("jane@acme.com", state, company="Acme", name="Jane Doe")
+    assert await client.known_country("jane@acme.com", state, company="Acme", name="Jane Doe") == "GB"
+    # Harvey later sure of the same country: the same question, still cached.
+    again = await client.clear("jane@acme.com", state, country="GB", company="Acme", name="Jane Doe")
+    assert again.cached and len(calls) == 1
+
+
+async def seed_named(state, *, company_record="", company_field="", first="Sam", last="Lee",
+                     source="", email="sam@acme-widgets.example"):
+    company_id = ""
+    if company_record:
+        company_id = await state.add_company(Company(
+            name=company_record, domain=email.split("@")[1]))
+    return await state.add_prospect(Prospect(
+        company_id=company_id, first_name=first, last_name=last, title="Owner",
+        company=company_field, email=email, email_status="verified",
+        email_verified=True, source=source))
+
+
+async def checked_send(state, pid, to="sam@acme-widgets.example"):
+    await queue(state, pid, to=to)
+    calls, provider = [], FakeProvider()
+    sender = with_check(make_sender(state, provider), mock_precleared(calls, OK_BODY))
+    await sender._drain_due()
+    return calls, provider
+
+
+@pytest.mark.asyncio
+async def test_sender_sends_the_company_records_name_and_the_person(state):
+    pid = await seed_named(state, company_record="Acme Widgets Ltd",
+                           company_field="acme-widgets.example")
+    calls, provider = await checked_send(state, pid)
+    assert len(provider.sent) == 1
+    assert calls[0]["json"]["company_name"] == "Acme Widgets Ltd"
+    assert calls[0]["json"]["recipient_name"] == "Sam Lee"
+
+
+@pytest.mark.asyncio
+async def test_sender_falls_back_to_the_prospects_company_field(state):
+    pid = await seed_named(state, company_field="Acme Widgets")
+    calls, _ = await checked_send(state, pid)
+    assert calls[0]["json"]["company_name"] == "Acme Widgets"
+
+
+@pytest.mark.asyncio
+async def test_sender_sends_no_person_for_a_company_inbox(state):
+    pid = await seed_named(state, company_field="Acme Widgets", first="", last="",
+                           source=COMPANY_INBOX_SOURCE, email="hello@acme-widgets.example")
+    calls, _ = await checked_send(state, pid, to="hello@acme-widgets.example")
+    assert len(calls) == 1
+    assert calls[0]["json"]["company_name"] == "Acme Widgets"
+    assert "recipient_name" not in calls[0]["json"]
+
+
+@pytest.mark.asyncio
+async def test_a_company_lookup_failure_does_not_stop_the_drain(state, monkeypatch):
+    pid = await seed_named(state, company_record="Acme Widgets Ltd", company_field="Acme Widgets")
+
+    async def boom(company_id):
+        raise RuntimeError("company lookup failed")
+    monkeypatch.setattr(state, "get_company", boom)
+    calls, provider = await checked_send(state, pid)
+    assert len(provider.sent) == 1
+    # The prospect's own field stands in for the record it couldn't load.
+    assert calls[0]["json"]["company_name"] == "Acme Widgets"
+
+
 # ── verdicts ──
 
 
@@ -257,6 +534,8 @@ async def test_ok_verdict_sends_and_logs_the_receipt(state):
         "sender_country": "GB",
         "address_source": "unknown",
         "existing_customer": False,
+        "company_name": "Acme",
+        "recipient_name": "Jane Doe",
     }
     assert "authorization" not in calls[0]["headers"]
     assert await logged_receipts(state) == ["cc_rcpt_OK0000000001"]

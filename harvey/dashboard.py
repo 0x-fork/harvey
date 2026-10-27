@@ -5,13 +5,14 @@ import ipaddress
 import json
 import logging
 import os
+import shutil
 import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import aiosqlite
@@ -26,6 +27,7 @@ logger = logging.getLogger("harvey.dashboard")
 
 from harvey import dashboard_auth as auth  # noqa: E402
 from harvey.paths import PROJECT_ROOT  # noqa: E402
+from harvey.pidfile import LOCK_FILE, loop_lock_held, pid_alive  # noqa: E402
 from harvey.textio import read_user_text  # noqa: E402
 DB_PATH = PROJECT_ROOT / "data" / "harvey.db"
 ENV_FILE = PROJECT_ROOT / ".env"
@@ -164,10 +166,17 @@ def _check_harvey_pid() -> int | None:
     if PID_FILE.exists():
         try:
             pid = int(PID_FILE.read_text(encoding="utf-8").strip())
-            os.kill(pid, 0)  # Check if process exists
+        except (OSError, ValueError):
+            pid = None
+        # pid_alive, never os.kill(pid, 0): on Windows that terminates the loop.
+        # And only while a loop holds the lock: after a crash or a reboot the
+        # PID can belong to an unrelated program, which Stop must not signal.
+        if pid is not None and pid_alive(pid) and loop_lock_held(LOCK_FILE):
             return pid
-        except (ValueError, ProcessLookupError, PermissionError):
+        try:
             PID_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
     return None
 
 
@@ -282,6 +291,29 @@ async def get_setup_status():
         "done": bool(cf_id) and bool(cf_token),
         "required": False,
         "help": "Optional. For JavaScript-rendered website crawling during training.",
+    })
+
+    # 9. Warmup service: TrulyInbox connected, or another service the user named
+    from harvey.integrations import trulyinbox as ti
+    try:
+        state = _state()
+        await state.init_db()
+        choice = await ti.get_choice(state)
+    except Exception:
+        choice = ""
+    if _has("TRULYINBOX_API_KEY"):
+        choice = "connected"
+    checks.append({
+        "id": "warmup_service",
+        "label": {"connected": "Warmup: TrulyInbox connected",
+                  "other": "Warmup: your own warmup service"}.get(choice, "Warm up your mailbox"),
+        "done": bool(choice),
+        # Instantly warms its own accounts, so there it's a suggestion, not a step.
+        "required": provider != "instantly",
+        "help": ("A new mailbox needs 2-4 weeks of warmup before cold email, and warmup "
+                 "keeps it out of spam after that. We recommend TrulyInbox: connect it and "
+                 "Harvey shows whether your mailbox is warmed."),
+        "link": ti.AFFILIATE_URL,
     })
 
     required_checks = [c for c in checks if c["required"]]
@@ -400,6 +432,61 @@ async def save_env_settings(request: Request):
             except Exception as e:
                 logger.warning("Failed to write .env: %s", e)
                 return {"success": False, "message": "Could not write .env file."}
+    return {"success": True}
+
+
+@app.post("/api/trulyinbox/connect")
+async def trulyinbox_connect(request: Request):
+    """Check a TrulyInbox key against the sending mailbox, then save it to .env."""
+    from harvey import deliverability as d
+    from harvey.integrations import trulyinbox as ti
+    try:
+        data = await request.json()
+    except Exception:
+        data = None
+    key = data.get("key") if isinstance(data, dict) else None
+    if not isinstance(key, str) or not key.strip() or len(key) > 512:
+        return JSONResponse({"success": False, "message": "Paste your TrulyInbox API key."},
+                            status_code=400)
+    key = key.strip()
+    try:
+        from harvey.config import load_config
+        config = load_config()
+        address, warmup = ti.sending_address(config), config.channels.email.warmup
+    except Exception:
+        address, warmup = "", None
+    if not address:
+        return JSONResponse({"success": False, "message": ti.NO_ADDRESS}, status_code=400)
+    workspace = (_read_env_file().get("TRULYINBOX_WORKSPACE_ID", "")
+                 or os.getenv("TRULYINBOX_WORKSPACE_ID", "")).strip()
+    ti.forget_rejected(key)
+    try:
+        client = ti.TrulyInbox(key, workspace)
+        health = await client.mailbox_health(address)
+    except ti.TrulyInboxError as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=400)
+    updates = {"TRULYINBOX_API_KEY": key}
+    if not workspace:
+        updates["TRULYINBOX_WORKSPACE_ID"] = client.workspace_id
+    async with _env_lock:
+        try:
+            _write_env_file(updates)
+        except Exception as e:
+            logger.warning("Failed to write .env: %s", e)
+            return {"success": False, "message": "Could not write .env file."}
+    state = _state()
+    await state.init_db()
+    await ti.set_choice(state, "connected")
+    return {"success": True, "message": d.check_warmup_service(health, warmup).detail}
+
+
+@app.post("/api/trulyinbox/other")
+async def trulyinbox_other():
+    """The user warms their mailbox with another service: stop recommending one."""
+    from harvey.integrations import trulyinbox as ti
+    state = _state()
+    await state.init_db()
+    await ti.set_choice(state, "other")
     return {"success": True}
 
 
@@ -522,19 +609,32 @@ async def start_harvey():
 
     if _check_harvey_pid():
         return {"success": False, "message": "Harvey is already running."}
+    from harvey.main import _needs_setup
+    if _needs_setup():
+        return {"success": False,
+                "message": "Harvey isn't set up yet. Run `harvey setup` in a terminal first."}
 
     # Ensure data dir exists
     (PROJECT_ROOT / "data").mkdir(parents=True, exist_ok=True)
+
+    # The native Claude CLI installer puts claude in ~/.local/bin without
+    # always adding it to PATH; the heartbeat can't think without it.
+    env = os.environ.copy()
+    local_bin = Path.home() / ".local" / "bin"
+    if not shutil.which("claude") and local_bin.is_dir():
+        env["PATH"] = str(local_bin) + os.pathsep + env.get("PATH", "")
 
     try:
         log_handle = open(LOG_FILE, "a", encoding="utf-8")
         try:
             _harvey_process = subprocess.Popen(
-                [sys.executable, "-m", "harvey"],
+                [sys.executable, "-m", "harvey", "run"],
                 cwd=str(PROJECT_ROOT),
+                stdin=subprocess.DEVNULL,
                 stdout=log_handle,
                 stderr=log_handle,
                 start_new_session=True,
+                env=env,
             )
         finally:
             # Child holds its own copies of the fds; don't leak ours.
@@ -543,13 +643,9 @@ async def start_harvey():
         logger.warning("Failed to start Harvey: %s", e)
         return {"success": False, "message": f"Failed to start Harvey: {e}"}
     _harvey_started_at = datetime.now()
-
-    # Write PID file
-    try:
-        PID_FILE.write_text(str(_harvey_process.pid), encoding="utf-8")
-    except OSError as e:
-        logger.warning("Could not write PID file: %s", e)
-
+    # The loop writes its own PID file once it holds the loop lock. Writing
+    # the child's PID here would overwrite a running loop's record if this
+    # child then finds the lock taken and exits.
     return {"success": True, "pid": _harvey_process.pid}
 
 
@@ -562,23 +658,37 @@ async def stop_harvey():
     if not pid:
         return {"success": False, "message": "Harvey is not running."}
 
+    own = _harvey_process if _harvey_process and _harvey_process.pid == pid else None
+
+    def alive() -> bool:
+        # Our own child is reaped by poll(); left unreaped it is a zombie,
+        # which still answers signal 0.
+        if own is not None:
+            return own.poll() is None
+        return pid_alive(pid)
+
     try:
         os.kill(pid, signal.SIGTERM)
         # Wait briefly for graceful shutdown
         for _ in range(10):
-            try:
-                os.kill(pid, 0)
-                await asyncio.sleep(0.5)
-            except ProcessLookupError:
+            if not alive():
                 break
+            await asyncio.sleep(0.5)
         else:
-            # Force kill if still running
+            # Force kill if still running (Windows has no SIGKILL; SIGTERM
+            # there is already TerminateProcess)
             try:
-                os.kill(pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
+                os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+            except OSError:
                 pass
-    except (ProcessLookupError, PermissionError):
-        pass
+            await asyncio.sleep(0.5)
+    except OSError as e:
+        logger.warning("Couldn't signal Harvey (pid %s): %s", pid, e)
+
+    if alive():
+        # Started by another user, or from an elevated terminal on Windows.
+        return {"success": False,
+                "message": f"Couldn't stop Harvey (pid {pid}). Stop it where it was started."}
 
     _harvey_process = None
     _harvey_started_at = None
@@ -666,8 +776,12 @@ async def get_stats():
         actions = await query_db("SELECT COUNT(*) as count FROM actions")
         action_count = actions[0]["count"] if actions else 0
 
+        # usage_log rows are keyed by the LOCAL date (increment_usage /
+        # get_usage_today use date.today()); SQLite's date('now') is UTC and
+        # can select a different day's counts on either side of UTC midnight.
         usage = await query_db(
-            "SELECT claude_calls, codex_calls FROM usage_log WHERE date = date('now')"
+            "SELECT claude_calls, codex_calls FROM usage_log WHERE date = ?",
+            (date.today().isoformat(),),
         )
         usage_today = (usage[0]["claude_calls"] or 0) if usage else 0
         codex_today = (usage[0]["codex_calls"] or 0) if usage else 0
@@ -799,6 +913,12 @@ async def get_usage():
 @app.get("/api/prospects")
 async def get_prospects():
     rows = await query_db("SELECT * FROM prospects ORDER BY created_at DESC LIMIT 200")
+    # Someone whose opt-out was undone keeps a way to see what happened.
+    undone = {r["pid"] for r in await query_db(
+        "SELECT DISTINCT json_extract(details_json, '$.prospect_id') AS pid FROM actions "
+        "WHERE action_type = 'opt_out_undone' AND json_valid(details_json)")}
+    for r in rows:
+        r["opt_out_undone"] = r.get("id") in undone
     return rows
 
 
@@ -916,13 +1036,67 @@ async def get_outbox_api():
         return {"error": str(e)}
 
 
+@app.get("/api/sending-mode")
+async def get_sending_mode():
+    """Approval (every email waits for you) or autopilot, and what that means here."""
+    from harvey.config import load_config
+    from harvey.gate import _booking_prefix, allowed_link_domains
+    path = _resolve_config_file()
+    try:
+        config = load_config(str(path))
+    except Exception as e:
+        return JSONResponse({"error": f"Couldn't read {path.name}: {e}"}, status_code=500)
+    state = _state()
+    await state.init_db()
+    return {
+        "mode": "approval" if config.channels.email.require_approval else "autopilot",
+        "provider": config.channels.email.provider,
+        "file": path.name,
+        "your_domains": sorted(allowed_link_domains(config)),
+        "booking_page": _booking_prefix(config),
+        "held": await state.count_held_for_review(),
+    }
+
+
+@app.post("/api/sending-mode")
+async def set_sending_mode(request: Request):
+    """Switch it. Autopilot needs {"mode": "autopilot", "confirm": "autopilot"};
+    {"mode": "approval"} works at once and sends back to the Outbox whatever
+    autopilot approved that hasn't gone out."""
+    from harvey.config import ConfigError, set_require_approval
+    try:
+        body = await request.json()
+    except ValueError:
+        body = None
+    mode = body.get("mode") if isinstance(body, dict) else None
+    if mode not in ("approval", "autopilot"):
+        return _refuse('expected {"mode": "approval"} or {"mode": "autopilot", "confirm": "autopilot"}', 400)
+    if mode == "autopilot" and body.get("confirm") != "autopilot":
+        return _refuse('Type "autopilot" to confirm: Harvey will send email without asking you.', 400)
+    path = _resolve_config_file()
+    try:
+        set_require_approval(mode == "approval", path)
+    except ConfigError as e:
+        return _refuse(str(e), 409)
+    state = _state()
+    await state.init_db()
+    requeued = await state.requeue_autopilot_approved() if mode == "approval" else 0
+    await state.log_action("sending_mode", "dashboard", {"mode": mode, "file": path.name,
+                                                         "requeued": requeued})
+    out = {"success": True, "mode": mode}
+    if mode == "approval":
+        out["requeued"] = requeued
+    return out
+
+
 @app.post("/api/outbox/approve-all")
 async def outbox_approve_all():
     try:
         state = _state()
         await state.init_db()
         n = await state.approve_outbox()
-        return {"success": True, "approved": n}
+        # Held ones (possible planted link or leak) are approved one by one.
+        return {"success": True, "approved": n, "held": await state.count_held_for_review()}
     except Exception as e:
         return JSONResponse({"success": False, "message": str(e)}, status_code=500)
 
@@ -1271,10 +1445,72 @@ async def get_campaigns():
     return rows
 
 
+@app.get("/api/prospects/{prospect_id}/opt-out")
+async def get_opt_out(prospect_id: str):
+    """Why this person is opted out: the rule, the words and their message."""
+    rows = await query_db("SELECT status FROM prospects WHERE id = ?", (prospect_id,))
+    if not rows:
+        return _refuse("unknown prospect", 404)
+    status = rows[0].get("status") or "new"
+    state = _state()
+    await state.init_db()
+    history = await state.opt_out_history(prospect_id)
+    last = next((h for h in reversed(history) if h["action"] == "opt_out"), None)
+    out = {
+        "opted_out": status == "opted_out", "status": status, "recorded": bool(last),
+        "at": None, "rule": None, "matched": "", "why": "", "message": "",
+        "conversation_id": "", "history": history,
+    }
+    if last:
+        out.update({k: last.get(k) or out[k] for k in
+                    ("rule", "matched", "why", "message", "conversation_id")})
+        out["at"] = last["at"]
+    elif status == "opted_out" or history:
+        # Opted out before Harvey kept reasons (and maybe undone since):
+        # show the last thing they wrote.
+        for c in await query_db(
+                "SELECT id, thread_json, updated_at FROM conversations "
+                "WHERE prospect_id = ? ORDER BY updated_at DESC", (prospect_id,)):
+            try:
+                thread = json.loads(c.get("thread_json") or "[]")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            theirs = [m for m in thread if isinstance(m, dict) and m.get("sender") == "prospect"]
+            if theirs:
+                out.update(message=str(theirs[-1].get("content") or ""),
+                           conversation_id=c["id"], at=theirs[-1].get("timestamp") or c.get("updated_at"))
+                break
+    return out
+
+
+@app.post("/api/prospects/{prospect_id}/opt-out/undo")
+async def undo_opt_out(prospect_id: str, request: Request):
+    """The owner says this opt-out was a mistake. Needs {"confirm": true}."""
+    try:
+        body = await request.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, dict) or body.get("confirm") is not True:
+        return _refuse('expected {"confirm": true}', 400)
+    rows = await query_db("SELECT email FROM prospects WHERE id = ?", (prospect_id,))
+    if not rows:
+        return _refuse("unknown prospect", 404)
+    state = _state()
+    await state.init_db()
+    history = await state.opt_out_history(prospect_id)
+    last = next((h for h in reversed(history) if h["action"] == "opt_out"), {})
+    if not await state.undo_opt_out(prospect_id, details={
+            "prospect_email": rows[0].get("email") or "",
+            "previous_why": last.get("why", ""), "previous_at": last.get("at", "")}):
+        return _refuse("This person isn't opted out.")
+    return {"success": True, "status": "replied"}
+
+
 @app.get("/api/conversations")
 async def get_conversations():
     rows = await query_db("""
-        SELECT c.*, p.first_name, p.last_name, p.email as prospect_email, p.company
+        SELECT c.*, p.first_name, p.last_name, p.email as prospect_email, p.company,
+               p.status as prospect_status
         FROM conversations c
         LEFT JOIN prospects p ON c.prospect_id = p.id
         ORDER BY c.updated_at DESC LIMIT 100
@@ -1386,13 +1622,18 @@ _discovery_kind = "discover"   # or "profile": reading sites has no stop switch
 
 
 def _discovery_queries(body: dict, config):
-    from harvey.collectors.discover import build_queries
+    from harvey.collectors.discover import build_queries, preset_problem
 
+    preset = str(body.get("preset") or "")
+    problem = preset_problem(preset, str(body.get("provider") or ""), config=config)
+    if problem:
+        raise ValueError(problem)
     cities = [c.strip() for c in (body.get("cities") or []) if c.strip()] or None
     return build_queries(
         config, cities=cities,
         depth=int(body.get("depth") or 30),
         limit=int(body.get("limit") or 100),
+        preset=preset,
     )
 
 
@@ -1433,7 +1674,10 @@ async def estimate_discovery(request: Request):
             return JSONResponse({"error": f"unknown provider {provider!r}"},
                                 status_code=400)
 
-        queries = _discovery_queries(body, load_config())
+        try:
+            queries = _discovery_queries(body, load_config())
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
         return {
             "provider": provider,
             "queries": [q.keyword() for q in queries],
@@ -1470,7 +1714,10 @@ async def start_discovery(request: Request):
                                 status_code=400)
 
         config = load_config()
-        queries = _discovery_queries(body, config)
+        try:
+            queries = _discovery_queries(body, config)
+        except ValueError as e:
+            return JSONResponse({"success": False, "message": str(e)}, status_code=400)
         max_spend = float(body.get("max_spend") or 1.0)
 
         state = _state()
@@ -1528,7 +1775,13 @@ async def start_profile():
         async def _go():
             global _discovery_report
             try:
-                companies, observations, _ = await run_profile_stage(state, limit=200)
+                try:
+                    from harvey.config import load_config
+                    config = load_config()
+                except Exception:
+                    config = None   # still profiles; no role is singled out
+                companies, observations, _ = await run_profile_stage(
+                    state, limit=200, config=config)
                 _discovery_report = {
                     "profiled_companies": companies,
                     "profile_observations": observations,
@@ -1751,6 +2004,14 @@ async def get_live_status():
     }
 
 
+def _require_approval_now() -> bool:
+    try:
+        from harvey.config import load_config
+        return bool(load_config(str(_resolve_config_file())).channels.email.require_approval)
+    except Exception:
+        return True
+
+
 @app.get("/api/today")
 async def get_today():
     """What needs a human, right now.
@@ -1814,12 +2075,39 @@ async def get_today():
                 "action": "Open the log", "tab": "controls",
             })
 
+        hold = await state.current_sends_held()
+        if hold:
+            from harvey.sending_mode import held_message
+            title, detail = held_message(hold, waiting=len(approved))
+            items.append({
+                "key": "sends-held", "tone": "bad", "title": title, "detail": detail,
+                "action": "Open the log", "tab": "controls",
+            })
+
         if paused:
             items.append({
                 "key": "paused", "tone": "bad",
                 "title": "Sending is paused",
                 "detail": str(paused) + ". Nothing will go out until you resume it.",
                 "action": "Review and resume", "tab": "outbox",
+            })
+
+        # Cold email waiting on the optional Precleared check: its free
+        # checks ran out, the key was rejected, or it couldn't be reached.
+        from harvey.integrations.precleared import current_hold, hold_message
+        try:
+            from harvey.config import load_config
+            loaded = load_config(str(_resolve_config_file()))
+        except Exception:
+            loaded = None  # can't judge: show the hold rather than hide it
+        precleared_hold = await current_hold(state, loaded)
+        if precleared_hold:
+            message = hold_message(precleared_hold)
+            items.append({
+                "key": "precleared-hold", "tone": message["tone"],
+                "title": message["title"], "detail": message["detail"],
+                "action": "Open the log", "tab": "controls",
+                "url": message["url"], "url_label": message["url_label"],
             })
 
         setup = await get_setup_status()
@@ -1887,7 +2175,10 @@ async def get_today():
                 "key": "outbox", "tone": "warn",
                 "title": (f"{len(pending)} email waiting for approval" if len(pending) == 1
                           else f"{len(pending)} emails waiting for approval"),
-                "detail": "Nothing sends until you approve it. Read them one at a time.",
+                "detail": ("Nothing sends until you approve it. Read them one at a time."
+                           if _require_approval_now() else
+                           "Autopilot sends the rest on its own; these wait for you. "
+                           "Read them one at a time."),
                 "action": "Open the decisions desk", "tab": "outbox",
             })
 
@@ -2028,10 +2319,12 @@ COHORT_MAX_PAGE_SIZE = 200
 
 
 async def _cohort_companies(require: list[str], exclude: list[str],
-                            offset: int = 0, limit: int | None = None):
+                            offset: int = 0, limit: int | None = None,
+                            ranges: list[dict] | None = None):
     state = _state()
     await state.init_db()
-    return await state.cohort_companies(require, exclude, offset, limit)
+    return await state.cohort_companies(require, exclude, offset, limit,
+                                        ranges=ranges)
 
 
 def _codes(raw) -> list[str]:
@@ -2046,6 +2339,53 @@ def _codes(raw) -> list[str]:
     if len(codes) > 200 or any(len(c) > 128 for c in codes):
         raise ValueError("too many or oversized signal codes")
     return codes
+
+
+COHORT_MAX_RANGES = 20
+
+
+def _range_bound(raw):
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
+        raise ValueError("range bounds must be numbers")
+    value = float(raw)
+    if value != value or abs(value) > 1e12:
+        raise ValueError("range bound is out of bounds")
+    return value
+
+
+def _ranges(raw) -> list[dict]:
+    """Numeric cohort filters: a list of {code, min, max}, or the CSV query
+    form "SERP_RANK:11:30,MAPS_RANK::3". At least one bound per range."""
+    if raw is None or raw == "" or raw == []:
+        return []
+    if isinstance(raw, str):
+        items = []
+        for part in raw.split(","):
+            if not part.strip():
+                continue
+            pieces = part.split(":")
+            if len(pieces) != 3:
+                raise ValueError("ranges look like CODE:min:max")
+            items.append({"code": pieces[0], "min": pieces[1], "max": pieces[2]})
+        raw = items
+    if not isinstance(raw, list) or any(not isinstance(r, dict) for r in raw):
+        raise ValueError("ranges must be a list of {code, min, max}")
+    if len(raw) > COHORT_MAX_RANGES:
+        raise ValueError("too many ranges")
+    out = []
+    for r in raw:
+        code = r.get("code")
+        if not isinstance(code, str) or not code.strip() or len(code) > 128:
+            raise ValueError("each range needs a signal code")
+        low, high = _range_bound(r.get("min")), _range_bound(r.get("max"))
+        if low is None and high is None:
+            raise ValueError(f"range on {code} needs a min or a max")
+        if low is not None and high is not None and low > high:
+            raise ValueError(f"range on {code}: min is above max")
+        out.append({"code": code.strip(), "min": low, "max": high})
+    return out
 
 
 def _cohort_integer(raw, default):
@@ -2066,7 +2406,8 @@ async def preview_cohort(request: Request):
     The payoff for confirming signals: a cohort is a query, not a list. Set
     intersection happens in SQL — intersecting in JS over a capped fetch
     silently returns the wrong answer. ``offset``/``limit`` page through the
-    matches; ``size`` is always the whole cohort.
+    matches; ``size`` is always the whole cohort. ``ranges`` adds numeric
+    filters — ``[{"code": "SERP_RANK", "min": 11, "max": 30}]``.
     """
     try:
         body = await request.json()
@@ -2074,13 +2415,15 @@ async def preview_cohort(request: Request):
             raise ValueError("request body must be an object")
         require = _codes(body.get("require"))
         exclude = _codes(body.get("exclude"))
+        ranges = _ranges(body.get("ranges"))
         offset = max(0, _cohort_integer(body.get("offset"), 0))
         limit = min(max(1, _cohort_integer(body.get("limit"), COHORT_PAGE_SIZE)),
                     COHORT_MAX_PAGE_SIZE)
-        if not require:
+        if not require and not ranges:
             return {"size": 0, "offset": 0, "limit": limit, "companies": []}
 
-        size, rows = await _cohort_companies(require, exclude, offset, limit)
+        size, rows = await _cohort_companies(require, exclude, offset, limit,
+                                             ranges=ranges)
         return {"size": size, "offset": offset, "limit": limit,
                 "companies": rows}
     except (ValueError, TypeError) as e:
@@ -2098,7 +2441,7 @@ def _csv_cell(value):
 
 
 @app.get("/api/cohort.csv")
-async def export_cohort(require: str = "", exclude: str = ""):
+async def export_cohort(require: str = "", exclude: str = "", ranges: str = ""):
     """The whole cohort as a CSV download — every match, not just one page."""
     import csv
     import io
@@ -2109,8 +2452,9 @@ async def export_cohort(require: str = "", exclude: str = ""):
     try:
         codes = _codes(require)
         excluded = _codes(exclude)
-        if codes:
-            _, rows = await _cohort_companies(codes, excluded)
+        bounds = _ranges(ranges)
+        if codes or bounds:
+            _, rows = await _cohort_companies(codes, excluded, ranges=bounds)
             for r in rows:
                 writer.writerow([_csv_cell(r.get(k)) for k in
                                  ("name", "domain", "website", "industry", "location")])

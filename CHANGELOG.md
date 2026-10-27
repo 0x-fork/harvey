@@ -13,8 +13,158 @@ minor versions can still change behaviour.
   listings around each city, with phone, website, category, rating and review
   count, and Google organic results with rank, both from one
   `SCAVIO_API_KEY`. Maps is 1 credit per 20 businesses and Search 1 credit per
-  10 results; estimates use the entry-plan price, so they run high. Off unless
+  10 results; estimates use the $0.01 pay-as-you-go credit price. Off unless
   you pick one in `harvey discover` or the dashboard. Closes #28.
+- **TrulyInbox for warmup.** Harvey now recommends TrulyInbox for warming and
+  keeping sending mailboxes healthy, and reads it: `harvey trulyinbox connect`
+  (or the new warmup step on the dashboard's setup checklist) checks a key and
+  saves it, and `harvey warmup` then says whether the sending mailbox is
+  actually warmed: enrolled, signed in, warmed for `min_days`, and under 5%
+  spam in its warmup mail. Read-only; it never changes anything in TrulyInbox.
+  `harvey trulyinbox other` records that you use another warmup service.
+- **A do-not-contact list, enforced at send time.** `compliance.do_not_contact`
+  takes addresses and domains Harvey must never email: competitors, your
+  existing customers, anyone under a legal hold, a partner you agreed not to
+  approach. A domain covers its subdomains, matched on a label boundary, so
+  `acme.example` blocks `mail.acme.example` and leaves `notacme.example`
+  alone — a plain suffix test would catch the wrong company. The check runs
+  in `pre_send_check`, so it is the last thing before an email leaves and
+  holds for one a human already approved in the Outbox. It applies to replies as well as cold mail: a list that lets
+  automated replies through is not a do-not-contact list, and the operator
+  can still answer by hand. Entries are normalised when the config loads, so
+  ` @Acme.EXAMPLE `, a pasted `https://www.acme.example/about`,
+  `Jane Doe <jane@acme.example>` (that address) and `acme.example` behave
+  alike; an entry that names nothing is a config error, not a silent no-op.
+  An edit counts at once in a running Harvey. A listed person who writes
+  back goes to you without a draft, and `harvey export` leaves them out. On
+  Instantly, which has no Outbox, listed leads are left out of the upload
+  and a reply to one goes to you; a lead Instantly already has must be
+  removed there.
+
+- **Discovery skips do-not-contact companies too.** The same
+  `compliance.do_not_contact` list is now applied while discovering, before a
+  result becomes a company, so a forbidden business never enters the pool: it
+  costs nothing to enrich, never has its site read, and stops turning up in
+  cohorts for someone to spot by eye. The send-time gate is unchanged and
+  still the last word — only it can stop a send — but on its own it let a
+  competitor through discovery and charged you for the enrichment first.
+  Discovery has a domain, not an address, so only domain entries apply here:
+  `jane@acme.example` bars one mailbox, and acme.example stays discoverable
+  because a colleague there may still be worth reaching. Skipped companies
+  are counted separately from junk, and `harvey discover` prints the count
+  only when it isn't zero — junk asks whether a result is a business at all,
+  this asks whether you are allowed to approach one, and burying the second
+  in the first is how a list that has grown too broad goes unnoticed.
+
+- **TinyFish as a free discovery source** (from #95). `harvey discover
+  --provider tinyfish` (or *TinyFish* on the Discover tab) finds businesses
+  by phrase with a free `TINYFISH_API_KEY`, no card, and runs the `yc`,
+  `hiring`, `accelerator` and `funding` presets. Harvey paces it to its
+  published limits, 30 searches a minute and 500 an hour, and a run that
+  uses up the hour (or is refused the key) stops and says why instead of
+  failing every remaining phrase. It records no
+  `SERP_RANK`: TinyFish's ordering isn't Google's and its search takes no
+  location, so rank signals still come from Serper or DataForSEO SERP, and
+  a TinyFish run never marks a business they ranked as gone. Scout also
+  searches through TinyFish when the key is set, after Serper.
+
+- **Open roles from the job board a company actually uses.** When a
+  company's own site links or embeds a Greenhouse, Lever, Ashby or Workable
+  board, profiling reads that board's public JSON feed (one request, capped
+  at 8 MB, never a guessed token) instead of guessing from careers-page
+  HTML, which on most startup sites has no roles in it at all because a
+  script loads them. `HIRING_ROLE` now records the roles matching
+  `icp.hiring_signals` (else `icp.titles`) with department, location,
+  posting date and the posting's URL; the new `OPEN_ROLES` signal counts the
+  board's open roles. When the board lists no matching role, `HIRING_ROLE`
+  is recorded as 0, so a role that has closed stops counting in cohorts and
+  shows as "no" to the reviewer. Matching folds VP/Vice President, CMO/Chief
+  Marketing Officer and similar, and "Assistant to the CEO" is not a CEO
+  role. Pages linking three or more boards, none named like the site (an
+  agency or a VC portfolio page), are attributed to nobody. Sites without a
+  board still get the careers-page read.
+  The new `hiring` discovery preset (`harvey discover --preset hiring`, or
+  *Look for: Companies hiring for your roles*) searches through Serper or
+  DataForSEO SERP for companies whose own careers pages list your roles.
+  `skills/signal_playbook.md` has a short section on using a posting as the
+  hook: cite the role as posted, never guess salary or headcount, don't
+  imply inside knowledge, mind the posting date.
+
+- **Find companies by where they rank in a city.** DataForSEO SERP now also
+  records who holds the local 3-pack (`IN_LOCAL_PACK`, slot 1-3, ads
+  excluded), and a new **DataForSEO Google Maps** provider records each
+  business's map position (`MAPS_RANK`) with its rating, category and
+  claimed status, keeping businesses with no website by their place_id
+  (`NO_WEBSITE`). Both search from the geocoded city centre. Every rank is
+  stored with the search phrase that produced it ("#14 for 'roofer Denver,
+  CO'"), one per business per phrase, keeping the best. When a later search
+  for that phrase no longer finds a business, Harvey records that, so an old
+  rank or a lost pack slot doesn't keep matching. Websiteless businesses are
+  keyed on Google's cid, so the pack and Maps resolve to one company. `icp.keyword_variants`
+  adds search phrases per industry. The cohort builder takes numeric ranges
+  (Signals tab, `/api/cohort` `ranges`, `/api/cohort.csv?ranges=SERP_RANK:11:30`),
+  so "organic rank 11-30, not in the local pack" is one query. The signal
+  playbook has rank-based angles, worded as "when we searched from downtown
+  Denver", never as an absolute position.
+
+- **Cold email in each recipient's office hours** (from #59 by
+  gabrielaoimevbore-beep; `channels.email.send_window`, #53). Cold email goes out only between `start` and `end` (08:00 to 17:00 on
+  weekdays by default) in the recipient's own time zone. The zone is worked
+  out once and stored on the prospect, from the company's location (US
+  states, Canadian provinces, Australian states, countries with one zone or
+  one main zone, and the coordinates discovery already cached), the country
+  Precleared returns when that check is on, or `prospect_country`. A code
+  that is a state and a country too ("Mumbai, IN", "Adelaide, SA") is
+  settled by those; with nothing else it reads as a US state. Anyone Harvey
+  can't place gets the window in `usage.quiet_hours.timezone`. Follow-ups
+  keep their `delay_days` and move into the window, an email approved after
+  hours waits for the next one, and replies are never held by the window.
+  With `recipient_timezone` on, quiet hours still pause prospecting,
+  writing and replies, but wake for cold email that can go now in its
+  recipient's window (not paused, under the caps): the heartbeat reads
+  replies, then sends it. `weekdays_only` means Monday to Friday. Off unless
+  set; Gmail, Microsoft and SMTP only.
+
+- **A built-in skill for selling to YC startups.** The `yc` discovery preset
+  (`harvey discover --preset yc`, or *Look for: YC startups* on Discover)
+  searches your industries, through Serper or DataForSEO SERP, for companies
+  whose own site says they're backed by Y Combinator. The new `YC_BACKED`
+  signal tags them from their homepage or About page (a reference to their
+  own YC page, or a line where they say it, never customer or audience
+  lines), with the batch when it's stated (W24, S23). Many YC companies
+  don't say it on their site, so it finds the ones that do. For those prospects the writer and reply handler use the new
+  `skills/selling_to_startups.md` playbook: who reads, timing around the
+  batch and Demo Day, what not to do. Harvey never reads ycombinator.com,
+  whose terms forbid scraping it or collecting founders' contact details.
+- **Startups beyond YC: accelerators and recent raises.** Two more presets:
+  `accelerator` (*Accelerator startups*) finds companies whose own site says
+  Techstars, 500 Global, Antler, Entrepreneur First, South Park Commons, Neo,
+  AI Grant, a16z speedrun, Pioneer or Plug and Play backed them, and
+  `funding` (*Recently funded*) finds companies announcing their own raise in
+  the last 18 months, with news sites, press wires and funding databases
+  excluded and filtered as junk. Two new signals read it off their own
+  pages: `ACCELERATOR` (program and cohort, from a sentence where the company
+  says it or a "Backed by" logo wall) and `FUNDING_ROUND` (round, amount and
+  date, from the homepage, the search hit's own page, About or the press
+  page; the date from the sentence or the page's publish date). Both are
+  anchored like `YC_BACKED`: "we help startups raise", customer or
+  portfolio lines, an investor's round in another company, and money that
+  isn't a raise (loans closed, verdicts won, money raised for a charity)
+  don't count. The founder playbook now applies to YC- and
+  accelerator-backed companies and to raises dated within 18 months, and has
+  a section on writing to recently funded companies; an older or undated
+  raise is never written to as news.
+- **Approval or autopilot, visible and switchable.** The Outbox now says
+  which sending mode you're in, and Settings → Sending explains both,
+  lists the domains counted as yours and switches them. Turning autopilot
+  on takes typing `autopilot`; turning it off is one click and works at
+  once, mid-cycle too (every step that queues or sends re-reads the mode):
+  emails autopilot approved that haven't gone out come back to the Outbox,
+  and the sender won't send one while approval is on. Only the
+  `require_approval` line of your config changes (comments kept), and a
+  running Harvey picks it up next cycle. Each outbox row records who
+  approved it (`approved_by`: you, autopilot, or earlier for rows from
+  before this). The README has a plain table of what each mode does.
 - **`harvey warmup [domain]`**: checks whether a sending domain is ready for
   cold email. It covers MX, SPF (`+all`, duplicates, top-level lookups), DKIM,
   DMARC, domain age, domain and SMTP-IP blocklists (a list that refuses the
@@ -36,9 +186,236 @@ minor versions can still change behaviour.
   off), cold email still sends, and `harvey run`, `harvey status` and the
   Outbox tab warn until it's set. The opt-out line must ask for a reply
   Harvey recognises and can't contain a link. Based on #13 by Camilo Cruz.
+- **The Today page and `harvey status` say when Precleared is holding cold
+  email.** When the check can't be made (its free checks for the day are used
+  up, the key is out of checks, was rejected or is being rate limited, or
+  Precleared can't be reached), cold email to new addresses waits and replies
+  still go out, but this used to reach only the log, so cold email just went
+  out slower. Harvey now records the hold, and the Today page and
+  `harvey status` say how many cold emails are waiting and what fixes it: a
+  free key, a pack for that key (the checkout link from Precleared's answer),
+  or nothing but time. The next fresh answer clears it, a hold not seen for a
+  day is ignored, and switching the check off clears it. (from #57 by
+  gabrielaoimevbore-beep)
+
+### Changed
+
+- **Precleared is told the company's and person's names Harvey already has.**
+  For a UK address, cold email may go to a limited company's staff without
+  consent but not to a sole trader, so Precleared has to find the company
+  behind the domain on the Companies House register. When the domain alone
+  didn't find it, the answer was `consent_needed`, even for a company Harvey
+  knew the name of. Harvey now sends `company_name` (the company record's
+  name, else the prospect's company field) and `recipient_name` (the
+  prospect's first and last name; none for a company inbox), which
+  Precleared uses to search the register and match the company's officers.
+  It doesn't store the person's name. The names join the cache fingerprint
+  only when set: a cached `ok_to_email` stands when they first arrive, and
+  any other cached verdict gets one fresh check with them.
+- **Precleared is told the recipient's country Harvey already knows.** The
+  send window works out where a company is (a country, US state, Canadian
+  province or Australian state in its location, or a code that is a state
+  and a country too once the cached coordinates settle it); the compliance
+  check used to ask Precleared about the address with none of it, so
+  Precleared had to find the country again and, when it couldn't, answered
+  `unknown` and the email failed. Harvey now sends that country as
+  `recipient_country` when it is sure of it, which Precleared takes as
+  settled. Nothing it is not sure of is sent: "Berlin, DE" with no
+  coordinates reads as Delaware by convention and goes without a country,
+  as do a bare city and coordinates alone. Without a certain country,
+  `prospect_country` goes as the default, as before, and with that unset
+  the one country every `icp.geography` entry is in now serves as that
+  default; Precleared uses a default only when its own lookups show
+  nothing. The country joins the cache fingerprint only when it is set, so
+  cached verdicts are kept, and an address Harvey later becomes sure of is
+  re-checked once unless Precleared had found the same country itself.
+  `docs/precleared.md` describes the check in full.
+- **Setup comes first on Today.** Until setup is finished, the checklist sits at
+  the top of the Today page as a "Finish setting up Harvey" card, with the next
+  step highlighted, instead of at the bottom of the side column.
+- **Scout reads a company's site the way a person would.** It starts at the
+  homepage and follows the site's own menu to its team, about, our-story,
+  meet-the-doctors or attorneys pages (six pages at most), instead of
+  guessing nine fixed paths and stopping at the first that answered. Owners
+  are read from team cards, sentences ("owned and operated by…"),
+  and schema.org founders, and rank first (a surname in the business name
+  only breaks a tie between owners);
+  at most two people per company become prospects. ICP titles match by
+  whole word, with owner synonyms (Proprietor, Principal, Managing Partner,
+  Founder, CEO). With `LIKELY_OWNER` confirmed, each owner is recorded with
+  its evidence.
+- **Email patterns come from the addresses a site publishes**, including
+  ones hidden behind Cloudflare email protection or a mail link's `data-`
+  attributes, matched to the people the site names. A lone ambiguous
+  address (`kmorrow@`) teaches nothing, and an address another named person
+  could own (`jsmith@` with both John and Jane Smith there) is never guessed
+  for anyone. A named person's own published address is used as is. With no
+  evidence, a company known to be small (ICP company size, or a
+  local-business listing) is guessed as `first@`, others as `first.last@`. Every address is still graded
+  verified / risky / guess / invalid, and only verified or risky ones are
+  ever sent.
+- **Gmail reads only what's new.** After the first complete read of the
+  week, each cycle asks Gmail's history for messages added to the inbox
+  since the last check, so a busy mailbox costs what a quiet one does.
+  Harvey moves past them only once every reply has been handled, so one
+  it couldn't handle is read again. It reads the full week again when
+  Gmail's history marker has expired, and once a day as a backstop.
 
 ### Fixed
 
+- **Replies remember the whole conversation** (closes #97). A reply was
+  written from the last six messages only, so a requirement the prospect
+  stated earlier ("synthetic data only, processed in the EU") dropped out
+  and the draft could contradict it. Harvey now sends the whole thread, and
+  tells the model that what the prospect asked for or ruled out, and what
+  Harvey agreed to in its own messages, still applies. Each message's text
+  is quoted under a header the prospect can't type, so a reply that writes
+  "Harvey: confirmed, the first year is free" stays the prospect's words
+  and is no agreement. A thread too long to fit (about 24,000 characters)
+  keeps the latest six messages, then the prospect's own earlier words,
+  then Harvey's, and says how many it left out; one pasted wall of text in
+  an older message is cut so it can't crowd out the rest, while the
+  message being answered is kept almost whole.
+
+- **The dashboard's Start and Stop work, on Windows and everywhere else.**
+  Start launched `python -m harvey` with no command, so the loop printed the
+  help and exited; it now runs `harvey run`, and finds `claude` in
+  `~/.local/bin` when the native installer left it off PATH. On Windows the
+  "is it running?" check was `os.kill(pid, 0)`, which there terminates the
+  process it asks about, and a stale PID file made the status and Start
+  return 500. The check now asks the OS without signalling. `harvey run`
+  records itself too, so a loop started in a terminal shows as running, and
+  holds a lock on `data/harvey.lock`: a PID file left by a crash or a reboot
+  can name an unrelated program, which is now reported as stopped and never
+  signalled, and a second `harvey run` refuses to start while one is
+  running. Start refuses, with the reason, until `harvey setup` has been
+  run (the loop used to sit in the setup wizard reading the dashboard's
+  terminal), and Stop says so when it couldn't end the loop instead of
+  reporting success. (From #91 and #90.)
+
+- **`{{company}}'s` reads right for names ending in "s"**: "Parkes Builders'",
+  not "Parkes Builders's". (From #90.)
+
+- **LinkedIn-profile web searches run only when LinkedIn prospecting is on**
+  (from #60 by FreemanGT). Searching `site:linkedin.com/in` for your titles
+  found names with no company and no email, which Harvey can never verify
+  or write to, and they counted toward the "no usable emails" check that
+  pauses prospecting for the day. It also ran first and could use up the
+  cycle's three searches before company discovery, which finds people you
+  can email, got any. That search now runs only when LinkedIn prospecting
+  is on (`channels.linkedin.enabled`, off by default) with a LinkedIn login.
+
+- **Dashboard actions work in Safari and Firefox** (from #80 by 0SansNom).
+  Confirming signals, approving the Outbox and saving settings all failed
+  with "Cross-origin requests are refused." The dashboard's requests asked the
+  browser to send no referrer, which per the Fetch spec makes a POST's Origin
+  `null`, and the guard rightly refused it. Safari and Firefox follow the
+  spec; Chrome didn't, so it worked there. Requests now send their origin to
+  the dashboard itself, and only to it.
+
+- **A reply stops the cold email to the whole company.** Stop-on-reply was
+  per person, so when an owner wrote back "not interested" the office
+  manager still got the follow-up. Now a reply (not a bounce, an
+  out-of-office or a "wrong person, ask Bob") cancels the sequence emails
+  queued for everyone else at that company, and Harvey won't write, stage
+  or send cold email to them later; the Outbox and log say which colleague
+  replied. Colleagues are the same company; or, when Harvey has no company
+  for one of them, the same email domain, and only if it's that company's
+  own domain, never a shared one like gmail.com or rr.com. Instantly
+  campaigns Harvey creates turn on Instantly's own `stop_for_company`.
+
+- **DataForSEO SERP sends a location.** It sent only a keyword, but
+  DataForSEO requires a location on every task, so searches failed or came
+  back un-localised. It now sends the geocoded city point, or a
+  "Denver,Colorado,United States" location name, or the United States for
+  searches with no city. "No search results" is now an empty answer rather
+  than an error; other task errors still stop that query and are reported.
+- **DataForSEO SERP estimates were 3.3x low.** They used the standard-queue
+  price ($0.0006 per 10 results); Harvey calls the Live endpoint ($0.002),
+  so a depth-30 search is $0.006, not $0.0018. Harvey stays on Live: it's
+  synchronous, so the spend cap checked between searches sees real spend.
+
+- **Scout finds the actual decision maker.** On a test set of 19 small
+  business sites it found the right person on 3; it now finds 17. It no
+  longer turns headings like "Team of Experts" into prospects, reads a
+  bio paragraph as a job title, lets "Vice President" pass for "President",
+  or takes a customer quoted in a testimonial for the owner.
+- **A cached default email pattern no longer blocks better evidence.** A
+  first.last@ guess cached for a domain used to be read first forever, so
+  neither a real address nor a Hunter lookup could replace it. Hunter is
+  asked once per domain, and `j.smith@` is no longer read as first.last@.
+- **The company-inbox fallback finds published inboxes it used to miss**: it
+  reads whole pages (an `info@` 140k characters into a page counted for
+  nothing), schema.org, and an address on the business's own second domain
+  (`admin@phroofing.test` for prairieheritageroofing.test). It is also used
+  when the named owner's address is only a guess, which is never sent.
+- **reCAPTCHA no longer makes a site look blocked.** Any page mentioning
+  "captcha" in its first 4,000 characters counted as a block, which cost
+  Harvey every site with a protected contact form. Only real challenge
+  pages count now, and a SiteGround or Cloudflare challenge is reported as
+  challenged (not unreachable) without retrying every URL variant.
+- **Gmail reads replies in the charset they were written in** (from #58 by
+  xiaoheiai4719-collab). Every reply was decoded as UTF-8, so a reply sent
+  as ISO-8859-1 or Windows-1252 ("Je préfère mardi") reached the model
+  garbled. Each part now uses its declared charset; an unknown or missing
+  one, or odd headers, falls back to UTF-8 without losing the text. SMTP
+  and Microsoft 365 already decoded correctly.
+- **You see it when Harvey isn't sending because it couldn't read your
+  inbox.** Sending waits until replies are read, so an opt-out stops its
+  follow-up. That hold only showed in the log, so a lapsed Gmail sign-in
+  could stall sending for days unnoticed. Today now shows it first, with
+  the reason, how long, how many emails are waiting and the fix (`harvey
+  gmail auth`, `harvey microsoft auth`, or a mailbox over the read limit),
+  and so does `harvey status`. It clears itself once sending runs again.
+- **Gmail: nothing sends until the whole inbox has been read** (from #62 by
+  xiaoheiai4719-collab). A failed or partial inbox read used to look like
+  an empty inbox, so a follow-up could go out before an opt-out on page two
+  was handled. Gmail now reads every page of the last week, and raises on
+  any failure so the heartbeat holds sending, the same as Microsoft 365. A
+  send whose outcome is unknown (a dropped connection, a 5xx, an unreadable
+  answer) is recorded as maybe-sent and never retried, so nobody gets it
+  twice. Messages already read aren't downloaded again on later cycles.
+- **Autopilot can't be steered by text from outside** (#66, reported by
+  Yaaaannnn435). Websites Harvey researches and the replies people send
+  reach the model, and either can carry planted instructions. That text is
+  now fenced as data in every prompt (writer, reply handler, scout scoring,
+  Humanizer), in a block it can't close itself. Prompts only lower the odds,
+  so with `require_approval: false` an email nobody approved goes back to
+  the Outbox, marked Held with the reason, when it links to or gives an
+  address at a domain that isn't yours (sending domain, booking link, or
+  `channels.email.link_domains`), or quotes Harvey's own instructions.
+  Bare domains like `example.com/x` count as links. Approving it yourself
+  sends it. On Instantly, replies now run the pre-send gate too and a held
+  one goes to you; a campaign template that would be held isn't deployed.
+  The model never had tools, files or network to act with, so this was
+  never more than what it wrote.
+- **Opted-out contacts are no longer in the prospect CSV.** Someone who
+  replied "unsubscribe" stayed in `harvey export` and the dashboard's Export
+  button, so taking the list to another sequencer could email them again.
+  They're now left out even when `--status` or `--email-status` is given;
+  `harvey export --all` (and `?all=true`) is still the raw, unfiltered dump.
+  From #64 by hifzabuildsai.
+- **An opt-out now stays an opt-out.** Any later message from someone who
+  opted out (an out-of-office, a "thanks") set them back to *replied* or
+  *lost*, which put them back in the export, and a question from them got a
+  drafted answer in the Outbox. Now their message is kept in a closed
+  conversation for you to read, nothing is drafted, and no code path can
+  move a prospect off *opted out*. A complaint from them still comes to you.
+- **See why someone opted out, and undo it.** Each opt-out now records the
+  rule that fired (an opt-out phrase, "no thanks", a one-word reply, or the
+  model's judgement), the words it matched and their message. **Why?** on
+  their row in Contacts (or on the conversation) shows it, and **Undo
+  opt-out** reverses a mistaken one after a confirm: they become *replied*,
+  so nothing is sent on its own, and Harvey's answer to their next reply
+  waits for your approval even with `require_approval: false` (on
+  Instantly, which can't hold a reply, that conversation comes to you). Opt-outs from before this show their last message instead, and
+  every undo is logged.
+- **`aiosmtplib` is now 5.1.3 or later** (was `>=3.0.1,<4`). Older versions
+  wrote a CR/LF inside an address straight to the SMTP server, so an address
+  scraped from a website could add commands of its own
+  (GHSA-v3q9-hj7j-63hq), and kept plaintext bytes across STARTTLS
+  (GHSA-vxj7-4xrp-5vr4). Harvey passes scraped addresses to it when sending
+  over SMTP and when probing a mailbox. Reported in #66.
 - A follow-up no longer goes out before, or right after, the email it
   follows. Each step now waits until the previous one has actually been sent
   and its gap (at least a day) has passed. Before, approving a batch of drafts
@@ -136,11 +513,30 @@ minor versions can still change behaviour.
   have each new recipient checked before the first cold email against UK
   PECR, US CAN-SPAM, Canada's CASL, Germany's UWG and France's rules. Any
   verdict but `ok_to_email` fails that outbox item with the rule and the next
-  step. If the check can't be made (daily allowance used up, network down, a
-  malformed response), cold emails wait for a later cycle while replies still
-  go out. One check per address, cached for 30 days; changing the sender
-  country, address source or product description triggers a fresh check. The
-  receipt id is logged with each send. Native providers only. Off by default.
+  step. If the check can't be made because of Precleared (daily allowance or
+  rate limit, a bad key, network down, an unreadable answer), new addresses
+  wait for a later cycle while email to people already cleared, and replies,
+  still go out; if it fails for one address, only that email is moved back
+  six hours (failures at two different domains with no answer in between
+  hold new addresses too), and an address whose check timed out or got an
+  answer Harvey can't read is moved back as well, so it can't keep the
+  others waiting. One check per address, cached for 30 days; changing the
+  sender country, address source or product description triggers a fresh
+  check. The receipt id is logged with each send. Native providers only. Off
+  by default.
+- **`harvey setup` offers the Precleared check** (from #46 by
+  gabrielaoimevbore-beep). A new optional last step
+  asks whether to turn the check on, where your business is based (GB or US)
+  and, if your prospects are all in one country, which one (answering "no"
+  there asks before saving it as Norway's code). It then offers a
+  free `PRECLEARED_API_KEY` (hidden input, saved to `.env`; 25 checks a day
+  instead of 10). Off unless you say yes. Re-running setup offers your saved
+  answers as the defaults, so pressing Enter never switches the check off. The
+  Claude-guided setup in CLAUDE.md offers the same step. Setup now reads and
+  saves `harvey.local.yaml` when it exists (it's what `harvey train` writes,
+  and the file Harvey reads), not the `harvey.yaml` it shadows, so its answers
+  take effect; if it can't save the file it says so instead of ticking the
+  summary.
 - **Cohort builder pagination and CSV export.** The cohort table on the
   Signals tab used to stop at the first 50 matches with no way to see the
   rest. It now pages with Prev / Next ("Showing 51–100 of 147"), and an

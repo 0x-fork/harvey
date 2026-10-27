@@ -612,6 +612,15 @@ tr:focus-within .row-action { opacity: 1; }
 .check-info { flex: 1; min-width: 0; }
 .check-label { font-size: var(--fs-ui); font-weight: 500; }
 .check-label.done { color: var(--text-3); font-weight: 400; }
+.check-item.current {
+  margin: 0 calc(-1 * var(--sp-3)); padding: var(--sp-3);
+  background: var(--accent-soft); border-radius: var(--r-md);
+}
+.check-item.current + .check-item, .check-item + .check-item.current { border-top-color: transparent; }
+.setup-card { margin-bottom: var(--sp-4); }
+.setup-head { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--sp-3); margin-bottom: var(--sp-3); }
+.setup-head h3 { font-size: var(--fs-h3); margin: 0; }
+.setup-head p { margin: 2px 0 0; font-size: var(--fs-caption); }
 .check-help { font-size: var(--fs-caption); color: var(--text-3); margin-top: 2px; text-wrap: pretty; overflow-wrap: anywhere; }
 .setup-pct { font-size: var(--fs-caption); color: var(--text-3); font-weight: 500; }
 
@@ -649,6 +658,10 @@ details[open] > summary::before { rotate: 45deg; }
 }
 @media (hover: hover) { .cohort-pick:hover { box-shadow: inset 0 0 0 1px var(--line-strong); } }
 .cohort-pick:has(input:checked) { background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent-line); }
+.cohort-range { align-items: center; }
+.cohort-range > span:first-child { flex: 1; }
+.cohort-bound { width: 64px; padding: 3px 6px; font: inherit; font-size: 12px; }
+.cohort-range:has(.cohort-bound:not(:placeholder-shown)) { background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent-line); }
 .cohort-pick input { accent-color: var(--accent); }
 .cohort-pick .n { margin-left: auto; font-size: var(--fs-caption); color: var(--text-3); }
 .cohort-size { font-size: 2rem; font-weight: 600; letter-spacing: -0.03em; line-height: 1.1; }
@@ -990,3 +1003,32 @@ table.clip td { max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
 .more-fields { margin-bottom: var(--sp-3); }
 .more-fields summary { cursor: pointer; font-size: var(--fs-ui); color: var(--text-2); margin-bottom: var(--sp-3); }
 .check-line { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-ui); color: var(--text-2); cursor: pointer; }
+
+/* Contacts: why someone is opted out, under their row. */
+.detail-row > td { white-space: normal; background: var(--surface-2); }
+.optout-panel { display: flex; flex-direction: column; gap: var(--sp-2); max-width: 72ch; padding: var(--sp-2) 0; }
+.optout-panel h4 { margin: 0; font-size: var(--fs-ui); }
+.optout-panel p { margin: 0; font-size: var(--fs-ui); line-height: 1.55; }
+.optout-panel .optout-meta { font-size: var(--fs-caption); color: var(--text-2); }
+.optout-panel .thread-msg.received { background: var(--surface); }
+.optout-panel .convo-actions { margin-top: var(--sp-2); }
+.optout-panel .convo-actions .muted { white-space: normal; }
+.optout-panel .convo-actions .btn-ghost { margin-left: 0; }
+
+/* Outbox: an email autopilot held for you (#66). */
+.desk-held { margin-bottom: var(--sp-3); }
+
+/* Approval or autopilot: the Outbox notice and the Settings card. */
+.mode-banner { align-items: center; }
+.mode-banner > div { flex: 1; }
+.mode-card h3 { margin: 0 0 var(--sp-2); }
+.mode-card p { margin: 0 0 var(--sp-2); font-size: var(--fs-ui); line-height: 1.55; max-width: 72ch; }
+.mode-card .convo-actions .muted { white-space: normal; flex-basis: 100%; }
+.mode-confirm .form-input { width: 12rem; }
+.mode-card .convo-actions .btn-ghost { margin-left: 0; }
+.mode-banner:not(.wait) { background: var(--surface); border-color: var(--line); }
+
+/* Setup checklist: the warmup step's actions */
+.warmup-actions { margin-top: var(--sp-2); align-items: center; }
+a.btn, a.btn:hover { text-decoration: none; }
+.warmup-actions .form-input { flex: 1 1 200px; height: 28px; min-width: 0; }

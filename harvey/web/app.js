@@ -229,8 +229,8 @@ const SOURCE_LABELS = {
   company_website: 'Team page', known_company_backfill: 'Team page',
   scraped_mailto: 'Published address', hunter_domain_search: 'Hunter', linkedin_search: 'LinkedIn',
   job_board: 'Job board', web_search: 'Web search', company_inbox: 'Company inbox',
-  osm: 'OpenStreetMap', dataforseo_listings: 'DataForSEO', dataforseo_serp: 'DataForSEO SERP',
-  serper: 'Serper', scavio_maps: 'Scavio Maps', scavio_search: 'Scavio Search',
+  osm: 'OpenStreetMap', dataforseo_listings: 'DataForSEO', dataforseo_serp: 'DataForSEO SERP', dataforseo_maps: 'DataForSEO Maps',
+  serper: 'Serper', tinyfish: 'TinyFish', scavio_maps: 'Scavio Maps', scavio_search: 'Scavio Search',
 };
 function sourceLabel(s) {
   if (!s) return '';
@@ -258,7 +258,9 @@ function actionText(a) {
       : 'Sent email ' + escHtml(String(d.step || 1)) + ' to ' + who;
     case 'reply': return 'Answered ' + who + intent;
     case 'reply_queued': return 'Drafted a reply to ' + who + intent;
-    case 'opt_out': return who + ' opted out';
+    case 'opt_out': return who + ' opted out' + (d.why ? ' · ' + escHtml(d.why) : '');
+    case 'opt_out_undone': return 'You undid ' + (who || 'a contact') + '’s opt-out';
+    case 'reply_after_opt_out': return who + ' wrote again after opting out · no reply sent';
     case 'escalation': return 'Flagged ' + who + ' for you' + (d.reason ? ' · ' + escHtml(d.reason) : '');
     case 'bounce': return 'Email to ' + who + ' bounced';
     case 'manual_send': return 'You marked a contact as emailed by hand';
@@ -414,7 +416,7 @@ function loadCurrentTab() {
     case 'conversations': loadConversations(); break;
     case 'activity': loadActivity(); break;
     case 'usage': loadUsage(); break;
-    case 'settings': loadSettings(); break;
+    case 'settings': loadSettings(); loadSendingModeCard(); break;
     case 'controls': loadHarveyStatus(); loadLogs(); break;
   }
 }
@@ -662,14 +664,17 @@ async function loadSetupStatus() {
   // Finished setup disappears completely rather than greeting you forever.
   if (pct === 100) { el.innerHTML = ''; return; }
 
+  // The first unfinished required step is the one to do now.
+  const next = data.checks.find(c => c.required && !c.done);
   const renderCheck = (c, optional) =>
-    '<div class="check-item">' +
+    '<div class="check-item' + (c === next ? ' current' : '') + '">' +
       (c.done ? '<span class="check-icon done">' + icon('check') + '</span>'
               : '<span class="check-icon pending"></span>') +
       '<div class="check-info">' +
         '<div class="check-label ' + (c.done ? 'done' : '') + '">' + escHtml(c.label) +
           (optional ? '<span class="optional-tag">optional</span>' : '') + '</div>' +
         (!c.done ? '<div class="check-help">' + escHtml(c.help) + '</div>' : '') +
+        (!c.done && c.id === 'warmup_service' ? warmupServiceActions(c) : '') +
       '</div></div>';
 
   const required = data.checks.filter(c => c.required);
@@ -677,8 +682,10 @@ async function loadSetupStatus() {
   const done = required.filter(c => c.done).length;
 
   el.innerHTML =
-    '<div class="subhead">Setup <span class="setup-pct">' + done + ' of ' + required.length + ' done</span></div>' +
-    '<div class="card">' +
+    '<div class="card setup-card">' +
+      '<div class="setup-head"><div><h3>Finish setting up Harvey</h3>' +
+        '<p class="muted">Harvey starts finding prospects and sending once these are done.</p></div>' +
+        '<span class="setup-pct">' + done + ' of ' + required.length + ' done</span></div>' +
       '<div class="bar thick" style="margin-bottom:8px"><span style="width:' + pct + '%;background:var(--accent)"></span></div>' +
       required.map(c => renderCheck(c, false)).join('') +
       (optional.length
@@ -688,6 +695,43 @@ async function loadSetupStatus() {
           optional.map(c => renderCheck(c, true)).join('') + '</div></details>'
         : '') +
     '</div>';
+}
+
+// The warmup step: get TrulyInbox, paste its key, or say you use another service.
+function warmupServiceActions(c) {
+  return '<div class="btn-group warmup-actions">' +
+      '<a class="btn btn-primary btn-sm" href="' + safeHref(c.link) + '" target="_blank" ' +
+        'rel="noopener sponsored">Get TrulyInbox</a>' +
+      '<input class="form-input" id="trulyinbox-key" type="password" autocomplete="off" ' +
+        'placeholder="Paste your TrulyInbox API key" aria-label="TrulyInbox API key" ' +
+        'onkeydown="if (event.key === \'Enter\') connectTrulyInbox()">' +
+      '<button class="btn btn-secondary btn-sm" id="trulyinbox-go" onclick="connectTrulyInbox()">Connect</button>' +
+      '<button class="btn btn-ghost btn-sm" onclick="useOtherWarmup()">I use another service</button>' +
+    '</div>';
+}
+
+async function connectTrulyInbox() {
+  const input = document.getElementById('trulyinbox-key');
+  const go = document.getElementById('trulyinbox-go');
+  if (!input || !input.value.trim()) return;
+  if (go) go.disabled = true;
+  const data = await api('/api/trulyinbox/connect', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({key: input.value.trim()}),
+  });
+  if (go) go.disabled = false;
+  if (data && data.success) {
+    input.value = '';
+    showToast(data.message || 'TrulyInbox connected', 'success');
+    loadSetupStatus();
+  } else {
+    showToast((data && data.message) || 'Could not connect TrulyInbox', 'error');
+  }
+}
+
+async function useOtherWarmup() {
+  const data = await api('/api/trulyinbox/other', {method: 'POST'});
+  if (data && data.success) loadSetupStatus();
 }
 
 // ── Signals: Harvey proposes, you confirm ──
@@ -858,6 +902,7 @@ function discoverBody() {
     depth: Number(document.getElementById('disc-depth').value) || 30,
     limit: Number(document.getElementById('disc-limit').value) || 100,
     max_spend: Number(document.getElementById('disc-cap').value) || 1,
+    preset: (document.getElementById('disc-preset') || {}).value || '',
   };
 }
 
@@ -989,7 +1034,7 @@ function renderDiscoverResult(report, running) {
 
 // ── Cohort builder: a prospect list is a query ──
 
-let _cohort = { require: new Set(), exclude: new Set() };
+let _cohort = { require: new Set(), exclude: new Set(), ranges: {} };
 let _cohortOffset = 0;
 let _cohortGeneration = 0;
 const COHORT_PAGE = 50;
@@ -1021,9 +1066,37 @@ function renderCohortBuilder() {
         '<span class="n">' + (s.companies || 0) + '</span></label>'
     ).join('') + '</div></div>';
 
+  // Numeric signals (ranks, ratings) take a range: "organic rank 11-30".
+  const numeric = confirmed.filter(s => s.value_type === 'num');
+  const bound = (code, side) => {
+    const v = (_cohort.ranges[code] || {})[side];
+    return '<input type="number" class="cohort-bound" placeholder="' + side + '" ' +
+      'value="' + (v === undefined || v === null ? '' : escHtml(String(v))) + '" ' +
+      'aria-label="' + escHtml(code) + ' ' + side + '" ' +
+      'onchange="setCohortRange(' + jsq(code) + ',' + jsq(side) + ',this.value)">';
+  };
+  const rangeCol = numeric.length ?
+    '<div style="height:18px"></div><div><div class="subhead" style="margin-top:0">In range ' +
+      '<span class="muted" style="font-weight:400;text-transform:none;letter-spacing:0">' +
+      '&mdash; e.g. organic rank 11 to 30; leave a side blank for no limit</span></div>' +
+      '<div class="cohort-grid">' +
+      numeric.map(s =>
+        '<div class="cohort-pick cohort-range"><span>' + escHtml(s.label || s.code) + '</span>' +
+          bound(s.code, 'min') + '<span class="muted">to</span>' + bound(s.code, 'max') + '</div>'
+      ).join('') + '</div></div>' : '';
+
   el.innerHTML = col('Must have', 'require', '&mdash; every company in the cohort carries all of these') +
     '<div style="height:18px"></div>' +
-    col('Must not have', 'exclude', '&mdash; disqualifiers');
+    col('Must not have', 'exclude', '&mdash; disqualifiers') + rangeCol;
+}
+
+function setCohortRange(code, side, value) {
+  const r = _cohort.ranges[code] || {min: null, max: null};
+  r[side] = value === '' || isNaN(Number(value)) ? null : Number(value);
+  if (r.min === null && r.max === null) delete _cohort.ranges[code];
+  else _cohort.ranges[code] = r;
+  _cohortOffset = 0;
+  runCohort();
 }
 
 function toggleCohort(key, code, on) {
@@ -1042,14 +1115,15 @@ async function runCohort() {
   const el = document.getElementById('cohort-result');
   if (!el) return;
   const require = [..._cohort.require], exclude = [..._cohort.exclude];
-  if (!require.length) { el.innerHTML = ''; return; }
+  const ranges = _cohortRanges();
+  if (!require.length && !ranges.length) { el.innerHTML = ''; return; }
   // Remove the prior export button as soon as its criteria become stale.
   el.innerHTML = '<p class="muted">Loading cohort…</p>';
 
   const data = await api('/api/cohort', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({require: require, exclude: exclude,
+    body: JSON.stringify({require: require, exclude: exclude, ranges: ranges,
                           offset: offset, limit: COHORT_PAGE}),
   });
   if (generation !== _cohortGeneration) return;
@@ -1097,9 +1171,19 @@ async function runCohort() {
   el.innerHTML = html + '</div>';
 }
 
+function _cohortRanges() {
+  return Object.entries(_cohort.ranges || {})
+    .filter(([, r]) => r.min !== null || r.max !== null)
+    .map(([code, r]) => ({code: code, min: r.min, max: r.max}));
+}
+
 async function exportCohort(button) {
   const qs = new URLSearchParams({require: [..._cohort.require].join(','),
                                   exclude: [..._cohort.exclude].join(',')});
+  // Ranges travel as "CODE:min:max", a blank side meaning no limit.
+  const ranges = Object.entries(_cohort.ranges || {})
+    .map(([code, r]) => code + ':' + (r.min ?? '') + ':' + (r.max ?? ''));
+  if (ranges.length) qs.set('ranges', ranges.join(','));
   button.disabled = true;
   button.textContent = 'Exporting…';
   let url;
@@ -1510,7 +1594,8 @@ async function loadUsage() {
 // wait in the rail.
 
 async function loadOutbox() {
-  const data = await api('/api/outbox');
+  const [data, mode] = await Promise.all([api('/api/outbox'), api('/api/sending-mode')]);
+  _sendingMode = mode && !mode.error ? mode : null;
   const banner = document.getElementById('outbox-banner');
   const desk = document.getElementById('outbox-desk');
   const list = document.getElementById('outbox-list');
@@ -1538,8 +1623,10 @@ async function loadOutbox() {
 
   actions.innerHTML =
     (pending.length && !data.paused
-      ? '<button class="btn btn-primary btn-sm" onclick="outboxApproveAll()">Approve all ' +
-        pending.length + '</button>' : '') +
+      ? (pending.length > pending.filter(p => heldReason(p)).length
+        ? '<button class="btn btn-primary btn-sm" onclick="outboxApproveAll()" ' +
+          'title="Emails Harvey held are left for you to approve one by one">Approve all ' +
+          (pending.length - pending.filter(p => heldReason(p)).length) + '</button>' : '') : '') +
     (data.paused
       ? '<button class="btn btn-secondary btn-sm" onclick="sendingToggle(\'resume\')">' +
         'Resume sending</button>'
@@ -1548,10 +1635,10 @@ async function loadOutbox() {
 
   // The kill switch gets a banner only when it's actually on — a permanent
   // bar for a thing that isn't happening is just noise.
-  banner.innerHTML = data.paused
+  banner.innerHTML = sendingModeBanner(_sendingMode) + (data.paused
     ? '<div class="banner bad">' + icon('alert') + '<div><b>Sending is paused</b>' +
         '<p>' + escHtml(data.paused) + '. Approved mail stays queued until you resume.</p></div></div>'
-    : '';
+    : '');
   // Only once there is mail to warn about: a fresh install sends nothing.
   const anyMail = pending.length || (data.approved || []).length || (data.sent || []).length;
   if (data.compliance_notice && anyMail) {
@@ -1562,7 +1649,9 @@ async function loadOutbox() {
 
   desk.innerHTML = pending.length ? renderDesk(pending, _desk.i) :
     '<div class="card">' + emptyState(icon('check'), 'Nothing to review',
-      'Every draft Harvey writes lands here first. Approve one and it sends on schedule.') +
+      _sendingMode && _sendingMode.mode === 'autopilot'
+        ? 'Autopilot is on, so Harvey sends on its own. Anything it holds for you shows up here.'
+        : 'Every draft Harvey writes lands here first. Approve one and it sends on schedule.') +
     '</div>';
 
   const table = (title, rows, cols) => {
@@ -1631,6 +1720,118 @@ function renderDeskContext(ctx) {
   '</div>';
 }
 
+// ── Approval or autopilot ──
+// Approval (the default): every email waits in the Outbox for you.
+// Autopilot (channels.email.require_approval: false): Harvey sends on its
+// own, and still holds what gate.autopilot_review flags. Turning autopilot
+// on takes typing the word; turning it off is one click and works at once.
+let _sendingMode = null, _autopilotArmed = false, _modeBusy = false;
+
+function sendingModeBanner(m) {
+  if (!m) return '';
+  if (m.mode === 'autopilot') {
+    return '<div class="banner wait mode-banner">' + icon('alert') + '<div><b>Autopilot is on</b>' +
+      '<p>Harvey sends email on its own. It holds anything that links to a site that isn’t yours or ' +
+      'quotes its own instructions; those wait here' + (m.held ? ' (' + m.held + ' now)' : '') + '.</p></div>' +
+      '<button class="btn btn-secondary btn-sm" onclick="setSendingMode(\'approval\')"' +
+        (_modeBusy ? ' disabled' : '') + '>Turn off autopilot</button></div>';
+  }
+  const instantly = m.provider === 'instantly';
+  return '<div class="banner mode-banner">' + icon('check') + '<div><b>Approval mode</b>' +
+    '<p>' + (instantly
+      ? 'Instantly can’t hold single emails, so campaigns aren’t sent to Instantly until you turn on autopilot.'
+      : 'Every email Harvey writes waits here until you approve it.') +
+    ' <a href="#" onclick="goTab(\'settings\');return false">About autopilot</a></p></div></div>';
+}
+
+function sendingModeCard(m) {
+  if (!m) return '<div class="card muted">Couldn’t read the sending mode.</div>';
+  const auto = m.mode === 'autopilot';
+  const instantly = m.provider === 'instantly';
+  const domains = (m.your_domains || []).map(escHtml).join(', ') || 'none yet';
+  let html = '<div class="card mode-card"><h3>Sending mode: ' + (auto ? 'Autopilot' : 'Approval') + '</h3>' +
+    '<p><b>Approval</b> (the default): every email Harvey writes, first emails, follow-ups and replies, ' +
+      'waits in the Outbox until you approve it.' +
+      (instantly ? ' On Instantly, which can’t hold single emails, that means campaigns aren’t deployed.' : '') + '</p>' +
+    '<p><b>Autopilot</b>: Harvey sends on its own, on schedule, within your daily limit and quiet hours. ' +
+      'Opt-outs, bounces and Pause all sending work the same. It still holds an email for you when it links ' +
+      'to, or gives an address at, a site that isn’t yours, or quotes Harvey’s own instructions: text from ' +
+      'websites and replies can try to steer what it writes. The first reply after you undo an opt-out waits too.</p>' +
+    '<p class="muted">Counted as yours: ' + domains + (m.booking_page ? '; your booking page ' + escHtml(m.booking_page) : '') +
+      '. Add others under <code>channels.email.link_domains</code> in <code>' + escHtml(m.file) + '</code>.</p>';
+  if (auto) {
+    html += '<div class="convo-actions"><span class="muted">Turning it off works at once: emails autopilot ' +
+      'approved that haven’t gone out come back to the Outbox.' +
+      (instantly ? ' Campaigns already on Instantly keep running until you pause them there.' : '') + '</span>' +
+      '<button class="btn btn-primary btn-sm" onclick="setSendingMode(\'approval\')"' +
+        (_modeBusy ? ' disabled' : '') + '>Turn off autopilot</button></div>';
+  } else if (_autopilotArmed) {
+    html += '<div class="convo-actions mode-confirm"><span class="muted">Approve a batch or two by hand first ' +
+      'and read what Harvey writes. Type <b>autopilot</b> to turn it on. It starts from Harvey’s next cycle.</span>' +
+      '<input class="form-input" id="autopilot-confirm" autocomplete="off" aria-label="Type autopilot to confirm" ' +
+        'oninput="document.getElementById(\'autopilot-go\').disabled = this.value.trim().toLowerCase() !== \'autopilot\'" ' +
+        'onkeydown="if (event.key === \'Enter\' && this.value.trim().toLowerCase() === \'autopilot\') setSendingMode(\'autopilot\')">' +
+      '<button class="btn btn-primary btn-sm" id="autopilot-go" disabled onclick="setSendingMode(\'autopilot\')">Turn on autopilot</button>' +
+      '<button class="btn btn-ghost btn-sm" onclick="_autopilotArmed=false;renderSendingModeCard()">Cancel</button></div>';
+  } else {
+    html += '<div class="convo-actions"><button class="btn btn-secondary btn-sm" ' +
+      'onclick="_autopilotArmed=true;renderSendingModeCard()">Turn on autopilot…</button></div>';
+  }
+  return html + '</div>';
+}
+
+function renderSendingModeCard() {
+  const el = document.getElementById('sending-mode-card');
+  if (el) el.innerHTML = sendingModeCard(_sendingMode);
+  const input = document.getElementById('autopilot-confirm');
+  if (input) input.focus();
+}
+
+async function loadSendingModeCard() {
+  const m = await api('/api/sending-mode');
+  _sendingMode = m && !m.error ? m : null;
+  renderSendingModeCard();
+}
+
+async function setSendingMode(mode) {
+  if (_modeBusy) return;
+  const body = {mode};
+  if (mode === 'autopilot') {
+    const input = document.getElementById('autopilot-confirm');
+    body.confirm = input ? input.value.trim().toLowerCase() : '';
+  }
+  _modeBusy = true;
+  document.querySelectorAll('.mode-banner button, .mode-card button').forEach(b => { b.disabled = true; });
+  try {
+    const res = await api('/api/sending-mode', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+    });
+    if (res && res.success) {
+      _autopilotArmed = false;
+      showToast(mode === 'autopilot'
+        ? 'Autopilot is on from Harvey’s next cycle. Held emails still wait for you.'
+        : 'Autopilot is off. Every email waits for you' +
+          (res.requeued ? '; ' + res.requeued + ' queued by autopilot came back to the Outbox.' : '.') +
+          (_sendingMode && _sendingMode.provider === 'instantly'
+            ? ' Campaigns already on Instantly keep running: pause them in Instantly.' : ''), 'success');
+    } else {
+      showToast(failMsg(res, 'Couldn’t change the sending mode.'), 'error');
+    }
+  } finally {
+    _modeBusy = false;
+  }
+  loadSendingModeCard();
+  loadOutbox();
+}
+
+// Why autopilot sent this back for a human (sender: gate.autopilot_review).
+const HELD_PREFIX = 'held for your review: ';   // state.HELD_FOR_REVIEW
+function heldReason(item) {
+  const e = String((item && item.error) || '');
+  const why = e.startsWith(HELD_PREFIX) ? e.slice(HELD_PREFIX.length) : '';
+  return why.charAt(0).toUpperCase() + why.slice(1);
+}
+
 function renderDesk(items, i) {
   const cur = items[i];
   const rail = items.map((it, n) => {
@@ -1638,7 +1839,9 @@ function renderDesk(items, i) {
     const parts = String(who || '').split(/[\s@.]+/);
     return '<div class="desk-item ' + (n === i ? 'active' : '') + '" onclick="deskGo(' + n + ')">' +
       '<span class="avatar">' + initials(parts[0], parts[1]) + '</span>' +
-      '<div class="di-text"><div class="to">' + escHtml(who) + '</div>' +
+      '<div class="di-text"><div class="to">' + escHtml(who) +
+        (heldReason(it) ? ' <span class="tag t-bad" title="Harvey held this instead of sending it">Held</span>' : '') +
+        '</div>' +
       '<div class="sub">' + escHtml(it.subject || '(no subject)') + '</div></div>' +
     '</div>';
   }).join('');
@@ -1679,6 +1882,11 @@ function renderDesk(items, i) {
         '<span class="tag">' + (cur.kind === 'reply' ? 'Reply' : 'Email ' + escHtml(String(cur.step))) + '</span>' +
         '<span class="muted">sends ' + formatDate(cur.send_at) + '</span></div>' +
       renderDeskContext(cur.context) +
+      (heldReason(cur)
+        ? '<div class="banner wait desk-held">' + icon('alert') + '<div><b>Harvey held this instead of sending it</b>' +
+          '<div>' + escHtml(heldReason(cur)) + '. Read it before approving: text from a website or an ' +
+          'email can try to steer what Harvey writes.</div></div></div>'
+        : '') +
       draft + footer +
       '<div class="desk-actions">' + actions +
         '<span class="muted" style="font-size:12px;margin-left:auto">' +
@@ -1772,7 +1980,9 @@ async function outboxAct(id, action) {
 async function outboxApproveAll() {
   if (deskBusy()) return;
   const data = await api('/api/outbox/approve-all', {method: 'POST'});
-  if (data && data.success) showToast('Approved ' + data.approved + ' email(s).', 'success');
+  if (data && data.success) showToast('Approved ' + data.approved + ' email(s).' + (data.held
+    ? ' ' + data.held + ' Harvey held ' + (data.held === 1 ? 'is' : 'are') + ' left for you to read and approve one by one.'
+    : ''), 'success');
   else showToast(failMsg(data, 'Approve-all failed.'), 'error');
   loadOutbox();
 }
@@ -1947,11 +2157,107 @@ function renderContacts() {
       '<td>' + badge(p.status) + '</td>' +
       '<td class="muted">' + sourceLabel(p.source) + '</td>' +
       '<td class="muted" style="white-space:nowrap">' + relTime(p.created_at) + '</td>' +
-      '<td><button class="btn btn-ghost btn-sm row-action" onclick="fbProspect(' + i + ')" ' +
-        'title="Leave feedback on this contact">Feedback</button></td></tr>';
+      '<td><div class="cell-row">' + (p.status === 'opted_out' || p.opt_out_undone || _optOut.id === p.id
+        ? '<button class="btn btn-ghost btn-sm" onclick="toggleOptOut(' + i + ')" ' +
+          'aria-expanded="' + (_optOut.id === p.id) + '" title="What made Harvey stop emailing them">' +
+          (p.status === 'opted_out' ? 'Why?' : 'Opt-out history') + '</button>' : '') +
+        '<button class="btn btn-ghost btn-sm row-action" onclick="fbProspect(' + i + ')" ' +
+        'title="Leave feedback on this contact">Feedback</button></div></td></tr>';
+    if (_optOut.id === p.id) html += '<tr class="detail-row"><td colspan="8">' + optOutPanel(p) + '</td></tr>';
   }
   rowsEl.innerHTML = html + '</tbody></table></div>' +
     '<div class="table-foot">' + rows.length + ' of ' + _prospects.length + ' contacts</div>';
+}
+
+// Why someone is opted out, and undoing it. Harvey never moves anyone off
+// "opted out" on its own, so a mistaken one (a bare "stop" that meant
+// something else) needs you: see what triggered it, then undo it here.
+let _optOut = {id: null, data: null, armed: false, busy: false};
+const OPT_OUT_RULES = {
+  phrase: 'Matched an opt-out phrase',
+  no_thanks: 'Matched “no thanks”',
+  only_words: 'Their reply was only an opt-out word',
+  model: 'The model’s judgement (no phrase matched)',
+};
+
+async function toggleOptOut(i) {
+  const p = _prospects[i];
+  if (!p) return;
+  if (_optOut.id === p.id) { _optOut = {id: null, data: null, armed: false, busy: false}; renderContacts(); return; }
+  _optOut = {id: p.id, data: null, armed: false, busy: false};
+  renderContacts();
+  const data = await api('/api/prospects/' + encodeURIComponent(p.id) + '/opt-out');
+  if (_optOut.id !== p.id) return;   // closed or switched meanwhile
+  _optOut.data = data || {error: true};
+  renderContacts();
+}
+
+function optOutPanel(p) {
+  const d = _optOut.data;
+  const name = escHtml([p.first_name, p.last_name].filter(Boolean).join(' ') || p.email);
+  if (!d) return '<div class="optout-panel muted">Loading…</div>';
+  if (d.error) return '<div class="optout-panel muted">Couldn’t load the opt-out record. Try again.</div>';
+  let html = '<div class="optout-panel"><h4>' + (d.opted_out ? 'Why Harvey stopped emailing ' : 'Opt-out history for ') +
+    name + '</h4>';
+  if (d.recorded) {
+    html += '<p>' + escHtml(d.why) + '</p><div class="optout-meta">' +
+      escHtml(own(OPT_OUT_RULES, d.rule) || d.rule || '') + (d.at ? ' · ' + relTime(d.at) : '') + '</div>';
+  } else if (d.opted_out || (d.history || []).length) {
+    html += '<p>They opted out before Harvey kept a record of why.' +
+      (d.message ? ' The last thing they wrote:' : ' There’s no reply from them on file.') + '</p>';
+  }
+  if (d.message) {
+    html += '<div class="thread-msg received"><div class="sender">' + escHtml(p.first_name || 'They') +
+      (d.at ? ' &middot; ' + relTime(d.at) : '') + '</div>' + escHtml(d.message) + '</div>';
+  }
+  const undone = (d.history || []).filter(h => h.action === 'opt_out_undone');
+  if (undone.length) {
+    html += '<div class="optout-meta">' + undone.map(h => 'You undid an opt-out ' + relTime(h.at)).join(' · ') + '</div>';
+  }
+  if (!d.opted_out) {
+    html += '<div class="convo-actions"><span class="muted">Not opted out now (' +
+      escHtml(statusMeta(d.status).label) + ').</span></div>';
+  } else if (_optOut.armed) {
+    html += '<div class="convo-actions"><span class="muted">Harvey will treat them as having replied. Nothing is ' +
+      'sent automatically, emails the opt-out cancelled stay cancelled, and Harvey’s answer to their next ' +
+      'reply waits for your approval, even on autopilot. Only undo it if they didn’t mean to opt out.</span>' +
+      '<button class="btn btn-primary btn-sm" onclick="undoOptOut()"' + (_optOut.busy ? ' disabled' : '') +
+        '>Confirm undo</button>' +
+      '<button class="btn btn-ghost btn-sm" onclick="_optOut.armed=false;renderContacts()">Cancel</button></div>';
+  } else {
+    html += '<div class="convo-actions"><button class="btn btn-secondary btn-sm" ' +
+      'onclick="_optOut.armed=true;renderContacts()">Undo opt-out</button></div>';
+  }
+  return html + '</div>';
+}
+
+async function undoOptOut() {
+  const id = _optOut.id;
+  if (!id || _optOut.busy) return;
+  _optOut.busy = true;
+  renderContacts();
+  const res = await api('/api/prospects/' + encodeURIComponent(id) + '/opt-out/undo', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({confirm: true}),
+  });
+  if (res && res.success) showToast('Opt-out undone. They’re marked as replied; Harvey sends nothing on its own.', 'success');
+  else showToast(failMsg(res, 'Could not undo the opt-out. Try again.'), 'error');
+  if (_optOut.id !== id) return;
+  _optOut.armed = false;
+  _optOut.busy = false;
+  _optOut.data = await api('/api/prospects/' + encodeURIComponent(id) + '/opt-out') || {error: true};
+  loadProspects();
+}
+
+// From a conversation: the contact, with the opt-out record open.
+async function showOptOut(prospectId, email) {
+  goTab('prospects');
+  _contactQuery = email || '';
+  const search = document.getElementById('contact-search');
+  if (search) search.value = _contactQuery;
+  await loadProspects();
+  const i = _prospects.findIndex(p => p.id === prospectId);
+  if (i >= 0 && _optOut.id !== prospectId) toggleOptOut(i);
 }
 
 // Opens a filled-in compose window in whatever Gmail account the browser is
@@ -2215,6 +2521,12 @@ function convoActions(c) {
   if (c.status === 'open') {
     return '<div class="convo-actions"><button class="btn btn-ghost btn-sm" onclick="setConvoStatus(' +
       jsq(c.id) + ',\'closed\')">Close conversation</button></div>';
+  }
+  if (c.status === 'closed' && c.prospect_status === 'opted_out') {
+    // Reopening wouldn't help: Harvey never answers someone who opted out.
+    return '<div class="convo-actions"><span class="muted">' + icon('alert') + 'Opted out. Harvey won’t write to them.</span>' +
+      '<button class="btn btn-secondary btn-sm" onclick="showOptOut(' + jsq(c.prospect_id) + ',' + jsq(c.prospect_email) +
+      ')">Why opted out?</button></div>';
   }
   if (c.status === 'closed') {
     return '<div class="convo-actions"><button class="btn btn-ghost btn-sm" onclick="setConvoStatus(' +

@@ -10,7 +10,9 @@ import yaml
 
 from harvey.textio import read_user_text
 from dotenv import load_dotenv
-from pydantic import BaseModel, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel, PrivateAttr, TypeAdapter, ValidationError, field_validator, model_validator,
+)
 
 from harvey.paths import PROJECT_ROOT
 
@@ -68,6 +70,11 @@ class ICPConfig(BaseModel):
     #   "Denver, CO": "39.7392,-104.9903,50"
     # Without one, listings providers can only match on the business name.
     geo_coordinates: dict[str, str] = {}
+    # Extra searches per industry for rank discovery, e.g.
+    #   "roofing contractor": ["roofer", "roof repair"]
+    # Each variant runs in every city alongside the industry itself, so the
+    # estimate grows with it. Empty → each industry is its own one search.
+    keyword_variants: dict[str, list[str]] = {}
 
 
 class WarmupConfig(BaseModel):
@@ -140,6 +147,63 @@ class WarmupConfig(BaseModel):
         return min(ceiling, self.start_sends + (days - self.min_days) * self.daily_increase)
 
 
+class SendWindowConfig(BaseModel):
+    """When cold email may go out, in each recipient's local time.
+
+    Off unless ``channels.email.send_window`` is set. A cold email goes out
+    only between ``start`` and ``end`` (on weekdays, with ``weekdays_only``)
+    in the recipient's own time zone, worked out from what Harvey knows
+    about them (see harvey/send_window.py). Recipients whose zone can't be
+    told get the window in ``usage.quiet_hours.timezone``; so does everyone
+    with ``recipient_timezone: false``. Follow-ups keep their delay_days and
+    move into the window. Replies are never held.
+    """
+
+    start: str = "08:00"
+    end: str = "17:00"
+    weekdays_only: bool = True     # Monday to Friday, in every country
+    recipient_timezone: bool = True
+
+    @field_validator("start", "end", mode="before")
+    @classmethod
+    def _valid_clock(cls, v, info):
+        if v is None:
+            return cls.model_fields[info.field_name].default
+        # YAML 1.1 reads an unquoted 17:00 as the number 1020 (base 60).
+        if isinstance(v, int) and not isinstance(v, bool) and 0 <= v < 24 * 60:
+            v = f"{v // 60:02d}:{v % 60:02d}"
+        v = str(v).strip()
+        try:
+            _time.fromisoformat(v)
+        except ValueError:
+            raise ValueError(
+                f"send_window time '{v}' is not valid. Use 24h HH:MM, e.g. '08:00'."
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _start_before_end(self):
+        if _time.fromisoformat(self.start) >= _time.fromisoformat(self.end):
+            raise ValueError(
+                "send_window.start must be earlier than send_window.end "
+                "(a send window can't run past midnight)."
+            )
+        return self
+
+
+def send_window_of(config) -> "SendWindowConfig | None":
+    """The configured send window, or None when there isn't one."""
+    email = getattr(getattr(config, "channels", None), "email", None)
+    window = getattr(email, "send_window", None)
+    return window if isinstance(window, SendWindowConfig) else None
+
+
+def operator_timezone(config) -> str:
+    """usage.quiet_hours.timezone: the zone Harvey itself runs on."""
+    quiet = getattr(getattr(config, "usage", None), "quiet_hours", None)
+    return getattr(quiet, "timezone", "") or "UTC"
+
+
 class EmailChannelConfig(BaseModel):
     enabled: bool = True
     # "instantly" (legacy), "gmail" (Gmail/Workspace via API — recommended),
@@ -155,12 +219,20 @@ class EmailChannelConfig(BaseModel):
     # outbox, so it holds campaigns and escalates replies while this is true.
     # Set false explicitly for full autopilot once you trust the output.
     require_approval: bool = True
+    # Your own domains besides the sending address's and the booking link's
+    # (e.g. your main site when you send from a secondary domain). On
+    # autopilot, an email linking anywhere else waits in the Outbox.
+    link_domains: list[str] = []
     # Kill switch: pause all sending when bounces exceed this fraction of
     # sent mail (measured over the trailing sends). 0 disables the switch.
     max_bounce_rate: float = 0.05
     # New domain? Ramp cold email up slowly (see WarmupConfig). Native
     # providers only: Instantly has its own warmup and per-account limits.
     warmup: WarmupConfig = WarmupConfig()
+    # Send cold email only in office hours, in each recipient's own time
+    # zone (see SendWindowConfig). None: no window, as before. Native
+    # providers only; Instantly schedules its own sends.
+    send_window: SendWindowConfig | None = None
 
     @field_validator("warmup", mode="before")
     @classmethod
@@ -319,11 +391,46 @@ class ComplianceConfig(BaseModel):
     # Must ask for wording Harvey recognises as an opt-out (OPT_OUT_WORDS).
     # "" leaves it off (and harvey warns).
     opt_out_line: str = DEFAULT_OPT_OUT_LINE
+    # Companies this operator will never email: competitors, existing
+    # customers, anyone under a legal hold, a partner you agreed not to
+    # approach. An entry is an address ("jane@acme.example") or a domain
+    # ("acme.example", which also covers its subdomains). Enforced by the gate at
+    # send time, so it holds for an email a human already approved, and for
+    # replies as well as cold mail — "never contact" means never.
+    do_not_contact: list[str] = []
 
     @field_validator("postal_address", "opt_out_line", mode="before")
     @classmethod
     def _blank_is_empty(cls, v):
         return "" if v is None else v
+
+    @field_validator("do_not_contact", mode="before")
+    @classmethod
+    def _clean_do_not_contact(cls, v):
+        """One string is a list; blanks and duplicates are dropped.
+
+        Normalising here rather than at the point of use keeps the gate's
+        matching free of parsing, and means " @Acme.EXAMPLE " or a pasted
+        "https://www.acme.example/" behaves the same as "acme.example". An
+        entry that names no address or domain is an error, not a no-op.
+        """
+        from harvey.gate import do_not_contact_entries
+        if v is None:
+            return []
+        if isinstance(v, str):
+            v = [v]
+        if not isinstance(v, (list, tuple)):
+            raise ValueError("must be a list of email addresses and domains")
+        seen: list[str] = []
+        for item in v:
+            if item is None:
+                continue
+            if not isinstance(item, str):
+                raise ValueError(f"{item!r} is not an email address or a domain")
+            for cleaned in do_not_contact_entries(item):
+                if cleaned not in seen:
+                    seen.append(cleaned)
+        return seen
 
     @field_validator("opt_out_line")
     @classmethod
@@ -498,6 +605,9 @@ class HarveyConfig(BaseModel):
     brain: BrainConfig = BrainConfig()
     compliance: ComplianceConfig = ComplianceConfig()
     writer: WriterConfig = WriterConfig()
+    # The file it was loaded from, so a running Harvey can re-read the
+    # sending mode from that same file (refresh_sending_mode).
+    _source_path: str | None = PrivateAttr(default=None)
 
 
 class EnvConfig(BaseModel):
@@ -511,6 +621,7 @@ class EnvConfig(BaseModel):
     hunter_api_key: str = ""
     serper_api_key: str = ""
     scavio_api_key: str = ""
+    tinyfish_api_key: str = ""
     reoon_api_key: str = ""
     zerobounce_api_key: str = ""
     # Native mail providers (channels.email.provider: gmail | smtp)
@@ -569,7 +680,9 @@ def load_config(config_path: str | None = None) -> HarveyConfig:
         )
 
     try:
-        return HarveyConfig(**data)
+        config = HarveyConfig(**data)
+        config._source_path = str(config_path)
+        return config
     except ValidationError as e:
         # Log a friendly, actionable summary, then re-raise the original
         # ValidationError so callers (and tests) keep the pydantic type.
@@ -626,6 +739,7 @@ def load_env() -> EnvConfig:
         hunter_api_key=os.getenv("HUNTER_API_KEY", "").strip(),
         serper_api_key=os.getenv("SERPER_API_KEY", "").strip(),
         scavio_api_key=os.getenv("SCAVIO_API_KEY", "").strip(),
+        tinyfish_api_key=os.getenv("TINYFISH_API_KEY", "").strip(),
         reoon_api_key=os.getenv("REOON_API_KEY", "").strip(),
         zerobounce_api_key=os.getenv("ZEROBOUNCE_API_KEY", "").strip(),
         gmail_client_id=os.getenv("GMAIL_CLIENT_ID", "").strip(),
@@ -643,6 +757,176 @@ def load_env() -> EnvConfig:
         precleared_api_key=os.getenv("PRECLEARED_API_KEY", "").strip(),
     )
     return env
+
+
+# ── Approval or autopilot ─────────────────────────────────────────────────
+#
+# channels.email.require_approval: true (the default) means every email
+# waits in the Outbox for you; false is autopilot. The dashboard can switch
+# it, so it is edited in place: one line changes and the comments stay.
+
+_APPROVAL_LINE_RE = re.compile(
+    r"^(?P<lead>[ \t]*require_approval[ \t]*:[ \t]*)(?P<val>[^\s#]+)", re.MULTILINE)
+_EMAIL_KEY_RE = re.compile(r"^(?P<ind>[ \t]+)email[ \t]*:[ \t]*(?:#.*)?$", re.MULTILINE)
+
+
+def _email_section(data):
+    channels = data.get("channels") if isinstance(data, dict) else None
+    email = channels.get("email") if isinstance(channels, dict) else None
+    return email if isinstance(email, dict) else None
+
+
+def _with_approval_line(raw: str, word: str) -> list[str]:
+    """Ways to say require_approval: <word> in ``raw``: change the line that
+    is there, or add one under an ``email:`` key."""
+    out = [raw[:m.start("val")] + word + raw[m.end("val"):] for m in _APPROVAL_LINE_RE.finditer(raw)]
+    for m in _EMAIL_KEY_RE.finditer(raw):
+        child = m.group("ind") + "  "
+        for line in raw[m.end():].split("\n")[1:]:
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            indent = line[:len(line) - len(line.lstrip(" \t"))]
+            if len(indent) > len(m.group("ind")):
+                child = indent
+            break
+        out.append(raw[:m.end()] + f"\n{child}require_approval: {word}" + raw[m.end():])
+    return out
+
+
+def set_require_approval(value: bool, path=None) -> Path:
+    """Write channels.email.require_approval into the config file Harvey
+    reads (harvey.local.yaml wins, as in load_config). Only that value
+    changes: the result must parse to the same settings apart from it, or
+    nothing is written and ConfigError says to set it by hand."""
+    import copy
+    import shutil
+    path = Path(path or _find_config_file())
+    target = path.resolve()          # a symlinked config stays a symlink
+    data_bytes = target.read_bytes()
+    bom = data_bytes.startswith(b"\xef\xbb\xbf")
+    try:
+        raw = data_bytes.decode("utf-8-sig").replace("\r\n", "\n")
+    except UnicodeDecodeError:
+        raise ConfigError(f"{path.name} isn't UTF-8, so it isn't rewritten. Set "
+                          f"channels.email.require_approval there by hand.")
+    try:
+        data = yaml.safe_load(raw)
+    except yaml.YAMLError as e:
+        raise ConfigError(f"Invalid YAML in {path.name}: {e}")
+    if _email_section(data) is None:
+        raise ConfigError(f"{path.name} has no channels.email section. Set "
+                          f"channels.email.require_approval there by hand.")
+    expected = copy.deepcopy(data)
+    _email_section(expected)["require_approval"] = bool(value)
+    word = "true" if value else "false"
+    for new in _with_approval_line(raw, word):
+        try:
+            if yaml.safe_load(new) != expected:
+                continue
+        except yaml.YAMLError:
+            continue
+        HarveyConfig(**expected)          # still a valid config
+        if b"\r\n" in data_bytes:
+            new = new.replace("\n", "\r\n")
+        tmp = target.with_name(target.name + ".tmp")
+        try:
+            tmp.write_bytes((b"\xef\xbb\xbf" if bom else b"") + new.encode("utf-8"))
+            shutil.copymode(target, tmp)
+            os.replace(tmp, target)
+        finally:
+            tmp.unlink(missing_ok=True)
+        _mode_cache.pop(str(target), None)
+        return path
+    raise ConfigError(f"Couldn't change require_approval in {path.name} safely. "
+                      f"Set channels.email.require_approval: {word} there by hand.")
+
+
+_mode_cache: dict[str, tuple[tuple, object]] = {}
+
+
+def refresh_sending_mode(config, path=None) -> bool:
+    """Bring a running config's require_approval in line with the file it was
+    loaded from, so a switch made while Harvey runs counts at once: the
+    sender, writer and handler call this before they queue or send. Cheap:
+    the file is only read again when it changed. True when the value
+    changed. A config not loaded from a file, or a file that can't be read,
+    leaves the running value alone."""
+    path = path or getattr(config, "_source_path", None)
+    if not path:
+        return False
+    try:
+        target = Path(path).resolve()
+        st = target.stat()
+        # Not the mtime alone: a restore or `cp -p` keeps it while the file changes.
+        stamp = (st.st_mtime_ns, st.st_size, st.st_ino, st.st_ctime_ns)
+        cached = _mode_cache.get(str(target))
+        if cached and cached[0] == stamp:
+            value = cached[1]
+        else:
+            email = _email_section(yaml.safe_load(read_user_text(target)))
+            value = email.get("require_approval", True) if email is not None else None
+            try:
+                # Read the way load_config reads it: "true", 'no', on...
+                value = TypeAdapter(bool).validate_python(value)
+            except ValidationError:
+                value = None
+            _mode_cache[str(target)] = (stamp, value)
+    except Exception:
+        return False
+    if not isinstance(value, bool) or value == config.channels.email.require_approval:
+        return False
+    config.channels.email.require_approval = value
+    return True
+
+
+_dnc_cache: dict[str, tuple[tuple, list[str] | None]] = {}
+
+
+def live_do_not_contact(config) -> list[str]:
+    """The do-not-contact list as the config file says it is now.
+
+    Someone who sees an approved email to a company they must not contact
+    adds it to the list while Harvey runs; waiting for a restart would let
+    that email go. Re-read only when the file changed (as refresh_sending_mode
+    does). A file that can't be read, or a list with a mistake in it, keeps
+    the last good list: never an empty one.
+    """
+    compliance = compliance_of(config)
+    path = getattr(config, "_source_path", None)
+    if not path:
+        return compliance.do_not_contact
+    try:
+        target = Path(path).resolve()
+        st = target.stat()
+        stamp = (st.st_mtime_ns, st.st_size, st.st_ino, st.st_ctime_ns)
+        cached = _dnc_cache.get(str(target))
+        if cached and cached[0] == stamp:
+            value = cached[1]
+        else:
+            value = None
+            try:
+                value = do_not_contact_from_file(target)
+            except Exception as e:
+                logger.warning(f"compliance.do_not_contact in {target.name} couldn't be read "
+                               f"({e}); still using the last good list.")
+            _dnc_cache[str(target)] = (stamp, value)
+    except OSError:
+        return compliance.do_not_contact
+    if value is None:
+        return compliance.do_not_contact
+    if value != compliance.do_not_contact and isinstance(
+            getattr(config, "compliance", None), ComplianceConfig):
+        config.compliance.do_not_contact = value
+    return value
+
+
+def do_not_contact_from_file(path=None) -> list[str]:
+    """Just ``compliance.do_not_contact`` from a config file, validated.
+    Raises on a file that can't be read or a list with a mistake in it."""
+    data = yaml.safe_load(read_user_text(path or _find_config_file()))
+    section = data.get("compliance") if isinstance(data, dict) else None
+    raw = section.get("do_not_contact") if isinstance(section, dict) else None
+    return ComplianceConfig(do_not_contact=raw).do_not_contact
 
 
 def _find_config_file() -> str:
