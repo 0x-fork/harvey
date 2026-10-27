@@ -635,6 +635,85 @@ async def test_unconfigured_provider_says_which_key_is_missing(state, config, mo
     assert "TINYFISH_API_KEY" in tf_report.errors[0]
 
 
+@pytest.mark.asyncio
+async def test_empty_api_key_runs_nothing_and_says_so(state, config,
+                                                      register, monkeypatch):
+    """The 2026-10-24 bug: an empty SERPER_API_KEY placeholder "succeeded"
+    with 0 observations and exit code 0. It must stop with a named error."""
+    monkeypatch.setattr("harvey.config.load_env",
+                        lambda: EnvConfig(serper_api_key=""))
+    fake = register(D.Serper())   # fresh instance — don't mutate the singleton
+
+    async def must_not_fetch(client, env, query):
+        raise AssertionError("an unconfigured provider must not be called")
+    fake.fetch = must_not_fetch
+
+    report = await D.run_discovery(state, config, "serper",
+                                   [D.DiscoveryQuery(term="roofer")])
+    assert report.stopped == "not configured"
+    assert report.queries_ran == 0
+    assert "SERPER_API_KEY" in report.errors[0]
+
+
+@pytest.mark.asyncio
+async def test_template_placeholder_key_is_treated_as_missing(state, config,
+                                                              register,
+                                                              monkeypatch):
+    monkeypatch.setattr("harvey.config.load_env",
+                        lambda: EnvConfig(serper_api_key="your_api_key_here"))
+    fake = register(D.Serper())   # fresh instance — don't mutate the singleton
+
+    async def must_not_fetch(client, env, query):
+        raise AssertionError("a placeholder key must not be sent to the API")
+    fake.fetch = must_not_fetch
+
+    report = await D.run_discovery(state, config, "serper",
+                                   [D.DiscoveryQuery(term="roofer")])
+    assert report.stopped == "not configured"
+    assert report.queries_ran == 0
+
+
+@pytest.mark.parametrize("value,missing", [
+    ("", True), ("   ", True), ("your_api_key_here", True),
+    ("PLACEHOLDER", True), ("<serper-key>", True), ("xxxxxx", True),
+    ("change-me", True), ("example_key", True),
+    ("a1b2c3d4e5f67890abcdef", False),   # a live-looking key
+    ("you@example.com", False),
+    ("a1todo9bxxxxyour_key_z", False),
+    ("placeholder-team@example.com", False),           # DataForSEO logins are emails
+])
+def test_missing_keys_flags_template_placeholders_not_real_keys(value, missing):
+    assert bool(D.PROVIDERS["serper"].missing_keys(
+        {"serper_api_key": value})) is missing
+
+
+@pytest.mark.asyncio
+async def test_queries_ran_reports_what_actually_executed(state, config,
+                                                          register):
+    fake = register(FakeProvider([[biz(domain="a.com")],
+                                  [biz(domain="b.com")]]))
+    report = await D.run_discovery(state, config, "fake", [
+        D.DiscoveryQuery(term="roofer", location="Denver"),
+        D.DiscoveryQuery(term="roofer", location="Aurora"),
+    ])
+    assert report.queries == 2
+    assert report.queries_ran == 2
+    assert report.as_dict()["queries_ran"] == 2
+
+
+@pytest.mark.asyncio
+async def test_queries_ran_is_zero_when_stopped_before_any_fetch(state, config,
+                                                                 register):
+    await state.set_setting("discovery_paused", "stopped by hand")
+    fake = register(FakeProvider([[biz(domain="a.com")]]))
+    report = await D.run_discovery(state, config, "fake",
+                                   [D.DiscoveryQuery(term="roofer")])
+    assert report.stopped == "paused"
+    assert report.queries_ran == 0
+    assert report.as_dict()["queries_ran"] == 0
+    assert fake.calls == 0
+
+
 def test_unknown_provider_fails_loudly():
     with pytest.raises(ValueError, match="unknown discovery provider"):
         import asyncio
@@ -910,6 +989,75 @@ def test_homepage_prefers_stronger_brand_over_longer_partial_match():
     assert D.site_name_from_html(html, "kettlemanlandscaping.com") == "Kettleman Landscaping"
 
 
+# --- CLI startup key guard -------------------------------------------
+#
+# `harvey discover --provider serper` with an empty or placeholder
+# SERPER_API_KEY used to exit 0 and record zero observations. cmd_discover
+# must refuse at startup - before the estimate, before any call - in both
+# collect mode, and never block estimates or the keyless default provider.
+
+from types import SimpleNamespace
+
+from harvey.cli import cmd_discover
+
+
+def _cli_args(**over):
+    base = dict(provider="serper", providers=False, estimate=False,
+                city="", depth=30, limit=100, max_spend=1.0, no_profile=True)
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def _fake_env(monkeypatch, **values):
+    from harvey import config as cfg
+    monkeypatch.setattr(
+        cfg, "load_env",
+        lambda: SimpleNamespace(model_dump=lambda: dict(values)))
+
+
+def test_missing_key_fails_loudly_at_startup(monkeypatch, capsys):
+    _fake_env(monkeypatch, serper_api_key="")
+    with pytest.raises(SystemExit) as ei:
+        cmd_discover(_cli_args())
+    assert ei.value.code == 1
+    out = capsys.readouterr().out
+    assert "provider skipped: missing key" in out
+    assert "SERPER_API_KEY" in out
+    assert "0 queries can run" in out
+    # The guard fires before the estimate is even attempted.
+    assert "Estimated cost" not in out
+
+
+def test_placeholder_key_is_treated_as_missing(monkeypatch, capsys):
+    _fake_env(monkeypatch, serper_api_key="your_key_here")
+    with pytest.raises(SystemExit) as ei:
+        cmd_discover(_cli_args())
+    assert ei.value.code == 1
+    assert "provider skipped: missing key" in capsys.readouterr().out
+
+
+def test_absent_key_is_treated_as_missing(monkeypatch, capsys):
+    _fake_env(monkeypatch)
+    with pytest.raises(SystemExit) as ei:
+        cmd_discover(_cli_args())
+    assert ei.value.code == 1
+    assert "SERPER_API_KEY" in capsys.readouterr().out
+
+
+def test_keyless_default_provider_is_never_blocked(monkeypatch, capsys):
+    # osm has no env_keys, so the startup guard must pass through. Reaching
+    # load_config (patched to raise) proves the guard let the command by.
+    _fake_env(monkeypatch)
+    from harvey import config as cfg
+
+    def _boom():
+        raise RuntimeError("reached-load-config")
+
+    monkeypatch.setattr(cfg, "load_config", _boom)
+    with pytest.raises(RuntimeError, match="reached-load-config"):
+        cmd_discover(_cli_args(provider="osm"))
+
+
 def test_tinyfish_measures_no_rank_signal():
     """A TinyFish run must not mark businesses Serper ranked as 'gone'."""
     assert D.TinyFish().rank_codes == ()
@@ -1081,3 +1229,77 @@ async def test_an_empty_list_changes_discovery_not_at_all(state, config, registe
     assert report.excluded == 0
     assert report.new_companies == 2
     assert await state.company_exists("rival.example")
+
+
+@pytest.mark.parametrize("domain", ["jobs.example.com", "careers.example.org", "example.test"])
+def test_new_junk_filters_keep_employer_sites(domain):
+    assert not D.is_junk(domain)
+
+
+@pytest.mark.parametrize("domain", ["naukri.com", "www.indiamart.com", "thingiverse.com"])
+def test_new_junk_filters_reject_aggregators(domain):
+    from harvey.agents.scout import Scout
+    assert D.is_junk(domain)
+    assert Scout._is_noise_domain(None, domain)
+
+
+@pytest.mark.asyncio
+async def test_serper_caps_request_and_estimate():
+    import json
+    requests = []
+    def respond(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json={"organic": []})
+    query = D.DiscoveryQuery(term="roofer", depth=100)
+    provider = D.Serper()
+    async with _client(respond) as client:
+        await provider.fetch(client, {"serper_api_key": "fixture"}, query)
+    assert requests[0]["num"] == 10
+    assert provider.estimate([query]) == pytest.approx(0.001)
+
+
+@pytest.mark.asyncio
+async def test_scout_serper_caps_request(monkeypatch):
+    from harvey.agents.scout import Scout
+    from types import SimpleNamespace
+    requests = []
+    async def fetch(url, **kwargs):
+        requests.append(kwargs["json_body"])
+        return httpx.Response(200, json={"organic": []})
+    await Scout._search_serper(SimpleNamespace(_fetch=fetch), "roofer", "fixture")
+    assert requests == [{"q": "roofer", "num": 10}]
+
+
+@pytest.mark.asyncio
+async def test_failed_attempt_is_not_a_successful_query(state, config, register):
+    fake = register(FakeProvider([]))
+    async def fail(*args):
+        raise RuntimeError("fixture failure")
+    fake.fetch = fail
+    report = await D.run_discovery(state, config, "fake", [D.DiscoveryQuery(term="roofer")])
+    assert report.queries_ran == 1
+    assert report.queries_succeeded == 0
+    assert report.errors
+
+
+@pytest.mark.parametrize("attempted,succeeded", [(0, 0), (2, 0), (2, 1), (1, 1)])
+def test_cli_exit_tracks_successful_queries(monkeypatch, config, attempted, succeeded):
+    from harvey import config as cfg, pipeline
+    _fake_env(monkeypatch, serper_api_key="fixture")
+    monkeypatch.setattr(cfg, "load_config", lambda: config)
+    async def init_db(self):
+        pass
+    async def estimate(*args, **kwargs):
+        return D.DiscoveryReport()
+    async def prospect(*args, **kwargs):
+        return SimpleNamespace(discover={"queries": 2, "queries_ran": attempted,
+                                        "queries_succeeded": succeeded}, errors=[])
+    monkeypatch.setattr(StateManager, "init_db", init_db)
+    monkeypatch.setattr(D, "run_discovery", estimate)
+    monkeypatch.setattr(pipeline, "run_prospecting", prospect)
+    if succeeded:
+        cmd_discover(_cli_args())
+    else:
+        with pytest.raises(SystemExit) as exc:
+            cmd_discover(_cli_args())
+        assert exc.value.code == 1

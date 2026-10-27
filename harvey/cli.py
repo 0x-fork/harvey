@@ -555,14 +555,13 @@ def cmd_profile(args):
 def cmd_discover(args):
     """Find businesses. The only stage that spends money, so it estimates first."""
     from harvey.state import StateManager
-    from harvey.config import load_config
+    from harvey.config import load_config, load_env
     from harvey.collectors.discover import (
         PROVIDERS, build_queries, preset_problem, provider_menu, run_discovery,
     )
 
     async def _discover():
         if args.providers:
-            from harvey.config import load_env
             print("\n  Discovery providers")
             print("  " + "=" * 68)
             for m in provider_menu(load_env().model_dump()):
@@ -582,6 +581,24 @@ def cmd_discover(args):
             print(f"\n  Unknown provider {args.provider!r}. "
                   f"See: harvey discover --providers\n")
             return
+
+        # Fail before collection; estimates need no credentials.
+        # An unconfigured provider used to end in one quiet "stopped
+        # early" line and exit code 0: a silent no-op that reads as
+        # success.
+        provider = PROVIDERS[args.provider]
+        missing = provider.missing_keys(load_env().model_dump())
+        if missing and not args.estimate:
+            names = ", ".join(k.upper() for k in missing)
+            print("\n  " + "!" * 68)
+            print(f"  ERROR: provider skipped: missing key - "
+                  f"{provider.label} is not configured, 0 queries can run.")
+            print(f"  Missing or empty: {names}")
+            print("  Put a real value in .env (template placeholders don't"
+                  " count), then retry.")
+            print("  All providers and their keys: harvey discover --providers")
+            print("  " + "!" * 68 + "\n")
+            raise SystemExit(1)
 
         config = load_config()
         state = StateManager()
@@ -620,8 +637,9 @@ def cmd_discover(args):
             max_spend=args.max_spend, profile=not args.no_profile,
         )
         r = result.discover or {}
+        ran = r.get("queries_ran", 0)
         print(f"  DISCOVER — {r.get('found', 0)} results across "
-              f"{r.get('queries', 0)} queries")
+              f"{ran} of {r.get('queries', 0)} queries")
         print(f"    {r.get('new_companies', 0)} new companies, "
               f"{r.get('known_companies', 0)} already known")
         print(f"    {r.get('junk', 0)} filtered out as directories/aggregators")
@@ -642,6 +660,18 @@ def cmd_discover(args):
 
         for err in result.errors[:5]:
             print(f"    ! {err}")
+
+        # Empty successful searches are valid; no successful requests is not.
+        # Partial success remains usable and exits zero.
+        if r.get("queries_succeeded", 0) == 0:
+            print("\n  " + "=" * 68)
+            print(f"  DISCOVERY COMPLETED NO QUERIES ({r.get('stopped') or 'no queries succeeded'})"
+                  " — exiting non-zero")
+            for err in (r.get("errors") or [])[:3]:
+                print(f"    - {err}")
+            print("  " + "=" * 68 + "\n")
+            raise SystemExit(1)
+
         print("\n  Next: harvey dashboard → Signals → cohort builder\n")
 
     asyncio.run(_discover())
