@@ -10,17 +10,22 @@ id is logged with the send so the decision can be shown later.
 One check per address: a definite verdict is cached in the settings table for
 CACHE_DAYS, together with a fingerprint of the facts it was decided on (sender
 country, address source, product description and, if set, the recipient's or
-the prospects' country). A cached verdict is reused only while those facts are
-unchanged, so a three-step sequence costs one check but a config change forces
-a fresh one. Replies are never checked. Precleared receives the recipient's
-address, your sender country, the address source you configure, your product
-description (used to judge relevance under CASL and French rules) and the
-recipient's country when Harvey is sure of it from the company's location
-(``send_window.recipient_country``), which Precleared takes as settled.
-Otherwise it receives, if there is one, your prospects' country (the
-configured ``prospect_country``, or the one country every ``icp.geography``
-entry is in), which it uses only when it can't work out the recipient's
-country from the address, company records or the company's website.
+the prospects' country and the company's and person's names). A cached verdict
+is reused only while those facts are unchanged, so a three-step sequence costs
+one check but a config change forces a fresh one. Replies are never checked.
+Precleared receives the recipient's address, your sender country, the address
+source you configure, your product description (used to judge relevance under
+CASL and French rules) and the recipient's country when Harvey is sure of it
+from the company's location (``send_window.recipient_country``), which
+Precleared takes as settled. Otherwise it receives, if there is one, your
+prospects' country (the configured ``prospect_country``, or the one country
+every ``icp.geography`` entry is in), which it uses only when it can't work out
+the recipient's country from the address, company records or the company's
+website. It also receives the company's name and the person's full name when
+Harvey has them (a company inbox has no person, so no name). For a UK
+recipient Precleared uses them to find the company on the Companies House
+register when the domain alone doesn't, and it doesn't store the person's
+name.
 
 A response Precleared can't vouch for (network trouble, daily allowance used
 up, a bad key, or a malformed body) holds cold email for a later cycle instead
@@ -80,6 +85,10 @@ VERDICTS = {"ok_to_email", "consent_needed", "blocked", "unknown"}
 DEFINITE_VERDICTS = {"ok_to_email", "consent_needed", "blocked"}
 ADDRESS_SOURCES = ("published", "bought", "scraped", "given", "unknown")
 SENDER_COUNTRIES = ("GB", "US")
+# Precleared's limits for the company and person names sent with a check.
+# A longer value would be refused, so names are cut to fit.
+MAX_COMPANY_NAME = 160
+MAX_RECIPIENT_NAME = 120
 # Where to buy more checks when a 402 answer carries no usable checkout link.
 BUY_URL = "https://precleared.dev/buy"
 GET_KEY_URL = "https://precleared.dev/get-key"
@@ -179,12 +188,13 @@ class PreclearedClient:
                 return "***REDACTED***"
         return text or ""
 
-    def _fingerprint(self, country: str = "") -> str:
+    def _fingerprint(self, country: str = "", company: str = "", name: str = "") -> str:
         """Hash of the facts Precleared decides on, apart from the address.
 
         These are exactly the fields _check sends with the address, so a
         cached verdict is only reused for the same question. ``country`` is
-        the recipient's country when Harvey is sure of it, as for _check.
+        the recipient's country when Harvey is sure of it, and ``company``
+        and ``name`` the company's and person's names, as for _check.
         """
         facts = {
             "v": CACHE_VERSION,
@@ -205,17 +215,27 @@ class PreclearedClient:
             # The ICP's country stands in for prospect_country; only while it
             # does, for the same reason.
             facts["icp_country"] = self.default_country
+        if company:
+            # Only when Harvey has them, so a verdict cached without the names
+            # still matches while an address has none (and see _cached once
+            # it has).
+            facts["company_name"] = company
+        if name:
+            facts["recipient_name"] = name
         return hashlib.sha256(json.dumps(facts, sort_keys=True).encode()).hexdigest()
 
-    async def clear(self, to_email: str, state, country: str = "") -> Clearance:
+    async def clear(self, to_email: str, state, country: str = "",
+                    company: str = "", name: str = "") -> Clearance:
         """Return the verdict for one address, from the cache when possible."""
-        cached = await self.cached(to_email, state, country)
-        return cached if cached is not None else await self.check(to_email, state, country)
+        cached = await self.cached(to_email, state, country, company=company, name=name)
+        return cached if cached is not None else await self.check(to_email, state, country, company=company, name=name)
 
-    async def cached(self, to_email: str, state, country: str = "") -> Clearance | None:
+    async def cached(self, to_email: str, state, country: str = "",
+                    company: str = "", name: str = "") -> Clearance | None:
         """The stored verdict for this address and these facts, or None."""
         email = (to_email or "").strip().lower()
-        return self._cached(await state.get_setting(SETTINGS_PREFIX + email), _country(country))
+        return self._cached(await state.get_setting(SETTINGS_PREFIX + email), _country(country),
+                            _name(company, MAX_COMPANY_NAME), _name(name, MAX_RECIPIENT_NAME))
 
     def stored_verdicts(self) -> tuple[str, str, str]:
         """What a stored verdict needs to still be used, for counting in SQL:
@@ -224,11 +244,14 @@ class PreclearedClient:
         oldest = (_utcnow() - timedelta(days=CACHE_DAYS)).isoformat()
         return SETTINGS_PREFIX, self._fingerprint(), oldest
 
-    async def check(self, to_email: str, state, country: str = "") -> Clearance:
+    async def check(self, to_email: str, state, country: str = "",
+                    company: str = "", name: str = "") -> Clearance:
         """Ask Precleared now, and store a definite verdict for next time."""
         email = (to_email or "").strip().lower()
+        company = _name(company, MAX_COMPANY_NAME)
+        name = _name(name, MAX_RECIPIENT_NAME)
         try:
-            result = await self._check(email, _country(country))
+            result = await self._check(email, _country(country), company, name)
         except Exception as e:
             # A failure nobody planned for holds cold email and pauses checks
             # (it may well happen for every address); it never stops the cycle.
@@ -245,33 +268,51 @@ class PreclearedClient:
                 "receipt_id": result.receipt_id,
                 "country": result.country,
                 "checked_at": _utcnow().isoformat(),
-                "inputs": self._fingerprint(_country(country)),
+                "inputs": self._fingerprint(_country(country), company, name),
             }))
         return result
 
-    async def known_country(self, to_email: str, state, country: str = "") -> str:
+    async def known_country(self, to_email: str, state, country: str = "",
+                            company: str = "", name: str = "") -> str:
         """The recipient's country from a cached verdict, or "". Never asks
-        Precleared. ``country`` is what clear() was given for this address,
-        since the verdict is keyed on it."""
+        Precleared. ``country``, ``company`` and ``name`` are what clear()
+        was given for this address, since the verdict is keyed on them."""
         email = (to_email or "").strip().lower()
-        cached = self._cached(await state.get_setting(SETTINGS_PREFIX + email), _country(country))
+        cached = self._cached(await state.get_setting(SETTINGS_PREFIX + email), _country(country),
+                              _name(company, MAX_COMPANY_NAME), _name(name, MAX_RECIPIENT_NAME))
         return cached.country if cached is not None else ""
 
-    def _cached(self, raw: str, country: str) -> Clearance | None:
+    def _cached(self, raw: str, country: str, company: str = "", name: str = "") -> Clearance | None:
         """The cached verdict for the question _check would ask, or None.
+
+        A verdict decided without the names is kept when it already allows
+        the email, since the names only help Precleared find the company;
+        any other verdict is asked for again once, with them.
+        """
+        cached = self._same_question(raw, country, company, name)
+        if cached is None and (company or name):
+            earlier = self._same_question(raw, country)
+            if earlier is not None and earlier.verdict == "ok_to_email":
+                return earlier
+        return cached
+
+    def _same_question(self, raw: str, country: str, company: str = "",
+                       name: str = "") -> Clearance | None:
+        """The verdict cached for exactly these facts, or None.
 
         A verdict decided without the country, for which Precleared found
         that same country itself, answers the same question, so it is kept
         rather than asked for again.
         """
-        cached = _from_cache(raw, self._fingerprint(country))
+        cached = _from_cache(raw, self._fingerprint(country, company, name))
         if cached is None and country:
-            earlier = _from_cache(raw, self._fingerprint())
+            earlier = _from_cache(raw, self._fingerprint("", company, name))
             if earlier is not None and earlier.country == country:
                 return earlier
         return cached
 
-    async def _check(self, email: str, country: str = "") -> Clearance:
+    async def _check(self, email: str, country: str = "", company: str = "",
+                     name: str = "") -> Clearance:
         payload = {
             "recipient_email": email,
             "sender_country": self.sender_country,
@@ -288,6 +329,16 @@ class PreclearedClient:
             # Precleared uses this only when the address, company records and
             # the company's website don't show the recipient's country.
             payload["default_recipient_country"] = self.default_country
+        if company:
+            # For a UK recipient, searched on the Companies House register
+            # when the domain alone doesn't find the company. A company found
+            # this way only counts when other evidence ties it to the
+            # recipient, such as one of its officers being the person below.
+            payload["company_name"] = company
+        if name:
+            # Matched against the company's current officers. Precleared
+            # doesn't store it.
+            payload["recipient_name"] = name
         headers = {
             "Content-Type": "application/json",
             "User-Agent": "harvey (+https://github.com/ethanplusai/harvey)",
@@ -395,6 +446,14 @@ class PreclearedClient:
             receipt_id=receipt_id,
             country=country,
         )
+
+
+def _name(value, limit: int) -> str:
+    """A company or person name for the check, with runs of whitespace made
+    single spaces and cut to Precleared's limit, or "" for anything else."""
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split())[:limit].strip()
 
 
 def _country(value) -> str:

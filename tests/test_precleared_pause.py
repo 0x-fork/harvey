@@ -60,9 +60,10 @@ async def people(state, emails):
         await queue(state, pid, to=email)
 
 
-async def store(state, email, body, country=""):
+async def store(state, email, body, country="", company="", name=""):
     """Give an address a stored verdict, as an earlier cycle would have."""
-    await PreclearedClient("GB", transport=mock_status(200, body)).clear(email, state, country)
+    await PreclearedClient("GB", transport=mock_status(200, body)).clear(
+        email, state, country, company=company, name=name)
 
 
 def recording(calls, answer):
@@ -113,7 +114,7 @@ async def test_people_already_cleared_still_get_email_after_the_allowance_runs_o
 @pytest.mark.asyncio
 async def test_a_stored_stopping_verdict_still_stops_the_email_after_a_pause(state):
     await people(state, [JANE, SAM])
-    await store(state, SAM, CONSENT_BODY)
+    await store(state, SAM, CONSENT_BODY, company="Acme", name="Jane Doe")
     provider = FakeProvider()
     sender = with_check(make_sender(state, provider), mock_precleared([], status=429))
 
@@ -167,6 +168,38 @@ async def test_waiting_count_validates_country_even_for_items_outside_page(state
     async def first_page_only(*args, **kwargs):
         rows = await real_get(*args, **kwargs)
         return [row for row in rows if row["to_email"] == JANE]
+
+    monkeypatch.setattr(state, "get_outbox", first_page_only)
+    await sender._drain_due()
+    assert (await stored_hold(state))["waiting"] == waiting
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cached_name,sent,waiting", [("Jane Doe", True, 1), ("Former Person", False, 2)])
+async def test_paused_checks_validate_recipient_names(state, cached_name, sent, waiting):
+    await people(state, [JANE, SAM])
+    await store(state, SAM, OK_BODY, company="Acme", name=cached_name)
+    calls = []
+    provider = FakeProvider()
+    sender = with_check(make_sender(state, provider), mock_precleared(calls, status=429))
+
+    await sender._drain_due()
+
+    assert len(calls) == 1
+    assert [m["to"] for m in provider.sent] == ([SAM] if sent else [])
+    assert (await stored_hold(state))["waiting"] == waiting
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cached_name,waiting", [("Jane Doe", 1), ("Former Person", 2)])
+async def test_waiting_count_validates_names_outside_page(state, monkeypatch, cached_name, waiting):
+    await people(state, [JANE, SAM])
+    await store(state, SAM, OK_BODY, company="Acme", name=cached_name)
+    sender = with_check(make_sender(state, FakeProvider()), mock_status(429, {}))
+    real_get = state.get_outbox
+
+    async def first_page_only(*args, **kwargs):
+        return [row for row in await real_get(*args, **kwargs) if row["to_email"] == JANE]
 
     monkeypatch.setattr(state, "get_outbox", first_page_only)
     await sender._drain_due()
@@ -679,7 +712,8 @@ async def test_quiet_hours_still_wake_for_someone_cleared_after_a_hold(state, mo
     assert not await sender.cold_due_in_window()  # the new address waits
 
     known = await seed_at(state, "Tokyo, Japan", "kenji@osaka.example")
-    await store(state, "kenji@osaka.example", verdict, country="JP")
+    await store(state, "kenji@osaka.example", verdict, country="JP",
+                company="osaka.example", name="Jane Doe")
     await approved(state, known, "kenji@osaka.example", step=2)
 
     assert await sender.cold_due_in_window() is wakes
@@ -698,7 +732,7 @@ async def test_quiet_hours_find_cleared_follow_up_beyond_first_page(state, monke
         await approved(state, pid, email)
     known = await seed_at(state, "Tokyo, Japan", SAM)
     await approved(state, known, SAM, step=2)
-    await store(state, SAM, OK_BODY, country="JP")
+    await store(state, SAM, OK_BODY, country="JP", company="beta.example", name="Jane Doe")
     sender = window_sender(state, FakeProvider(), monkeypatch)
     with_check(sender, httpx.MockTransport(lambda request: httpx.Response(503)))
     sender.compliance_held = True
