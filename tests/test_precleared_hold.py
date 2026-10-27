@@ -330,7 +330,8 @@ async def test_no_piece_of_the_key_reaches_the_hold(state):
     # not leave its first characters in the reason shown on Today.
     key = "pc_live_Zq8vN3kW1xR7tB5yM2"
     body = "x" * 190 + key
-    transport = httpx.MockTransport(lambda request: httpx.Response(500, text=body))
+    # 503: a busy server holds cold email whatever the addresses are.
+    transport = httpx.MockTransport(lambda request: httpx.Response(503, text=body))
     await two_cold_and_a_reply(state)
     sender = with_check(make_sender(state, FakeProvider()), transport, api_key=key)
 
