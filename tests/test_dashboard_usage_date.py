@@ -2,6 +2,7 @@
 
 import asyncio
 import sqlite3
+from contextlib import closing
 from datetime import date, timedelta
 
 import pytest
@@ -14,7 +15,7 @@ from tests.test_dashboard_signals import client  # noqa: F401
 @pytest.mark.parametrize("offset", [-1, 1])
 def test_stats_use_local_day_when_sqlite_utc_day_differs(client, monkeypatch, offset):
     asyncio.run(StateManager(str(client.db_path)).init_db())
-    with sqlite3.connect(client.db_path) as db:
+    with closing(sqlite3.connect(client.db_path)) as db, db:
         utc_day = date.fromisoformat(db.execute("SELECT date('now')").fetchone()[0])
         local_day = utc_day + timedelta(days=offset)
         db.executemany(
