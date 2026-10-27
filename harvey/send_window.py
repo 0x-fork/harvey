@@ -34,6 +34,19 @@ country, the cached coordinates or ``prospect_country``. With none of
 those, a US state code reads as the state and any other as the country, and
 that guess isn't stored. Writing the country out ("Berlin, Germany") always
 works.
+
+The same reading gives Precleared the recipient's country, when the check
+is on (``recipient_country``). Only a country Harvey is sure of goes: one
+named in the location, the country of a state or province named there, a
+code that is a region and a country too once nearby cached coordinates settle
+it. A stored time zone alone has no country provenance and does not count.
+A code read by convention alone, a state reading the coordinates
+contradict, and coordinates by themselves (the nearest reference city can
+be over a border) send nothing, because Precleared takes the country it is
+given as settled, and a wrong one is worse than none. Without one,
+``prospect_country`` or the one country every ``icp.geography`` entry is in
+goes as a default Precleared uses only when its own lookups show nothing
+(``icp_country``).
 """
 
 import math
@@ -262,6 +275,17 @@ def country_code(value) -> str:
     return code if code in pytz.country_timezones else ""
 
 
+@lru_cache(maxsize=1)
+def _zone_countries() -> dict[str, str]:
+    """Each zone's country, from the tz database: no zone is listed under two."""
+    return {zone: code for code, zones in pytz.country_timezones.items() for zone in zones}
+
+
+def zone_country(zone: str) -> str:
+    """The country a zone belongs to ("Europe/London" -> "GB"), or ""."""
+    return _zone_countries().get(str(zone or ""), "")
+
+
 def _one_offset(zones: list[str]) -> bool:
     """True when every zone keeps the same clock all year (Berlin and
     Busingen), so the country effectively has one zone."""
@@ -393,32 +417,70 @@ def zone_for(location: str = "", country: str = "", point: str = "") -> str:
     return _resolve(location, country, point)[0]
 
 
+def _country(parts: list[str], coords=None, hint: str = "") -> tuple[str, bool]:
+    """The country the location's text puts the place in, or "", plus
+    whether that was a guess: a code that is a region and a country, read
+    by the US-first convention because nothing else said which."""
+    text_country = _country_in(parts)
+    code = "" if text_country else _ambiguous_code(parts)
+    if not code:
+        return text_country, False
+    # "IN": Indiana or India? A country from elsewhere (Precleared's is
+    # stronger evidence than a code) settles it, even when it is neither,
+    # then the coordinates; otherwise a US state is read as the state
+    # and a province or Australian state code as the country.
+    home = REGION_COUNTRY[code]
+    if hint:
+        return hint, False
+    if coords:
+        as_region = _region(parts, home, "")
+        as_country = _country_zone(code, coords)
+        return (home if as_region and _ref_km(coords, as_region)
+                <= _ref_km(coords, as_country) else code), False
+    return (home if home == "US" else code), True
+
+
+def country_for(location: str = "", point: str = "") -> tuple[str, bool]:
+    """The country a location puts a recipient in, and whether it is certain.
+
+    Certain: a country named in the text, a US state, Canadian province or
+    Australian state (by name or an unambiguous code), or a code that is a
+    region and a country too settled by the cached coordinates. Not
+    certain: that code read by convention alone (the reading comes back,
+    marked so), a state reading the coordinates contradict, and the
+    coordinates by themselves, which can put a place over a border. ""
+    when nothing names one.
+    """
+    parts = _parts(location)
+    coords = _point(point)
+    country, guessed = _country(parts, coords)
+    if guessed:
+        return country, False
+    ambiguous = "" if _country_in(parts) else _ambiguous_code(parts)
+    if ambiguous and coords:
+        region_zone = _region(parts, REGION_COUNTRY[ambiguous], "")
+        country_zone = _country_zone(ambiguous, coords)
+        if min(_ref_km(coords, region_zone), _ref_km(coords, country_zone)) > MAX_REGION_KM:
+            return "", False
+    zone = _region(parts, country, "")
+    if zone and coords and _ref_km(coords, zone) > MAX_REGION_KM:
+        # The state was a misreading ("Perth, WA" in Australia): see _resolve.
+        zone = ""
+        if country == "US":
+            country = ""
+    if zone:
+        country = country or zone_country(zone)
+    return country, bool(country)
+
+
 def _resolve(location: str = "", country: str = "", point: str = "") -> tuple[str, bool]:
     """zone_for, plus whether the answer was a guess: a code that is a
     region and a country, read by the US-first convention because nothing
     else said which."""
     parts = _parts(location)
     coords = _point(point)
-    text_country = _country_in(parts)
     hint = country_code(country)
-    guessed = False
-    code = "" if text_country else _ambiguous_code(parts)
-    if code:
-        # "IN": Indiana or India? A country from elsewhere (Precleared's is
-        # stronger evidence than a code) settles it, even when it is neither,
-        # then the coordinates; otherwise a US state is read as the state
-        # and a province or Australian state code as the country.
-        home = REGION_COUNTRY[code]
-        if hint:
-            text_country = hint
-        elif coords:
-            as_region = _region(parts, home, "")
-            as_country = _country_zone(code, coords)
-            text_country = (home if as_region and _ref_km(coords, as_region)
-                            <= _ref_km(coords, as_country) else code)
-        else:
-            text_country = home if home == "US" else code
-            guessed = True
+    text_country, guessed = _country(parts, coords, hint)
     zone = _region(parts, text_country, hint)
     if zone and coords and _km(coords, _zone_points().get(zone, coords)) > MAX_REGION_KM:
         # The coordinates put it on another continent ("Perth, WA" in
@@ -501,6 +563,51 @@ def _prospect_country(config) -> str:
     return country_code(getattr(precleared, "prospect_country", ""))
 
 
+def icp_country(config) -> str:
+    """The one country every ``icp.geography`` entry is certainly in, or "".
+
+    Precleared's default when ``prospect_country`` is unset: the ICP is
+    where discovery looked. A default only, so Precleared's own finding
+    still wins."""
+    icp = getattr(config, "icp", None)
+    coords = getattr(icp, "geo_coordinates", None) or {}
+    found = set()
+    for place in getattr(icp, "geography", None) or []:
+        country, certain = country_for(place, coords.get(place, ""))
+        if not certain:
+            return ""
+        found.add(country)
+    return found.pop() if len(found) == 1 else ""
+
+
+async def _place(state, prospect) -> tuple[str, str]:
+    """The company's location and the "lat,lon" discovery cached for it."""
+    location = ""
+    if getattr(prospect, "company_id", ""):
+        company = await state.get_company(prospect.company_id)
+        location = (getattr(company, "location", "") or "") if company else ""
+    point = ""
+    if location.strip():
+        cached = await state.get_setting("geo:" + location.strip().lower())
+        point = "" if not cached or cached == "-" else cached
+    return location, point
+
+
+async def recipient_country(state, prospect) -> str:
+    """The recipient's country when Harvey is sure of it, for Precleared's
+    ``recipient_country``; "" otherwise, since a guess sent as fact would
+    override Precleared's own evidence. See ``country_for``."""
+    if prospect is None:
+        return ""
+    location, point = await _place(state, prospect)
+    country, certain = country_for(location, point)
+    if certain:
+        return country
+    # A stored zone may come from approximate coordinates or stale location
+    # data. Without provenance, it must not override Precleared's evidence.
+    return ""
+
+
 async def recipient_zone(state, prospect, config, country: str = "") -> str:
     """This recipient's zone, worked out once and stored on the prospect.
 
@@ -510,14 +617,7 @@ async def recipient_zone(state, prospect, config, country: str = "") -> str:
         return ""
     if getattr(prospect, "timezone", ""):
         return prospect.timezone
-    location = ""
-    if getattr(prospect, "company_id", ""):
-        company = await state.get_company(prospect.company_id)
-        location = (getattr(company, "location", "") or "") if company else ""
-    point = ""
-    if location.strip():
-        cached = await state.get_setting("geo:" + location.strip().lower())
-        point = "" if not cached or cached == "-" else cached
+    location, point = await _place(state, prospect)
     zone, guessed = _resolve(location, country_code(country), point)
     if zone and not guessed:
         prospect.timezone = zone

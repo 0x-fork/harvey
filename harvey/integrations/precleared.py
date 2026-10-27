@@ -9,18 +9,37 @@ id is logged with the send so the decision can be shown later.
 
 One check per address: a definite verdict is cached in the settings table for
 CACHE_DAYS, together with a fingerprint of the facts it was decided on (sender
-country, address source, product description and, if set, prospect country). A
-cached verdict is reused only while those facts are unchanged, so a three-step
-sequence costs one check but a config change forces a fresh one. Replies are
-never checked. Precleared receives the recipient's address, your sender
-country, the address source you configure, your product description (used to
-judge relevance under CASL and French rules) and, if you set one, your
-prospects' country, which it uses only when it can't work out the recipient's
-country from the address, company records or the company's website.
+country, address source, product description and, if set, the recipient's or
+the prospects' country and the company's and person's names). A cached verdict
+is reused only while those facts are unchanged, so a three-step sequence costs
+one check but a config change forces a fresh one. Replies are never checked.
+Precleared receives the recipient's address, your sender country, the address
+source you configure, your product description (used to judge relevance under
+CASL and French rules) and the recipient's country when Harvey is sure of it
+from the company's location (``send_window.recipient_country``), which
+Precleared takes as settled. Otherwise it receives, if there is one, your
+prospects' country (the configured ``prospect_country``, or the one country
+every ``icp.geography`` entry is in), which it uses only when it can't work out
+the recipient's country from the address, company records or the company's
+website. It also receives the company's name and the person's full name when
+Harvey has them (a company inbox has no person, so no name). For a UK
+recipient Precleared uses them to find the company on the Companies House
+register when the domain alone doesn't, and it doesn't store the person's
+name.
 
 A response Precleared can't vouch for (network trouble, daily allowance used
 up, a bad key, or a malformed body) holds cold email for a later cycle instead
-of failing it.
+of failing it. When the failure is about Precleared rather than the address
+(no connection or no answer in time, a busy server, the allowance or the rate
+limit, the key, an answer Harvey can't read), no more fresh checks are made
+that cycle, but a stored verdict is still used, so email to people already
+cleared carries on. Any other failure moves just that address's email back
+(see the sender's ADDRESS_RETRY_AFTER) and the rest of the cycle carries on,
+unless addresses at different domains fail with no answer in between, which
+pauses checks too. When the check timed out or Precleared's answer couldn't be
+read, that email is moved back as well, in case the address is the cause (a
+slow lookup, an odd answer), so one address can't keep every other one
+waiting.
 
 Without an API key Precleared allows 10 checks a day; a free key
 (https://precleared.dev/get-key, PRECLEARED_API_KEY) allows 25 a day.
@@ -32,6 +51,7 @@ A hold is also recorded under STATUS_KEY, so the dashboard's Today page and
 key, a pack, or nothing but time). The next fresh answer clears it.
 """
 
+import asyncio
 import hashlib
 import ipaddress
 import json
@@ -45,6 +65,7 @@ from urllib.parse import unquote, urlsplit
 import httpx
 
 from harvey.config import normalize_prospect_country
+from harvey.send_window import icp_country
 
 logger = logging.getLogger("harvey.precleared")
 
@@ -52,6 +73,9 @@ API_URL = "https://precleared.dev/api/v1/check"
 # Precleared answers within 25 seconds (with verdict "unknown" if a register
 # lookup is slow), so the read timeout sits just above that.
 TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
+# httpx's read timeout applies to each chunk, so an answer that trickles in
+# could outlast it; this bounds the whole request.
+TOTAL_TIMEOUT = 40.0
 CACHE_DAYS = 30
 # Bump when the facts in _fingerprint change, so older cache entries are
 # ignored rather than reused.
@@ -61,6 +85,10 @@ VERDICTS = {"ok_to_email", "consent_needed", "blocked", "unknown"}
 DEFINITE_VERDICTS = {"ok_to_email", "consent_needed", "blocked"}
 ADDRESS_SOURCES = ("published", "bought", "scraped", "given", "unknown")
 SENDER_COUNTRIES = ("GB", "US")
+# Precleared's limits for the company and person names sent with a check.
+# A longer value would be refused, so names are cut to fit.
+MAX_COMPANY_NAME = 160
+MAX_RECIPIENT_NAME = 120
 # Where to buy more checks when a 402 answer carries no usable checkout link.
 BUY_URL = "https://precleared.dev/buy"
 GET_KEY_URL = "https://precleared.dev/get-key"
@@ -72,10 +100,13 @@ STATUS_KEY = "precleared_status"
 # Precleared's allowance resets daily, so a hold not seen for this long is
 # stale: Harvey stopped running, or the check was switched off.
 STATUS_MAX_AGE = timedelta(hours=26)
-HOLD_KINDS = ("keyless_limit", "out_of_checks", "key_rejected", "unavailable")
+HOLD_KINDS = ("keyless_limit", "out_of_checks", "key_rejected", "rate_limited", "unavailable")
 # A 402's checkout link is only followed to Precleared itself or its card
 # checkout; any other host falls back to BUY_URL.
 BUY_HOSTS = ("precleared.dev", "checkout.stripe.com")
+# Answers that mean Precleared's server is busy or down, not that it can't
+# check one address.
+SERVER_BUSY = (502, 503, 504)
 
 
 @dataclass
@@ -84,12 +115,18 @@ class Clearance:
 
     ``allowed``: send it. ``held``: the check could not be made right now
     (network trouble, daily allowance used up, bad key, malformed response),
-    so the email stays queued and is tried again on a later cycle. Otherwise
-    the email is blocked and ``reason`` says why.
+    so the email stays queued and is tried again on a later cycle.
+    ``pause_checks``: that failure is about Precleared rather than this
+    address, so no more fresh checks are made this cycle. ``retry_address``:
+    the check timed out or its answer couldn't be read, which this address
+    may have caused, so its email is moved back too. Otherwise the email is
+    blocked and ``reason`` says why.
     """
 
     allowed: bool
     held: bool = False
+    pause_checks: bool = False
+    retry_address: bool = False
     verdict: str = ""
     reason: str = ""
     receipt_id: str = ""
@@ -112,6 +149,7 @@ class PreclearedClient:
         address_source: str = "unknown",
         pitch: str = "",
         prospect_country: str = "",
+        default_country: str = "",
         transport: httpx.AsyncBaseTransport | None = None,
     ):
         self.sender_country = sender_country
@@ -119,6 +157,10 @@ class PreclearedClient:
         self.address_source = address_source
         self.pitch = (pitch or "").strip()[:200]
         self.prospect_country = normalize_prospect_country(prospect_country)
+        # The country sent as the default when nothing names the recipient's:
+        # prospect_country, else default_country (from_config passes the one
+        # country the ICP geography is in).
+        self.default_country = self.prospect_country or normalize_prospect_country(default_country)
         self._transport = transport  # tests inject httpx.MockTransport
 
     @classmethod
@@ -135,6 +177,7 @@ class PreclearedClient:
             address_source=settings.address_source,
             pitch=getattr(product, "description", ""),
             prospect_country=getattr(settings, "prospect_country", ""),
+            default_country=icp_country(config),
         )
 
     def _redact(self, text: str) -> str:
@@ -145,11 +188,13 @@ class PreclearedClient:
                 return "***REDACTED***"
         return text or ""
 
-    def _fingerprint(self) -> str:
+    def _fingerprint(self, country: str = "", company: str = "", name: str = "") -> str:
         """Hash of the facts Precleared decides on, apart from the address.
 
         These are exactly the fields _check sends with the address, so a
-        cached verdict is only reused for the same question.
+        cached verdict is only reused for the same question. ``country`` is
+        the recipient's country when Harvey is sure of it, and ``company``
+        and ``name`` the company's and person's names, as for _check.
         """
         facts = {
             "v": CACHE_VERSION,
@@ -158,44 +203,116 @@ class PreclearedClient:
             "pitch": self.pitch,
             "existing_customer": False,
         }
-        if self.prospect_country:
+        if country:
+            # Only when set, so a verdict cached without one still matches
+            # while the address has none (and see _cached once it has).
+            facts["recipient_country"] = country
+        elif self.prospect_country:
             # Only when set, so cached verdicts from before the setting existed
             # still match.
             facts["prospect_country"] = self.prospect_country
+        elif self.default_country:
+            # The ICP's country stands in for prospect_country; only while it
+            # does, for the same reason.
+            facts["icp_country"] = self.default_country
+        if company:
+            # Only when Harvey has them, so a verdict cached without the names
+            # still matches while an address has none (and see _cached once
+            # it has).
+            facts["company_name"] = company
+        if name:
+            facts["recipient_name"] = name
         return hashlib.sha256(json.dumps(facts, sort_keys=True).encode()).hexdigest()
 
-    async def clear(self, to_email: str, state) -> Clearance:
+    async def clear(self, to_email: str, state, country: str = "",
+                    company: str = "", name: str = "") -> Clearance:
         """Return the verdict for one address, from the cache when possible."""
-        email = (to_email or "").strip().lower()
-        key = SETTINGS_PREFIX + email
-        inputs = self._fingerprint()
-        cached = _from_cache(await state.get_setting(key), inputs)
-        if cached is not None:
-            return cached
+        cached = await self.cached(to_email, state, country, company=company, name=name)
+        return cached if cached is not None else await self.check(to_email, state, country, company=company, name=name)
 
-        result = await self._check(email)
+    async def cached(self, to_email: str, state, country: str = "",
+                    company: str = "", name: str = "") -> Clearance | None:
+        """The stored verdict for this address and these facts, or None."""
+        email = (to_email or "").strip().lower()
+        return self._cached(await state.get_setting(SETTINGS_PREFIX + email), _country(country),
+                            _name(company, MAX_COMPANY_NAME), _name(name, MAX_RECIPIENT_NAME))
+
+    def stored_verdicts(self) -> tuple[str, str, str]:
+        """What a stored verdict needs to still be used, for counting in SQL:
+        its settings key prefix, these facts' fingerprint, and the oldest
+        ``checked_at`` that hasn't expired."""
+        oldest = (_utcnow() - timedelta(days=CACHE_DAYS)).isoformat()
+        return SETTINGS_PREFIX, self._fingerprint(), oldest
+
+    async def check(self, to_email: str, state, country: str = "",
+                    company: str = "", name: str = "") -> Clearance:
+        """Ask Precleared now, and store a definite verdict for next time."""
+        email = (to_email or "").strip().lower()
+        company = _name(company, MAX_COMPANY_NAME)
+        name = _name(name, MAX_RECIPIENT_NAME)
+        try:
+            result = await self._check(email, _country(country), company, name)
+        except Exception as e:
+            # A failure nobody planned for holds cold email and pauses checks
+            # (it may well happen for every address); it never stops the cycle.
+            return Clearance(allowed=False, held=True, pause_checks=True, retry_address=True,
+                             hold_kind="unavailable",
+                             reason=_clean(self._redact(
+                                 f"Precleared check failed ({type(e).__name__}: {e})"))[:240])
         if not result.held and result.verdict in DEFINITE_VERDICTS:
             # One entry per address: a fresh verdict replaces any earlier
             # one, including legacy entries written without a fingerprint.
-            await state.set_setting(key, json.dumps({
+            await state.set_setting(SETTINGS_PREFIX + email, json.dumps({
                 "verdict": result.verdict,
                 "reason": result.reason,
                 "receipt_id": result.receipt_id,
                 "country": result.country,
                 "checked_at": _utcnow().isoformat(),
-                "inputs": inputs,
+                "inputs": self._fingerprint(_country(country), company, name),
             }))
         return result
 
-    async def known_country(self, to_email: str, state) -> str:
+    async def known_country(self, to_email: str, state, country: str = "",
+                            company: str = "", name: str = "") -> str:
         """The recipient's country from a cached verdict, or "". Never asks
-        Precleared."""
+        Precleared. ``country``, ``company`` and ``name`` are what clear()
+        was given for this address, since the verdict is keyed on them."""
         email = (to_email or "").strip().lower()
-        cached = _from_cache(await state.get_setting(SETTINGS_PREFIX + email),
-                             self._fingerprint())
+        cached = self._cached(await state.get_setting(SETTINGS_PREFIX + email), _country(country),
+                              _name(company, MAX_COMPANY_NAME), _name(name, MAX_RECIPIENT_NAME))
         return cached.country if cached is not None else ""
 
-    async def _check(self, email: str) -> Clearance:
+    def _cached(self, raw: str, country: str, company: str = "", name: str = "") -> Clearance | None:
+        """The cached verdict for the question _check would ask, or None.
+
+        A verdict decided without the names is kept when it already allows
+        the email, since the names only help Precleared find the company;
+        any other verdict is asked for again once, with them.
+        """
+        cached = self._same_question(raw, country, company, name)
+        if cached is None and (company or name):
+            earlier = self._same_question(raw, country)
+            if earlier is not None and earlier.verdict == "ok_to_email":
+                return earlier
+        return cached
+
+    def _same_question(self, raw: str, country: str, company: str = "",
+                       name: str = "") -> Clearance | None:
+        """The verdict cached for exactly these facts, or None.
+
+        A verdict decided without the country, for which Precleared found
+        that same country itself, answers the same question, so it is kept
+        rather than asked for again.
+        """
+        cached = _from_cache(raw, self._fingerprint(country, company, name))
+        if cached is None and country:
+            earlier = _from_cache(raw, self._fingerprint("", company, name))
+            if earlier is not None and earlier.country == country:
+                return earlier
+        return cached
+
+    async def _check(self, email: str, country: str = "", company: str = "",
+                     name: str = "") -> Clearance:
         payload = {
             "recipient_email": email,
             "sender_country": self.sender_country,
@@ -204,28 +321,67 @@ class PreclearedClient:
         }
         if self.pitch:
             payload["pitch"] = self.pitch
-        if self.prospect_country:
+        if country:
+            # Harvey is sure of it from the company's location, and Precleared
+            # takes it as settled; so never a guess, and never both fields.
+            payload["recipient_country"] = country
+        elif self.default_country:
             # Precleared uses this only when the address, company records and
             # the company's website don't show the recipient's country.
-            payload["default_recipient_country"] = self.prospect_country
+            payload["default_recipient_country"] = self.default_country
+        if company:
+            # For a UK recipient, searched on the Companies House register
+            # when the domain alone doesn't find the company. A company found
+            # this way only counts when other evidence ties it to the
+            # recipient, such as one of its officers being the person below.
+            payload["company_name"] = company
+        if name:
+            # Matched against the company's current officers. Precleared
+            # doesn't store it.
+            payload["recipient_name"] = name
         headers = {
             "Content-Type": "application/json",
             "User-Agent": "harvey (+https://github.com/ethanplusai/harvey)",
         }
         if self.api_key:
+            if not re.fullmatch(r"[!-~]+", self.api_key):
+                # A key is plain printable ASCII. One pasted with a curly
+                # quote, a space or a line break can't be sent as a header,
+                # and the error would print it back, so it isn't tried.
+                return Clearance(allowed=False, held=True, pause_checks=True,
+                                 hold_kind="key_rejected", fix_url=GET_KEY_URL,
+                                 reason="PRECLEARED_API_KEY has a character that can't be "
+                                        "sent (a curly quote, a space or a line break); "
+                                        "check it in .env")
             headers["Authorization"] = f"Bearer {self.api_key}"
 
         try:
             async with httpx.AsyncClient(timeout=TIMEOUT, transport=self._transport) as client:
-                resp = await client.post(API_URL, json=payload, headers=headers)
+                resp = await asyncio.wait_for(
+                    client.post(API_URL, json=payload, headers=headers), TOTAL_TIMEOUT)
         except httpx.HTTPError as e:
-            return Clearance(allowed=False, held=True, hold_kind="unavailable",
+            # No answer in time may be this address (a slow lookup); no
+            # connection, or one dropped (a restart), is the same for everyone.
+            slow = isinstance(e, httpx.ReadTimeout)
+            return Clearance(allowed=False, held=True, pause_checks=True, retry_address=slow,
+                             hold_kind="unavailable",
                              reason=self._redact(f"Precleared unreachable: {e}"))
+        except asyncio.TimeoutError:
+            return Clearance(allowed=False, held=True, pause_checks=True, retry_address=True,
+                             hold_kind="unavailable",
+                             reason="Precleared took too long to answer")
 
         if resp.status_code == 429:
+            if self.api_key or _error_code(resp) == "rate_limited":
+                # A key that runs out of checks gets a 402, so a 429 on a key
+                # is Precleared's per-minute rate limit, not the daily one.
+                return Clearance(allowed=False, held=True, pause_checks=True,
+                                 hold_kind="rate_limited",
+                                 reason="Precleared rate limit reached; asking again next cycle")
             # Keyless allowance used up: a free key gives this install its own.
             return Clearance(
-                allowed=False, held=True, hold_kind="keyless_limit", fix_url=GET_KEY_URL,
+                allowed=False, held=True, pause_checks=True,
+                hold_kind="keyless_limit", fix_url=GET_KEY_URL,
                 reason="Precleared daily allowance used up; add PRECLEARED_API_KEY "
                        "(free key: https://precleared.dev/get-key) or wait until tomorrow",
             )
@@ -235,7 +391,8 @@ class PreclearedClient:
             # The 402 answer carries a checkout link for this key.
             buy_url = _buy_url(resp, self.api_key)
             return Clearance(
-                allowed=False, held=True, hold_kind="out_of_checks", fix_url=buy_url,
+                allowed=False, held=True, pause_checks=True,
+                hold_kind="out_of_checks", fix_url=buy_url,
                 reason=self._redact(
                     "Precleared: today's free checks on your key are used and it has "
                     f"no credits left; add a pack ({buy_url}) "
@@ -243,29 +400,36 @@ class PreclearedClient:
                 ),
             )
         if resp.status_code == 401:
-            return Clearance(allowed=False, held=True, hold_kind="key_rejected",
-                             fix_url=GET_KEY_URL,
+            return Clearance(allowed=False, held=True, pause_checks=True,
+                             hold_kind="key_rejected", fix_url=GET_KEY_URL,
                              reason="PRECLEARED_API_KEY was rejected (wrong or revoked)")
         if resp.status_code != 200:
-            return Clearance(allowed=False, held=True, hold_kind="unavailable",
+            # A busy or unreachable server affects every address; anything
+            # else may be about this address alone, so only its email waits.
+            return Clearance(allowed=False, held=True,
+                             pause_checks=resp.status_code in SERVER_BUSY, hold_kind="unavailable",
                              reason=f"Precleared HTTP {resp.status_code}: "
                                     f"{_clean(self._redact(resp.text))[:200]}")
 
         try:
             data = resp.json()
-        except ValueError:
-            return Clearance(allowed=False, held=True, hold_kind="unavailable",
-                             reason="Precleared returned invalid JSON")
+        except (ValueError, RecursionError):
+            return Clearance(allowed=False, held=True, pause_checks=True, retry_address=True,
+                             hold_kind="unavailable", reason="Precleared returned invalid JSON")
 
         # Only a JSON object with a known verdict counts as an answer.
         # Anything else is treated like an unavailable check, so cold email
-        # is held, not failed, and the rest of the cycle carries on.
+        # is held, not failed. A 200 means the check was made (and counted),
+        # and an answer Harvey can't read is about the API, not the address,
+        # so no more checks are spent on it this cycle.
         if not isinstance(data, dict):
-            return Clearance(allowed=False, held=True, hold_kind="unavailable",
+            return Clearance(allowed=False, held=True, pause_checks=True, retry_address=True,
+                             hold_kind="unavailable",
                              reason="Precleared returned an unexpected response (not a JSON object)")
         verdict = data.get("verdict")
         if not isinstance(verdict, str) or verdict not in VERDICTS:
-            return Clearance(allowed=False, held=True, hold_kind="unavailable",
+            return Clearance(allowed=False, held=True, pause_checks=True, retry_address=True,
+                             hold_kind="unavailable",
                              reason="Precleared returned a response without a known verdict")
 
         receipt = data.get("receipt")
@@ -278,14 +442,22 @@ class PreclearedClient:
         return Clearance(
             allowed=False,
             verdict=verdict,
-            reason=_reason(data),
+            reason=_clean(_reason(data)),
             receipt_id=receipt_id,
             country=country,
         )
 
 
+def _name(value, limit: int) -> str:
+    """A company or person name for the check, with runs of whitespace made
+    single spaces and cut to Precleared's limit, or "" for anything else."""
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split())[:limit].strip()
+
+
 def _country(value) -> str:
-    """A two-letter country code from Precleared's facts, or ""."""
+    """A two-letter country code, from Precleared's facts or the sender, or ""."""
     code = value.strip().upper() if isinstance(value, str) else ""
     return code if len(code) == 2 and code.isascii() and code.isalpha() else ""
 
@@ -316,6 +488,15 @@ def _contains_key(text: str, api_key: str) -> bool:
     return True
 
 
+def _error_code(resp: httpx.Response) -> str:
+    """The ``error`` field of a JSON error body, or ""."""
+    try:
+        data = resp.json()
+    except (ValueError, RecursionError):
+        return ""
+    return _text(data.get("error")) if isinstance(data, dict) else ""
+
+
 def _buy_url(resp: httpx.Response, api_key: str = "") -> str:
     """The checkout link from a 402 answer's ``buy_url``, or BUY_URL.
 
@@ -324,7 +505,7 @@ def _buy_url(resp: httpx.Response, api_key: str = "") -> str:
     """
     try:
         data = resp.json()
-    except ValueError:
+    except (ValueError, RecursionError):
         return BUY_URL
     url = data.get("buy_url") if isinstance(data, dict) else None
     if not (
@@ -547,6 +728,13 @@ def hold_message(hold: dict) -> dict:
                        "Check the key in .env, get a new free key at "
                        f"{url or GET_KEY_URL}, or switch the check off "
                        f"(compliance.precleared.enabled: false). {replies}"),
+        }
+    if kind == "rate_limited":
+        return {
+            "tone": "warn", "url": "", "url_label": "",
+            "title": "Precleared is limiting how fast Harvey can check",
+            "detail": (f"{emails}. Precleared allows a set number of checks a minute, "
+                       f"and Harvey asks again next cycle. {replies}"),
         }
     reason = _text(_clean(_text(hold.get("reason")))) or "no answer"
     return {

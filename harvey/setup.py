@@ -659,8 +659,11 @@ class SetupWizard:
         print("\n  Anything that isn't a clear yes waits in the Outbox with the reason.")
         print("  It checks mail sent through Gmail, Microsoft 365 or SMTP, not Instantly.")
         print("  Precleared receives each new recipient's address, your country, how")
-        print("  the address was found, your product description and, if you set one,")
-        print("  your prospects' country.")
+        print("  the address was found, your product description and the recipient's")
+        print("  country when the company's location makes it certain, else your")
+        print("  prospects' country if you set one. It also gets the company's and")
+        print("  person's names, to find a UK company on the register; it doesn't")
+        print("  store the person's name.")
 
         if not _ask_yes_no("Turn on the cold-email check?", default=was_on):
             # Only touch the config to switch off a check that was on.

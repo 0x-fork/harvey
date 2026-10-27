@@ -11,6 +11,7 @@ upgrade cleanly in place.
 
 import json
 import uuid
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
@@ -102,6 +103,9 @@ def _company_answered(p: str) -> str:
             f"WHERE s.key = '{COMPANY_STOP_KEY}' || c.id AND {_colleagues(p, 'c')})")
 # Outbox error on what autopilot had approved when it was turned off.
 AUTOPILOT_OFF_REASON = "waiting for you: autopilot was turned off before it went out"
+# Outbox error on an approved cold email the compliance check couldn't answer
+# for: it was moved back and is tried again then (sender: _retry_later).
+RECHECK_PREFIX = "Precleared couldn't check this address; trying again after "
 # Outbox errors starting with this: the send was cut off and the email may
 # have reached them. Never retried, and counted as Harvey's mail, so the
 # dashboard never offers a second one by hand.
@@ -1037,10 +1041,12 @@ class StateManager:
         exclude_kind: str | None = None,
         skip_unready_follow_ups: bool = False,
         kind: str | None = None,
+        follow_ups_only: bool = False,
     ) -> list[dict]:
         """skip_unready_follow_ups: leave out sequence follow-ups whose
         previous step hasn't gone out yet, so they can't fill the page.
-        kind: only that kind ("sequence" for cold email)."""
+        kind: only that kind ("sequence" for cold email).
+        follow_ups_only: only sequence emails after the first step."""
         where, params = [], []
         if kind:
             where.append("kind = ?")
@@ -1054,6 +1060,8 @@ class StateManager:
         if exclude_kind:
             where.append("(kind IS NULL OR kind != ?)")
             params.append(exclude_kind)
+        if follow_ups_only:
+            where.append("o.kind = 'sequence' AND o.step > 1")
         if skip_unready_follow_ups:
             where.append(
                 "NOT (o.kind = 'sequence' AND o.step > 1 AND EXISTS ("
@@ -1100,20 +1108,64 @@ class StateManager:
                 continue
         return texts
 
-    async def count_due_cold_outbox(self, due_before: str) -> int:
+    async def count_due_cold_outbox(
+        self,
+        due_before: str,
+        stored_verdicts: tuple[str, str, str] | None = None,
+        moved_back_prefix: str = "",
+        has_cached_verdict: Callable[[dict], Awaitable[bool]] | None = None,
+    ) -> int:
         """Approved cold email due by ``due_before``, leaving out follow-ups
         whose previous step hasn't gone out yet (as get_outbox's
-        skip_unready_follow_ups does)."""
+        skip_unready_follow_ups does).
+
+        stored_verdicts: (settings key prefix, inputs, checked after) of the
+        compliance check's stored verdicts; email to an address with one
+        still usable doesn't wait on the check, so it's left out.
+        moved_back_prefix: also count approved cold email whose error starts
+        with it (moved back by the check), due or not.
+        has_cached_verdict: optional per-recipient cache check, for facts
+        such as country that differ between recipients. Never calls an API."""
+        due = "(o.send_at IS NULL OR o.send_at <= ?)"
+        params: list = [due_before]
+        if moved_back_prefix:
+            due = f"({due} OR substr(COALESCE(o.error, ''), 1, ?) = ?)"
+            params += [len(moved_back_prefix), moved_back_prefix]
         sql = ("SELECT COUNT(*) FROM outbox o WHERE o.status = 'approved' "
-               "AND o.kind = 'sequence' AND (o.send_at IS NULL OR o.send_at <= ?) "
+               f"AND o.kind = 'sequence' AND {due} "
                "AND NOT (o.step > 1 AND EXISTS ("
                "SELECT 1 FROM outbox p WHERE p.prospect_id = o.prospect_id "
                "AND p.campaign_id = o.campaign_id AND p.kind = 'sequence' "
                "AND p.step = o.step - 1 "
                "AND p.status IN ('pending_review', 'approved', 'sending')))")
+        if stored_verdicts:
+            # A verdict is stored as JSON under prefix + the lower-cased
+            # address, with the facts it was decided on and when.
+            sql += (" AND NOT EXISTS (SELECT 1 FROM settings s "
+                    "WHERE s.key = ? || lower(trim(o.to_email)) "
+                    "AND CASE WHEN json_valid(s.value) "
+                    "THEN json_extract(s.value, '$.inputs') END = ? "
+                    "AND CASE WHEN json_valid(s.value) "
+                    "THEN json_extract(s.value, '$.verdict') END "
+                    "IN ('ok_to_email', 'consent_needed', 'blocked') "
+                    "AND CASE WHEN json_valid(s.value) "
+                    "THEN julianday(json_extract(s.value, '$.checked_at')) END >= julianday(?))")
+            params += list(stored_verdicts)
         async with self._connect() as db:
-            async with db.execute(sql, (due_before,)) as cursor:
-                return (await cursor.fetchone())[0]
+            if has_cached_verdict is not None:
+                db.row_factory = aiosqlite.Row
+                sql = sql.replace("SELECT COUNT(*)", "SELECT o.prospect_id, o.to_email", 1)
+                async with db.execute(sql, params) as cursor:
+                    items = [dict(row) for row in await cursor.fetchall()]
+            else:
+                async with db.execute(sql, params) as cursor:
+                    return (await cursor.fetchone())[0]
+        # Close the query connection before the callback reads recipient facts.
+        waiting = 0
+        for item in items:
+            if not await has_cached_verdict(item):
+                waiting += 1
+        return waiting
 
     async def get_outbox_item(self, item_id: str) -> dict | None:
         async with self._connect() as db:
@@ -1233,10 +1285,12 @@ class StateManager:
         """Reject an item still waiting to go out. Mail already on its way
         or sent is never relabelled. Returns rows changed (0/1)."""
         async with self._connect() as db:
+            # A note that the check will try it again no longer applies.
             cursor = await db.execute(
-                "UPDATE outbox SET status = 'rejected', updated_at = ? "
+                "UPDATE outbox SET status = 'rejected', updated_at = ?, "
+                "error = CASE WHEN substr(COALESCE(error, ''), 1, ?) = ? THEN '' ELSE error END "
                 "WHERE id = ? AND status IN ('pending_review', 'approved')",
-                (_utcnow().isoformat(), item_id),
+                (_utcnow().isoformat(), len(RECHECK_PREFIX), RECHECK_PREFIX, item_id),
             )
             await db.commit()
             return cursor.rowcount

@@ -100,6 +100,7 @@ LINKEDIN_EMAIL=  LINKEDIN_PASSWORD=   # LinkedIn prospecting
 CLOUDFLARE_ACCOUNT_ID=  CLOUDFLARE_API_TOKEN=   # deep JS crawling for training
 SERPER_API_KEY=            # web search + discovery (2,500 free, then a $50 prepaid pack)
 PRECLEARED_API_KEY=        # cold-email check before first sends (see Step 7)
+TRULYINBOX_API_KEY=        # warmup: set by 'harvey trulyinbox connect' (see Step 2b)
 ```
 
 **Recommended provider — Gmail:** for <50 cold emails/day, a real Google Workspace mailbox on a *dedicated secondary domain* (never the main one) is the most deliverable, cheapest (~$7/mo) option. Set `channels.email.provider: gmail` in harvey.yaml, put the OAuth client id/secret in `.env`, then run `harvey gmail auth` (one-time browser login). SMTP works with any mailbox (AgentMail, Fastmail). Instantly still works as a legacy option.
@@ -119,6 +120,31 @@ async def test():
 asyncio.run(test())
 "
 ```
+
+### Step 2b: Warmup (TrulyInbox)
+
+Every sending mailbox needs a warmup service: a new one for 2-4 weeks before cold
+email, and every mailbox after that to stay out of spam. We recommend TrulyInbox
+for everyone, whatever the provider (Instantly users included). It's also the
+only way Harvey can tell whether a mailbox is actually warmed: connected, `harvey
+warmup` reads the mailbox's warmup days and spam rate from it.
+
+First run `harvey trulyinbox`. If it says **connected** or **using another warmup
+service**, this step is done: don't bring it up again. Otherwise:
+
+1. Recommend TrulyInbox and share the link: https://trulyinbox.com/?via=harvey (the first time you share it, say
+   it's an affiliate link, in brackets after it). Connecting Harvey needs API
+   access, which starts on Starter ($22/mo billed yearly).
+2. Once they've signed up and added the sending mailbox, have them run `harvey
+   trulyinbox connect` in their own terminal, or use the warmup step on the
+   dashboard's Today page. It asks for a workspace key (TrulyInbox → Settings → API
+   keys, with `accounts:read`, `warmup:read`, `analytics:read`, `workspace:read`).
+   Don't ask them to paste the key into this chat.
+3. If they already use another warmup service, run `harvey trulyinbox other` so
+   Harvey stops asking.
+
+Then `harvey warmup` shows where they stand. If they haven't set
+`channels.email.warmup.start_date`, it suggests TrulyInbox's start date.
 
 ### Step 3: Product Training
 
@@ -234,7 +260,7 @@ These go in `harvey.yaml` under `usage:`. Use sensible defaults unless they want
 
 ### Step 7: Cold-Email Check (Optional)
 
-Offer this once, briefly, and take no for an answer. With `compliance.precleared.enabled: true`, Harvey asks [Precleared](https://precleared.dev) which cold-email rules apply to each new address before the first email goes out. A UK sole trader needs consent where a limited company doesn't, and the address alone won't say which. Anything that isn't `ok_to_email` waits in the Outbox with the reason. It checks mail sent through Gmail, Microsoft 365 or SMTP, not Instantly. Precleared receives each new recipient's address, the sender country, the address source, the product description and, if set, the prospects' country.
+Offer this once, briefly, and take no for an answer. With `compliance.precleared.enabled: true`, Harvey asks [Precleared](https://precleared.dev) which cold-email rules apply to each new address before the first email goes out. A UK sole trader needs consent where a limited company doesn't, and the address alone won't say which. Anything that isn't `ok_to_email` waits in the Outbox with the reason. It checks mail sent through Gmail, Microsoft 365 or SMTP, not Instantly. Precleared receives each new recipient's address, the sender country, the address source, the product description and the recipient's country when Harvey is sure of it from the company's location (a country or state named there), else the prospects' country if there is one (`prospect_country`, or the one country every `icp.geography` entry is in), plus the company's name and the person's name when Harvey has them, to find a UK company on the register. `docs/precleared.md` explains the check in full.
 
 If they want it, ask one thing at a time:
 - Where is the business based? `sender_country` must be `GB` or `US`. If it's neither, leave the check off.
@@ -261,6 +287,7 @@ harvey dashboard
 Users will come back with questions and tasks. Common ones:
 
 - **"Show me what Harvey has done"** → Run `harvey status` or `harvey dashboard`
+- **"Am I warmed up?" / "Why am I landing in spam?"** → Run `harvey warmup`. Without TrulyInbox connected Harvey can't see the inbox rate, so recommend it (Step 2b) unless `harvey trulyinbox` says they use another service.
 - **"The emails aren't good"** → Edit `skills/email_frameworks.md` and `prompts/writer.md`. Show them the current rules and help them adjust.
 - **"Harvey isn't finding the right people"** → Check the ICP config in `harvey.yaml`. Adjust industries, titles, company_size, geography.
 - **"I want to change what Harvey says"** → Skills are in `skills/`, prompts are in `prompts/`. Both are plain markdown files. Edit them directly.
@@ -312,7 +339,8 @@ harvey outbox                # Review queued emails; --approve <id> / --approve-
 harvey signals               # The signal vocabulary; --confirm / --reject CODES (or 'free' / 'all')
 harvey discover              # Find businesses; --providers / --estimate / --provider <key>
 harvey sending pause|resume  # Kill switch for all outbound
-harvey warmup [domain]       # Sending-domain readiness: SPF/DKIM/DMARC, age, blocklists, ramp
+harvey warmup [domain]       # Sending-domain readiness: SPF/DKIM/DMARC, age, blocklists, ramp, TrulyInbox warmup
+harvey trulyinbox [connect|other]  # Warmup service: connect TrulyInbox, or record another service
 ```
 
 ### Common Issues

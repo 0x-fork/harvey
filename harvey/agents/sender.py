@@ -14,6 +14,7 @@ import asyncio
 import logging
 import random
 import re
+import time
 from datetime import date, datetime, timedelta, timezone
 
 from harvey.brain import Brain
@@ -22,14 +23,14 @@ from harvey.config import (
     compliance_of, live_do_not_contact, operator_timezone, send_window_of,
 )
 from harvey.gate import autopilot_review, do_not_contact_match, pre_send_check
-from harvey.send_window import in_window, next_send_time, recipient_zone
+from harvey.send_window import in_window, next_send_time, recipient_country, recipient_zone
 from harvey.integrations.instantly import InstantlyClient
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
 from harvey.integrations.precleared import PreclearedClient, clear_hold, record_hold
 from harvey.sending_mode import sync_sending_mode
 from harvey.state import (
     AUTOPILOT_OFF_REASON, COLLEAGUE_REPLIED, HAND_SENT_REASON, HELD_FOR_REVIEW,
-    MANUAL_SEND_KEY, MAYBE_SENT_PREFIX, StateManager,
+    MANUAL_SEND_KEY, MAYBE_SENT_PREFIX, RECHECK_PREFIX, StateManager,
 )
 
 # A follow-up waits at least this long after the email it follows went out,
@@ -44,6 +45,15 @@ MAX_SENDS_PER_CYCLE = 8
 # How many due emails quiet hours look through for one that can go now.
 QUIET_HOURS_SCAN = 200
 SEND_JITTER_SECONDS = (4, 15)
+# Optional Precleared check: an email whose address Precleared couldn't
+# check is moved back this far, behind other email, rather than asked about
+# again every cycle. Failures for this many different domains with no answer
+# in between (across cycles) mean Precleared itself is in trouble, so checks
+# pause. And no new check starts after this many seconds of checking in one
+# cycle.
+ADDRESS_RETRY_AFTER = timedelta(hours=6)
+DOMAINS_FAILING_TO_PAUSE = 2
+CHECK_SECONDS_PER_CYCLE = 90
 
 # Prospect pipeline statuses that mean "stop emailing this person".
 STOP_STATUSES = {"replied", "opted_out", "lost", "meeting", "closed"}
@@ -84,14 +94,17 @@ class Sender:
         self.provider = get_mail_provider(config, env)
         # Optional per-recipient compliance check; None unless enabled.
         self.precleared = PreclearedClient.from_config(config, env)
+        # Domains whose check failed since Precleared last answered. Kept
+        # across cycles: one new address a cycle failing is still a pattern.
+        self._failing_domains: set[str] = set()
         # Disabled in tests to skip inter-send sleeps.
         self.send_pacing = True
         # Set by the heartbeat in quiet hours (send windows in recipients'
         # zones): only cold email goes, inside its window; replies wait for
         # the operator's own hours, as they always have.
         self.cold_only = False
-        # The last drain couldn't ask Precleared: quiet hours don't wake for
-        # cold email again until a drain outside them has run.
+        # The last drain couldn't ask Precleared: quiet hours wake only for
+        # cold email it has already cleared until a drain outside them has run.
         self.compliance_held = False
 
     @property
@@ -101,40 +114,95 @@ class Sender:
             and self.provider is not None
         )
 
-    async def _send_zone(self, prospect, country: str = "") -> str:
+    async def _send_zone(self, prospect, country: str = "", given: str = "",
+                         names: tuple[str, str] = ("", "")) -> str:
         """The time zone this recipient's send window is in: their own when
         it can be told (with recipient_timezone on), otherwise the zone in
-        usage.quiet_hours, as before."""
+        usage.quiet_hours, as before. ``country`` is the recipient's country
+        from Precleared, ``given`` the one Harvey gave the check (see
+        _recipient_country) and ``names`` the company and person names it
+        gave (see _recipient_names), which a cached verdict is keyed on."""
         window = send_window_of(self.config)
         if window is not None and window.recipient_timezone:
             if not country and self.precleared is not None and prospect is not None:
                 # A country Precleared already found counts on every check,
                 # not only on the one that asked it.
-                country = await self.precleared.known_country(prospect.email, self.state)
+                company, name = names
+                country = await self.precleared.known_country(
+                    prospect.email, self.state, given, company=company, name=name)
             zone = await recipient_zone(self.state, prospect, self.config, country)
             if zone:
                 return zone
         return operator_timezone(self.config)
 
-    async def _zone_or_default(self, prospect, country: str = "") -> str:
+    async def _zone_or_default(self, prospect, country: str = "", given: str = "",
+                               names: tuple[str, str] = ("", "")) -> str:
         """_send_zone, but a failure to work the zone out falls back to
         usage.quiet_hours.timezone for this one email instead of stopping
         the whole drain (replies included)."""
         try:
-            return await self._send_zone(prospect, country)
+            return await self._send_zone(prospect, country, given, names)
         except Exception as e:
             logger.warning(
                 f"Sender: couldn't work out the time zone for "
                 f"{getattr(prospect, 'email', '?')}, using quiet_hours.timezone: {e}")
             return operator_timezone(self.config)
 
+    async def _recipient_country(self, prospect) -> str:
+        """The recipient's country when Harvey is sure of it, for the
+        compliance check (see send_window.recipient_country). A failure to
+        work it out means none for this one email, which Precleared then
+        works out itself, instead of stopping the drain."""
+        try:
+            return await recipient_country(self.state, prospect)
+        except Exception as e:
+            logger.warning(
+                f"Sender: couldn't work out the country for "
+                f"{getattr(prospect, 'email', '?')}, leaving it to Precleared: {e}")
+            return ""
+
+    async def _recipient_names(self, prospect) -> tuple[str, str]:
+        """The company's name and the person's full name, for the compliance
+        check: the company record's name, else the prospect's own company
+        field, and the prospect's first and last name. A company inbox has no
+        person, so no name. A failure to load the company record falls back
+        to the prospect's own field for this one email instead of stopping
+        the drain."""
+        if prospect is None:
+            return "", ""
+        company = ""
+        if getattr(prospect, "company_id", ""):
+            try:
+                record = await self.state.get_company(prospect.company_id)
+                company = (getattr(record, "name", "") or "") if record else ""
+            except Exception as e:
+                logger.warning(
+                    f"Sender: couldn't load the company for "
+                    f"{getattr(prospect, 'email', '?')}, using the prospect's own: {e}")
+        company = company.strip() or (getattr(prospect, "company", "") or "").strip()
+        name = ""
+        if not getattr(prospect, "is_company_inbox", False):
+            first = (getattr(prospect, "first_name", "") or "").strip()
+            last = (getattr(prospect, "last_name", "") or "").strip()
+            name = f"{first} {last}".strip()
+        return company, name
+
+    async def _has_cached_verdict(self, item: dict) -> bool:
+        """Use the send loop's recipient facts when counting held email."""
+        prospect = await self.state.get_prospect(item["prospect_id"])
+        country = await self._recipient_country(prospect)
+        company, name = await self._recipient_names(prospect)
+        return await self.precleared.cached(
+            item["to_email"], self.state, country, company=company, name=name) is not None
+
     async def cold_due_in_window(self) -> bool:
         """Quiet hours: whether a cold email is due, inside its recipient's
         send window and free to go now (sending not paused, under the daily
-        and warmup caps, no compliance hold). Only then is it worth waking
-        to read replies and send."""
+        and warmup caps, and after a compliance hold only to someone
+        Precleared has already cleared). Only then is it worth waking to read
+        replies and send."""
         window = send_window_of(self.config)
-        if window is None or self.compliance_held or not self.is_native:
+        if window is None or not self.is_native:
             return False
         if not self.provider.is_configured() or await self.state.get_setting(KILL_SWITCH_KEY):
             return False
@@ -147,16 +215,35 @@ class Sender:
                 since=midnight.astimezone(timezone.utc).replace(tzinfo=None).isoformat()) <= 0:
             return False
         now = _utcnow()
+        due_before = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         due = await self.state.get_outbox(
-            status="approved", due_before=datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+            status="approved", due_before=due_before,
             limit=QUIET_HOURS_SCAN, skip_unready_follow_ups=True, kind="sequence",
         )
+        if self.compliance_held and self.precleared is not None:
+            # Match the drain's separate follow-up scan: waiting first emails
+            # must not hide a cleared follow-up and prevent the loop waking.
+            seen = {item["id"] for item in due}
+            follow_ups = await self.state.get_outbox(
+                status="approved", due_before=due_before,
+                limit=QUIET_HOURS_SCAN, skip_unready_follow_ups=True, follow_ups_only=True,
+            )
+            due += [item for item in follow_ups if item["id"] not in seen]
         for item in due:
             if item["kind"] != "sequence":
                 continue
             prospect = await self.state.get_prospect(item["prospect_id"])
+            country = await self._recipient_country(prospect) if self.precleared is not None else ""
+            names = await self._recipient_names(prospect) if self.precleared is not None else ("", "")
+            if self.compliance_held and self.precleared is not None:
+                # New addresses wait for a drain outside quiet hours; a
+                # stored verdict still lets email go, as in the drain.
+                clearance = await self.precleared.cached(
+                    item["to_email"], self.state, country, company=names[0], name=names[1])
+                if clearance is None or not clearance.allowed:
+                    continue
             if prospect is not None and in_window(
-                    now, await self._zone_or_default(prospect), window):
+                    now, await self._zone_or_default(prospect, given=country, names=names), window):
                 return True
         return False
 
@@ -657,6 +744,15 @@ class Sender:
         await self.state.update_outbox_item(item["id"], send_at=ready_at.isoformat())
         return "wait"
 
+    async def _retry_later(self, item: dict, reason: str) -> datetime:
+        """Move a cold email back by ADDRESS_RETRY_AFTER, saying why; return
+        the new time. Sending it clears the note."""
+        retry_at = _utcnow() + ADDRESS_RETRY_AFTER
+        await self.state.update_outbox_item(
+            item["id"], send_at=retry_at.isoformat(),
+            error=f"{RECHECK_PREFIX}{retry_at:%Y-%m-%d %H:%M} UTC: {reason}"[:300])
+        return retry_at
+
     async def _blocked(self, item: dict, prospect, allow_risky: bool) -> tuple[str, str] | None:
         """Why this email must not go out, as (status, error), or None."""
         await sync_sending_mode(self.config, self.state)   # "Turn off autopilot" counts at once
@@ -749,6 +845,16 @@ class Sender:
             exclude_kind="sequence",
         )
         extra = [item for item in unchecked if item["id"] not in seen]
+        if self.precleared is not None:
+            # First emails waiting on Precleared keep their place and could
+            # fill the page too, hiding follow-ups to people already cleared,
+            # which a stored verdict lets go out. Fetched on their own as well.
+            seen.update(item["id"] for item in extra)
+            follow_ups = await self.state.get_outbox(
+                status="approved", due_before=now, limit=budget * 3,
+                skip_unready_follow_ups=True, follow_ups_only=True,
+            )
+            extra += [item for item in follow_ups if item["id"] not in seen]
         if extra:
             due = sorted(
                 due + extra,
@@ -772,6 +878,11 @@ class Sender:
         hold = None
         waiting_on_check = 0
         answered = False
+        # Addresses Precleared couldn't check this cycle: their other emails
+        # aren't asked about again. (self._failing_domains: failures across
+        # several domains pause checks.)
+        failed_addresses: set[str] = set()
+        check_seconds = 0.0
         for item in due:
             if sent >= budget:
                 break
@@ -781,9 +892,6 @@ class Sender:
                 held_cold += 1
                 continue
             needs_check = self.precleared is not None and item["kind"] == "sequence"
-            if needs_check and compliance_paused:
-                waiting_on_check += 1
-                continue
 
             prospect = await self.state.get_prospect(item["prospect_id"])
             blocked = await self._blocked(item, prospect, allow_risky)
@@ -797,10 +905,17 @@ class Sender:
             if order:
                 await self.state.update_outbox_item(item["id"], status=order[0], error=order[1])
                 continue
+            # The recipient's country when Harvey is sure of it, and the
+            # company's and person's names: they go with the compliance
+            # check, and a cached verdict is keyed on them.
+            country = await self._recipient_country(prospect) if needs_check else ""
+            names = await self._recipient_names(prospect) if needs_check else ("", "")
             # Cold email waits for the recipient's send window, however
             # late it was approved; replies don't.
             if (window is not None and item["kind"] == "sequence"
-                    and await self._outside_window(item, await self._zone_or_default(prospect), window)):
+                    and await self._outside_window(
+                        item, await self._zone_or_default(prospect, given=country, names=names),
+                        window)):
                 outside_window += 1
                 continue
 
@@ -808,11 +923,53 @@ class Sender:
             # address, before the first cold email. Replies are never checked.
             receipt_id = ""
             if needs_check:
-                clearance = await self.precleared.clear(item["to_email"], self.state)
+                company, name = names
+                # A stored verdict still counts once checks are paused, so
+                # people already cleared keep getting their follow-ups; only
+                # new addresses wait for the next cycle.
+                clearance = await self.precleared.cached(
+                    item["to_email"], self.state, country, company=company, name=name)
+                if clearance is None and (compliance_paused
+                                          or check_seconds > CHECK_SECONDS_PER_CYCLE):
+                    waiting_on_check += 1
+                    continue
+                address = (item["to_email"] or "").strip().lower()
+                if clearance is None and address in failed_addresses:
+                    await self._retry_later(item, "the check failed for this address earlier this cycle")
+                    continue
+                if clearance is None:
+                    started = time.monotonic()
+                    clearance = await self.precleared.check(
+                        item["to_email"], self.state, country, company=company, name=name)
+                    check_seconds += time.monotonic() - started
+                if clearance.held and not clearance.pause_checks:
+                    # Possibly about this address alone: move its email back,
+                    # behind other email, and carry on with the rest. Only a
+                    # first failure counts towards pausing: an address failing
+                    # again says nothing new about Precleared.
+                    again = (item.get("error") or "").startswith(RECHECK_PREFIX)
+                    failed_addresses.add(address)
+                    if not again:
+                        self._failing_domains.add(address.rpartition("@")[2])
+                    waiting_on_check += 1
+                    retry_at = await self._retry_later(item, clearance.reason)
+                    logger.warning(
+                        f"Sender: Precleared couldn't check {item['to_email']}, trying "
+                        f"again after {retry_at:%Y-%m-%d %H:%M} UTC: {clearance.reason}"
+                    )
+                    if again or len(self._failing_domains) < DOMAINS_FAILING_TO_PAUSE:
+                        continue
                 if clearance.held:
+                    # About Precleared, not just this address: the others
+                    # would likely fail too, so no more fresh checks this cycle.
                     compliance_paused = True
                     hold = clearance
-                    waiting_on_check += 1
+                    if clearance.pause_checks:  # else counted just above
+                        waiting_on_check += 1
+                        if clearance.retry_address:
+                            # It may still be this address: don't let it be
+                            # first in line, and asked first, every cycle.
+                            await self._retry_later(item, clearance.reason)
                     logger.warning(
                         f"Sender: compliance check unavailable, holding cold "
                         f"email until a later cycle: {clearance.reason}"
@@ -820,6 +977,7 @@ class Sender:
                     continue
                 if not clearance.cached:
                     answered = True
+                    self._failing_domains.clear()
                 if not clearance.allowed:
                     await self.state.update_outbox_item(
                         item["id"], status="failed",
@@ -882,9 +1040,11 @@ class Sender:
             if item["kind"] == "sequence":
                 sent_cold += 1
             now_iso = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+            # A note that the check moved it back no longer applies.
+            note = {"error": ""} if (item.get("error") or "").startswith(RECHECK_PREFIX) else {}
             await self.state.update_outbox_item(
                 item["id"], status="sent", sent_at=now_iso, body=body,
-                message_id=result.message_id, thread_ref=result.thread_ref,
+                message_id=result.message_id, thread_ref=result.thread_ref, **note,
             )
             if prospect.status in ("new", "queued"):
                 await self.state.update_prospect_status(prospect.id, "contacted")
@@ -931,9 +1091,11 @@ class Sender:
         if self.precleared is not None:
             if hold is not None:
                 # The page read above stops at a few times the cycle's
-                # budget; count every due cold email still waiting.
-                waiting_on_check = max(
-                    waiting_on_check, await self.state.count_due_cold_outbox(now))
+                # budget; count every cold email still waiting on the check:
+                # due with no stored verdict to go on, or moved back by it.
+                waiting_on_check = max(waiting_on_check, await self.state.count_due_cold_outbox(
+                    now, has_cached_verdict=self._has_cached_verdict,
+                    moved_back_prefix=RECHECK_PREFIX))
                 await record_hold(self.state, hold, waiting_on_check)
             elif answered:
                 await clear_hold(self.state)

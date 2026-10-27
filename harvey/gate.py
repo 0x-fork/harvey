@@ -142,6 +142,31 @@ def do_not_contact_match(to_email: str, entries) -> str:
     return ""
 
 
+def do_not_contact_domain_match(domain: str, entries) -> str:
+    """The do-not-contact entry ``domain`` belongs to, or "".
+
+    Only domain entries count here. An address entry bars one mailbox, not
+    the company behind it: "jane@acme.example" says don't email Jane, so
+    acme.example stays discoverable and a colleague can still be reached.
+    Excluding a whole company on the strength of one address would shrink
+    the pool in a way nobody asked for, and silently.
+
+    The domain test is the one in ``do_not_contact_match``: a label
+    boundary, so "acme.example" covers "mail.acme.example" and leaves
+    "notacme.example" — a different company — alone.
+    """
+    host = _host(domain or "")
+    if not host or "@" in host or not entries:
+        return ""
+    for raw in entries:
+        entry = do_not_contact_entry(raw)
+        if not entry or "@" in entry:
+            continue
+        if host == entry or host.endswith("." + entry):
+            return entry
+    return ""
+
+
 def pre_send_check(
     to_email: str,
     subject: str,

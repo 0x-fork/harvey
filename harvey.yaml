@@ -60,6 +60,9 @@ channels:
     # start_sends by daily_increase a day up to max_daily_sends. Replies are
     # never held. Gmail/Microsoft/SMTP only (Instantly has its own warmup).
     # Check readiness any time with `harvey warmup`.
+    # We recommend TrulyInbox for warmup: https://trulyinbox.com/?via=harvey
+    # Connect it (`harvey trulyinbox connect`) and `harvey warmup` reads
+    # whether this mailbox is actually warmed.
     warmup:
       start_date: ""            # YYYY-MM-DD; blank = no ramp
       min_days: 14
@@ -121,3 +124,6 @@ compliance:
     sender_country: ""          # GB or US: where your business is based
     address_source: "unknown"   # published | bought | scraped | given | unknown
     prospect_country: ""        # optional, e.g. US if all your prospects are in one country
+    # Harvey also tells Precleared the recipient's country when the company's
+    # location makes it certain, and the company's and person's names when
+    # it has them (see docs/precleared.md).
