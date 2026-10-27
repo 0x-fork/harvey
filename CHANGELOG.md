@@ -22,9 +22,8 @@ minor versions can still change behaviour.
   approach. A domain covers its subdomains, matched on a label boundary, so
   `acme.example` blocks `mail.acme.example` and leaves `notacme.example`
   alone — a plain suffix test would catch the wrong company. The check runs
-  in `pre_send_check` rather than during discovery, so it is the last thing
-  before an email leaves and holds for one a human already approved in the
-  Outbox. It applies to replies as well as cold mail: a list that lets
+  in `pre_send_check`, so it is the last thing before an email leaves and
+  holds for one a human already approved in the Outbox. It applies to replies as well as cold mail: a list that lets
   automated replies through is not a do-not-contact list, and the operator
   can still answer by hand. Entries are normalised when the config loads, so
   ` @Acme.EXAMPLE `, a pasted `https://www.acme.example/about`,
@@ -35,6 +34,21 @@ minor versions can still change behaviour.
   Instantly, which has no Outbox, listed leads are left out of the upload
   and a reply to one goes to you; a lead Instantly already has must be
   removed there.
+
+- **Discovery skips do-not-contact companies too.** The same
+  `compliance.do_not_contact` list is now applied while discovering, before a
+  result becomes a company, so a forbidden business never enters the pool: it
+  costs nothing to enrich, never has its site read, and stops turning up in
+  cohorts for someone to spot by eye. The send-time gate is unchanged and
+  still the last word — only it can stop a send — but on its own it let a
+  competitor through discovery and charged you for the enrichment first.
+  Discovery has a domain, not an address, so only domain entries apply here:
+  `jane@acme.example` bars one mailbox, and acme.example stays discoverable
+  because a colleague there may still be worth reaching. Skipped companies
+  are counted separately from junk, and `harvey discover` prints the count
+  only when it isn't zero — junk asks whether a result is a business at all,
+  this asks whether you are allowed to approach one, and burying the second
+  in the first is how a list that has grown too broad goes unnoticed.
 
 - **TinyFish as a free discovery source** (from #95). `harvey discover
   --provider tinyfish` (or *TinyFish* on the Discover tab) finds businesses

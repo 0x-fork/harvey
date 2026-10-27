@@ -1,8 +1,10 @@
 """Addresses and domains on `compliance.do_not_contact` never get an email.
 
-Competitors, existing customers, anyone under a legal hold. The check lives in
-the gate rather than in discovery so it holds at the last moment before a send,
-including for an email a human already approved in the Outbox.
+Competitors, existing customers, anyone under a legal hold. The gate is the
+last word: it holds at the final moment before a send, including for an email
+a human already approved in the Outbox. Discovery applies the same list
+earlier, so a forbidden company never becomes a row — but only the gate can
+stop a send, so neither check replaces the other.
 """
 
 from types import SimpleNamespace
@@ -10,7 +12,9 @@ from types import SimpleNamespace
 import pytest
 
 from harvey.config import ComplianceConfig
-from harvey.gate import do_not_contact_match, pre_send_check
+from harvey.gate import (
+    do_not_contact_domain_match, do_not_contact_match, pre_send_check,
+)
 from tests.test_outbox_native import (  # noqa: F401  (state is a fixture)
     FakeProvider, make_sender, seed_prospect, state,
 )
@@ -300,3 +304,45 @@ async def test_a_reply_from_a_listed_address_goes_to_you_without_a_draft(state, 
     await handler._process_reply("jane@acme.example", "What does it cost?", "u1")
     assert drafted == []
     assert [c.prospect_id for c in await state.get_conversations_by_status("needs_human")] == [pid]
+
+
+# ── Discovery matches on the domain, because that is all it has ──
+
+
+@pytest.mark.parametrize("domain", [
+    "acme.example", "www.acme.example", "ACME.example", "  acme.example  ",
+    "mail.acme.example", "a.b.acme.example",
+])
+def test_a_listed_domain_is_recognised_however_it_arrives(domain):
+    assert do_not_contact_domain_match(domain, ["acme.example"]) == "acme.example"
+
+
+@pytest.mark.parametrize("domain", [
+    "notacme.example",          # the suffix test a blocklist usually gets wrong
+    "acme.example.evil.test",   # the listed name as a leading label
+    "other.example", "", "   ",
+])
+def test_a_lookalike_domain_is_left_alone(domain):
+    assert do_not_contact_domain_match(domain, ["acme.example"]) == ""
+
+
+def test_an_address_entry_does_not_exclude_its_company():
+    """"jane@acme.example" bars one mailbox, not the company behind it. A
+    colleague is still worth reaching, so the company stays discoverable and
+    only the gate stops mail to Jane."""
+    assert do_not_contact_domain_match("acme.example", ["jane@acme.example"]) == ""
+
+
+def test_address_and_domain_entries_coexist():
+    entries = ["jane@other.example", "acme.example"]
+    assert do_not_contact_domain_match("acme.example", entries) == "acme.example"
+    assert do_not_contact_domain_match("other.example", entries) == ""
+
+
+def test_an_entry_pasted_as_a_url_still_covers_the_domain():
+    assert do_not_contact_domain_match(
+        "acme.example", ["https://www.acme.example/about"]) == "acme.example"
+
+
+def test_an_empty_list_matches_nothing():
+    assert do_not_contact_domain_match("acme.example", []) == ""

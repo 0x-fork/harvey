@@ -1174,6 +1174,11 @@ class DiscoveryReport:
     actual_cost: float = 0.0
     found: int = 0
     junk: int = 0
+    # Counted apart from `junk` on purpose: junk is a judgement about whether
+    # a result is a business at all, this is a company the operator has
+    # forbidden. Folding them together would hide a do-not-contact list that
+    # has grown too broad inside a number nobody questions.
+    excluded: int = 0
     new_companies: int = 0
     known_companies: int = 0
     observations: int = 0
@@ -1187,6 +1192,7 @@ class DiscoveryReport:
             "estimated_cost": round(self.estimated_cost, 4),
             "actual_cost": round(self.actual_cost, 4),
             "found": self.found, "junk": self.junk,
+            "excluded": self.excluded,
             "new_companies": self.new_companies,
             "known_companies": self.known_companies,
             "observations": self.observations,
@@ -1356,7 +1362,8 @@ async def run_discovery(
     every time: the first small trial is what exposes the data-quality
     problems that would otherwise poison every market you scale to.
     """
-    from harvey.config import load_env
+    from harvey.config import live_do_not_contact, load_env
+    from harvey.gate import do_not_contact_domain_match
     from harvey.signals import seed_signal_catalog
 
     provider = PROVIDERS.get(provider_key)
@@ -1400,6 +1407,11 @@ async def run_discovery(
         "discover", provider=provider_key,
         params={"queries": len(queries), "estimate": report.estimated_cost},
     )
+
+    # Resolved once per run, not per result: the list may live in a file, and
+    # re-reading it a few hundred times would turn a config lookup into I/O
+    # inside the hot loop.
+    do_not_contact = live_do_not_contact(config)
 
     # Each business's base facts are written once per run; its ranks once per
     # (business, keyword), and again only if a repeat search ranks it better.
@@ -1446,6 +1458,14 @@ async def run_discovery(
                         biz.domain = company_host(biz.domain)
                     if is_junk(biz.domain, biz.raw_title or biz.name):
                         report.junk += 1
+                        continue
+                    # Before the upsert, so a forbidden company never becomes a
+                    # row and never reaches profiling. Checking it at send time
+                    # alone still lets one through discovery, where it costs
+                    # credits to enrich and sits in every cohort until somebody
+                    # notices it by eye.
+                    if do_not_contact_domain_match(biz.domain, do_not_contact):
+                        report.excluded += 1
                         continue
                     ident = biz.identity()
                     if not ident:
