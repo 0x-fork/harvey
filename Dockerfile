@@ -19,8 +19,12 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && playwright install --with-deps chromium \
     && rm -rf /var/lib/apt/lists/* /root/.cache
 
-# Non-root user; owns app data and the shared browser install
-RUN useradd --create-home --uid 1000 harvey \
+# Match the checkout owner on Linux; remain non-root.
+ARG HARVEY_UID=1000
+ARG HARVEY_GID=1000
+RUN test "$HARVEY_UID" -gt 0 && test "$HARVEY_GID" -gt 0 \
+    && groupadd --gid "$HARVEY_GID" harvey \
+    && useradd --create-home --uid "$HARVEY_UID" --gid "$HARVEY_GID" harvey \
     && mkdir -p /app/data \
     && chown -R harvey:harvey /app /ms-playwright
 

@@ -1,40 +1,29 @@
 services:
   harvey:
-    build: .
-    # The dashboard binds 127.0.0.1 only (by design; see _check_loopback_bind).
-    # Host networking puts that bind on the host's loopback, so the WebUI is
-    # reachable at http://127.0.0.1:5555 without exposing it to the network.
-    # Docker deployments are Linux-only for this reason: Docker Desktop on
-    # macOS/Windows has no usable host networking — install from pip there.
+    build:
+      context: .
+      args:
+        HARVEY_UID: ${HARVEY_UID:-1000}
+        HARVEY_GID: ${HARVEY_GID:-1000}
+    # Supported on native Linux. Keep the dashboard's loopback-only bind.
     network_mode: host
-    # WebUI first: the dashboard serves the UI and starts/stops the heartbeat
-    # loop itself (Actions card, /api/harvey/start). Logs land in data/logs/.
-    # The image's ENTRYPOINT is `python -m harvey`, so `docker compose run
-    # --rm harvey <subcommand>` runs any CLI subcommand (setup, train, ...).
     command: ["dashboard"]
-    env_file: .env
     volumes:
-      # Persist database, dashboard token and loop logs across restarts
-      - ./data:/app/data
-      # First-run setup writes /app/.env and updates /app/harvey.yaml.
-      # Bind-mount them back to the host so a rebuilt container keeps its
-      # configuration. Both host files must exist before `docker compose up`
-      # (Docker would create a directory for a missing single-file mount, and
-      # env_file already requires .env). Do NOT pre-create an empty
-      # harvey.local.yaml: any existing file wins over harvey.yaml when config
-      # loads, and an empty one reads as an empty config. To persist a
-      # configuration trained inside a container, copy it out first (see the
-      # Deploy with Docker section of the README) and then uncomment:
-      # - ./harvey.local.yaml:/app/harvey.local.yaml
-      - ./.env:/app/.env
-      - ./harvey.yaml:/app/harvey.yaml
-      # Knowledge, read-only
-      - ./prompts:/app/prompts:ro
-      - ./skills:/app/skills
-      # Mount Claude auth (required for Max plan usage).
-      # Not read-only: the CLI refreshes OAuth tokens in place.
-      # The container runs as non-root user "harvey" (uid 1000).
-      - ~/.claude:/home/harvey/.claude
+      # Mount the checkout directory, not individual config files: setup and
+      # training atomically replace files and create harvey.local.yaml.
+      # Source, configuration, knowledge, and data therefore survive recreation.
+      # Harvey reads .env itself; env_file would pin stale values at creation.
+      - type: bind
+        source: .
+        target: /app
+        bind:
+          create_host_path: false
+      # The Claude CLI refreshes OAuth tokens in place.
+      - type: bind
+        source: ${HOME}/.claude
+        target: /home/harvey/.claude
+        bind:
+          create_host_path: false
     restart: unless-stopped
     init: true
     logging:
