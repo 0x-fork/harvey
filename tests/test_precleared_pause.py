@@ -653,6 +653,42 @@ async def test_quiet_hours_still_wake_for_someone_cleared_after_a_hold(state, mo
 
 
 @pytest.mark.asyncio
+async def test_quiet_hours_find_cleared_follow_up_beyond_first_page(state, monkeypatch):
+    import harvey.agents.sender as sender_module
+
+    monkeypatch.setattr(sender_module, "QUIET_HOURS_SCAN", 2)
+    for email in (JANE, ANN):
+        pid = await seed_at(state, "Tokyo, Japan", email)
+        await approved(state, pid, email)
+    known = await seed_at(state, "Tokyo, Japan", SAM)
+    await approved(state, known, SAM, step=2)
+    await store(state, SAM, OK_BODY)
+    sender = window_sender(state, FakeProvider(), monkeypatch)
+    with_check(sender, httpx.MockTransport(lambda request: httpx.Response(503)))
+    sender.compliance_held = True
+    pin_now(monkeypatch, WED_0200)
+
+    assert await sender.cold_due_in_window()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("corruption", [
+    {"verdict": "unknown"}, {"verdict": None}, {"checked_at": "not-a-date"},
+])
+async def test_waiting_count_matches_cache_rejection(state, corruption):
+    await people(state, [JANE])
+    await store(state, JANE, OK_BODY)
+    key = "precleared:" + JANE
+    entry = json.loads(await state.get_setting(key))
+    entry.update(corruption)
+    await state.set_setting(key, json.dumps(entry))
+    client = PreclearedClient("GB")
+    assert await client.cached(JANE, state) is None
+    now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+    assert await state.count_due_cold_outbox(now, stored_verdicts=client.stored_verdicts()) == 1
+
+
+@pytest.mark.asyncio
 async def test_the_waiting_count_leaves_out_email_to_people_already_cleared(state):
     # One new address and twelve people already cleared; the allowance is
     # used up. The cleared go out as far as the cycle allows and the rest

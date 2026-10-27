@@ -161,10 +161,20 @@ class Sender:
                 since=midnight.astimezone(timezone.utc).replace(tzinfo=None).isoformat()) <= 0:
             return False
         now = _utcnow()
+        due_before = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
         due = await self.state.get_outbox(
-            status="approved", due_before=datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+            status="approved", due_before=due_before,
             limit=QUIET_HOURS_SCAN, skip_unready_follow_ups=True, kind="sequence",
         )
+        if self.compliance_held and self.precleared is not None:
+            # Match the drain's separate follow-up scan: waiting first emails
+            # must not hide a cleared follow-up and prevent the loop waking.
+            seen = {item["id"] for item in due}
+            follow_ups = await self.state.get_outbox(
+                status="approved", due_before=due_before,
+                limit=QUIET_HOURS_SCAN, skip_unready_follow_ups=True, follow_ups_only=True,
+            )
+            due += [item for item in follow_ups if item["id"] not in seen]
         for item in due:
             if item["kind"] != "sequence":
                 continue

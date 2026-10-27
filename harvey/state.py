@@ -1142,7 +1142,10 @@ class StateManager:
                     "AND CASE WHEN json_valid(s.value) "
                     "THEN json_extract(s.value, '$.inputs') END = ? "
                     "AND CASE WHEN json_valid(s.value) "
-                    "THEN json_extract(s.value, '$.checked_at') END >= ?)")
+                    "THEN json_extract(s.value, '$.verdict') END "
+                    "IN ('ok_to_email', 'consent_needed', 'blocked') "
+                    "AND CASE WHEN json_valid(s.value) "
+                    "THEN julianday(json_extract(s.value, '$.checked_at')) END >= julianday(?))")
             params += list(stored_verdicts)
         async with self._connect() as db:
             async with db.execute(sql, params) as cursor:
