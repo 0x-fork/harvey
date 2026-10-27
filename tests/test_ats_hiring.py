@@ -402,6 +402,7 @@ def test_the_hiring_preset_falls_back_to_titles_and_needs_search():
     assert len(terms) == 1 and '"ceo"' in terms[0]
     assert preset_problem("hiring", "osm")
     assert preset_problem("hiring", "serper") is None
+    assert preset_problem("hiring", "tinyfish") is None
     assert "hiring" in PRESETS
 
 

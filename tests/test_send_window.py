@@ -284,13 +284,13 @@ def test_icp_country():
 
 
 @pytest.mark.asyncio
-async def test_recipient_country_uses_the_stored_zone_when_the_text_is_a_guess(state):
-    # "Berlin, DE" alone is a guess, but a zone stored on the prospect (from
-    # Precleared's country, or a location Harvey could read) is certain.
+async def test_recipient_country_does_not_promote_a_stored_zone_to_evidence(state):
+    # Stored zones have no provenance: they can come from approximate
+    # coordinates or a previous location, so they cannot settle the country.
     pid = await seed_at(state, "Berlin, DE", "lena@de-acme.example")
     assert await recipient_country(state, await state.get_prospect(pid)) == ""
     await state.set_prospect_timezone(pid, "Europe/Berlin")
-    assert await recipient_country(state, await state.get_prospect(pid)) == "DE"
+    assert await recipient_country(state, await state.get_prospect(pid)) == ""
     assert await recipient_country(state, None) == ""
 
 
@@ -318,6 +318,13 @@ async def test_a_zone_stored_from_coordinates_alone_gives_no_country(state):
     prospect = await state.get_prospect(pid)
     assert prospect.timezone == "America/Vancouver"
     assert await recipient_country(state, prospect) == ""
+    # Losing the geocoding cache must not turn the approximate zone into fact.
+    await state.set_setting("geo:seattle", "-")
+    assert await recipient_country(state, prospect) == ""
+
+
+def test_faraway_coordinates_do_not_settle_an_ambiguous_country_code():
+    assert country_for("Example, IN", point="-33.87,151.21")[1] is False
 
 
 # ── The window ──

@@ -38,8 +38,8 @@ works.
 The same reading gives Precleared the recipient's country, when the check
 is on (``recipient_country``). Only a country Harvey is sure of goes: one
 named in the location, the country of a state or province named there, a
-code that is a region and a country too once the cached coordinates settle
-it, or the zone already stored on the prospect, mapped back to its country.
+code that is a region and a country too once nearby cached coordinates settle
+it. A stored time zone alone has no country provenance and does not count.
 A code read by convention alone, a state reading the coordinates
 contradict, and coordinates by themselves (the nearest reference city can
 be over a border) send nothing, because Precleared takes the country it is
@@ -456,6 +456,12 @@ def country_for(location: str = "", point: str = "") -> tuple[str, bool]:
     country, guessed = _country(parts, coords)
     if guessed:
         return country, False
+    ambiguous = "" if _country_in(parts) else _ambiguous_code(parts)
+    if ambiguous and coords:
+        region_zone = _region(parts, REGION_COUNTRY[ambiguous], "")
+        country_zone = _country_zone(ambiguous, coords)
+        if min(_ref_km(coords, region_zone), _ref_km(coords, country_zone)) > MAX_REGION_KM:
+            return "", False
     zone = _region(parts, country, "")
     if zone and coords and _ref_km(coords, zone) > MAX_REGION_KM:
         # The state was a misreading ("Perth, WA" in Australia): see _resolve.
@@ -597,13 +603,8 @@ async def recipient_country(state, prospect) -> str:
     country, certain = country_for(location, point)
     if certain:
         return country
-    zone = getattr(prospect, "timezone", "")
-    if zone and not _point(point):
-        # Stored from the location or from Precleared's country, both
-        # certain. With coordinates cached it may have come from them alone
-        # (the nearest reference city, which can be over a border), so it
-        # doesn't count.
-        return zone_country(zone)
+    # A stored zone may come from approximate coordinates or stale location
+    # data. Without provenance, it must not override Precleared's evidence.
     return ""
 
 

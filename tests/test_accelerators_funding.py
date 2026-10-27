@@ -293,6 +293,7 @@ def test_the_funding_preset_searches_recent_announcements():
 def test_the_presets_need_a_search_provider(preset):
     assert preset_problem(preset, "osm")
     assert preset_problem(preset, "serper") is None
+    assert preset_problem(preset, "tinyfish") is None
 
 
 @pytest.mark.parametrize("domain", [

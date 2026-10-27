@@ -382,3 +382,48 @@ async def test_one_request_budget_covers_everything_scout_fetches_for_a_company(
 ])
 def test_ordinary_page_text_is_not_a_challenge(page):
     assert not Scout._looks_blocked(page)
+
+
+@pytest.mark.asyncio
+async def test_scout_search_tinyfish():
+    import json
+    scout = site_scout({})
+    payload = {
+        "query": "Denver roofers",
+        "results": [
+            {"title": "Summit", "url": "https://summit.example", "snippet": "Roofing in Denver"},
+            {"title": "No URL", "snippet": "Ignored"},
+        ],
+    }
+
+    async def fake_fetch(url, headers=None, retries=2):
+        assert "api.search.tinyfish.ai" in url
+        assert headers.get("X-API-Key") == "tf_key"
+        resp = SimpleNamespace(
+            json=lambda: payload,
+            text=json.dumps(payload),
+            status_code=200,
+        )
+        return resp
+
+    scout._fetch = fake_fetch
+    results = await scout._search_tinyfish("Denver roofers", "tf_key")
+    assert len(results) == 1
+    assert results[0] == ("https://summit.example", "Roofing in Denver")
+
+
+@pytest.mark.asyncio
+async def test_scout_search_web_uses_tinyfish_backend():
+    scout = site_scout({})
+    scout.env.tinyfish_api_key = "tf_key"
+    called = []
+
+    async def fake_tinyfish(query, key):
+        called.append(("tinyfish", query, key))
+        return [("https://summit.example", "Roofing in Denver")]
+
+    scout._search_tinyfish = fake_tinyfish
+    results = await scout._web_search("Denver roofers")
+    assert called == [("tinyfish", "Denver roofers", "tf_key")]
+    assert len(results) == 1
+    assert results[0][0] == "https://summit.example"

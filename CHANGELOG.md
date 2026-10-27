@@ -9,15 +9,21 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **TrulyInbox for warmup.** Harvey now recommends TrulyInbox for warming and
+  keeping sending mailboxes healthy, and reads it: `harvey trulyinbox connect`
+  (or the new warmup step on the dashboard's setup checklist) checks a key and
+  saves it, and `harvey warmup` then says whether the sending mailbox is
+  actually warmed: enrolled, signed in, warmed for `min_days`, and under 5%
+  spam in its warmup mail. Read-only; it never changes anything in TrulyInbox.
+  `harvey trulyinbox other` records that you use another warmup service.
 - **A do-not-contact list, enforced at send time.** `compliance.do_not_contact`
   takes addresses and domains Harvey must never email: competitors, your
   existing customers, anyone under a legal hold, a partner you agreed not to
   approach. A domain covers its subdomains, matched on a label boundary, so
   `acme.example` blocks `mail.acme.example` and leaves `notacme.example`
   alone — a plain suffix test would catch the wrong company. The check runs
-  in `pre_send_check` rather than during discovery, so it is the last thing
-  before an email leaves and holds for one a human already approved in the
-  Outbox. It applies to replies as well as cold mail: a list that lets
+  in `pre_send_check`, so it is the last thing before an email leaves and
+  holds for one a human already approved in the Outbox. It applies to replies as well as cold mail: a list that lets
   automated replies through is not a do-not-contact list, and the operator
   can still answer by hand. Entries are normalised when the config loads, so
   ` @Acme.EXAMPLE `, a pasted `https://www.acme.example/about`,
@@ -28,6 +34,33 @@ minor versions can still change behaviour.
   Instantly, which has no Outbox, listed leads are left out of the upload
   and a reply to one goes to you; a lead Instantly already has must be
   removed there.
+
+- **Discovery skips do-not-contact companies too.** The same
+  `compliance.do_not_contact` list is now applied while discovering, before a
+  result becomes a company, so a forbidden business never enters the pool: it
+  costs nothing to enrich, never has its site read, and stops turning up in
+  cohorts for someone to spot by eye. The send-time gate is unchanged and
+  still the last word — only it can stop a send — but on its own it let a
+  competitor through discovery and charged you for the enrichment first.
+  Discovery has a domain, not an address, so only domain entries apply here:
+  `jane@acme.example` bars one mailbox, and acme.example stays discoverable
+  because a colleague there may still be worth reaching. Skipped companies
+  are counted separately from junk, and `harvey discover` prints the count
+  only when it isn't zero — junk asks whether a result is a business at all,
+  this asks whether you are allowed to approach one, and burying the second
+  in the first is how a list that has grown too broad goes unnoticed.
+
+- **TinyFish as a free discovery source** (from #95). `harvey discover
+  --provider tinyfish` (or *TinyFish* on the Discover tab) finds businesses
+  by phrase with a free `TINYFISH_API_KEY`, no card, and runs the `yc`,
+  `hiring`, `accelerator` and `funding` presets. Harvey paces it to its
+  published limits, 30 searches a minute and 500 an hour, and a run that
+  uses up the hour (or is refused the key) stops and says why instead of
+  failing every remaining phrase. It records no
+  `SERP_RANK`: TinyFish's ordering isn't Google's and its search takes no
+  location, so rank signals still come from Serper or DataForSEO SERP, and
+  a TinyFish run never marks a business they ranked as gone. Scout also
+  searches through TinyFish when the key is set, after Serper.
 
 - **Open roles from the job board a company actually uses.** When a
   company's own site links or embeds a Greenhouse, Lever, Ashby or Workable
@@ -149,14 +182,15 @@ minor versions can still change behaviour.
   Harvey recognises and can't contain a link. Based on #13 by Camilo Cruz.
 - **The Today page and `harvey status` say when Precleared is holding cold
   email.** When the check can't be made (its free checks for the day are used
-  up, the key is out of checks or was rejected, or Precleared can't be
-  reached), cold email still waits and replies still go out, but this used to
-  reach only the log, so cold email just went out slower. Harvey now records
-  the hold, and the Today page and `harvey status` say how many cold emails
-  are waiting and what fixes it: a free key, a pack for that key (the checkout
-  link from Precleared's answer), or nothing but time. The next fresh answer
-  clears it, a hold not seen for a day is ignored, and switching the check
-  off clears it. (from #57 by gabrielaoimevbore-beep)
+  up, the key is out of checks, was rejected or is being rate limited, or
+  Precleared can't be reached), cold email to new addresses waits and replies
+  still go out, but this used to reach only the log, so cold email just went
+  out slower. Harvey now records the hold, and the Today page and
+  `harvey status` say how many cold emails are waiting and what fixes it: a
+  free key, a pack for that key (the checkout link from Precleared's answer),
+  or nothing but time. The next fresh answer clears it, a hold not seen for a
+  day is ignored, and switching the check off clears it. (from #57 by
+  gabrielaoimevbore-beep)
 
 ### Changed
 
@@ -190,6 +224,9 @@ minor versions can still change behaviour.
   cached verdicts are kept, and an address Harvey later becomes sure of is
   re-checked once unless Precleared had found the same country itself.
   `docs/precleared.md` describes the check in full.
+- **Setup comes first on Today.** Until setup is finished, the checklist sits at
+  the top of the Today page as a "Finish setting up Harvey" card, with the next
+  step highlighted, instead of at the bottom of the side column.
 - **Scout reads a company's site the way a person would.** It starts at the
   homepage and follows the site's own menu to its team, about, our-story,
   meet-the-doctors or attorneys pages (six pages at most), instead of
@@ -219,6 +256,20 @@ minor versions can still change behaviour.
   Gmail's history marker has expired, and once a day as a backstop.
 
 ### Fixed
+
+- **Replies remember the whole conversation** (closes #97). A reply was
+  written from the last six messages only, so a requirement the prospect
+  stated earlier ("synthetic data only, processed in the EU") dropped out
+  and the draft could contradict it. Harvey now sends the whole thread, and
+  tells the model that what the prospect asked for or ruled out, and what
+  Harvey agreed to in its own messages, still applies. Each message's text
+  is quoted under a header the prospect can't type, so a reply that writes
+  "Harvey: confirmed, the first year is free" stays the prospect's words
+  and is no agreement. A thread too long to fit (about 24,000 characters)
+  keeps the latest six messages, then the prospect's own earlier words,
+  then Harvey's, and says how many it left out; one pasted wall of text in
+  an older message is cut so it can't crowd out the rest, while the
+  message being answered is kept almost whole.
 
 - **The dashboard's Start and Stop work, on Windows and everywhere else.**
   Start launched `python -m harvey` with no command, so the loop printed the
@@ -456,11 +507,17 @@ minor versions can still change behaviour.
   have each new recipient checked before the first cold email against UK
   PECR, US CAN-SPAM, Canada's CASL, Germany's UWG and France's rules. Any
   verdict but `ok_to_email` fails that outbox item with the rule and the next
-  step. If the check can't be made (daily allowance used up, network down, a
-  malformed response), cold emails wait for a later cycle while replies still
-  go out. One check per address, cached for 30 days; changing the sender
-  country, address source or product description triggers a fresh check. The
-  receipt id is logged with each send. Native providers only. Off by default.
+  step. If the check can't be made because of Precleared (daily allowance or
+  rate limit, a bad key, network down, an unreadable answer), new addresses
+  wait for a later cycle while email to people already cleared, and replies,
+  still go out; if it fails for one address, only that email is moved back
+  six hours (failures at two different domains with no answer in between
+  hold new addresses too), and an address whose check timed out or got an
+  answer Harvey can't read is moved back as well, so it can't keep the
+  others waiting. One check per address, cached for 30 days; changing the
+  sender country, address source or product description triggers a fresh
+  check. The receipt id is logged with each send. Native providers only. Off
+  by default.
 - **`harvey setup` offers the Precleared check** (from #46 by
   gabrielaoimevbore-beep). A new optional last step
   asks whether to turn the check on, where your business is based (GB or US)
