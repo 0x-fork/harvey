@@ -12,7 +12,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import aiosqlite
@@ -776,8 +776,12 @@ async def get_stats():
         actions = await query_db("SELECT COUNT(*) as count FROM actions")
         action_count = actions[0]["count"] if actions else 0
 
+        # usage_log rows are keyed by the LOCAL date (increment_usage /
+        # get_usage_today use date.today()); SQLite's date('now') is UTC and
+        # can select a different day's counts on either side of UTC midnight.
         usage = await query_db(
-            "SELECT claude_calls, codex_calls FROM usage_log WHERE date = date('now')"
+            "SELECT claude_calls, codex_calls FROM usage_log WHERE date = ?",
+            (date.today().isoformat(),),
         )
         usage_today = (usage[0]["claude_calls"] or 0) if usage else 0
         codex_today = (usage[0]["codex_calls"] or 0) if usage else 0
