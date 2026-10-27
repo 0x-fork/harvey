@@ -23,7 +23,7 @@ from harvey.config import (
     compliance_of, live_do_not_contact, operator_timezone, send_window_of,
 )
 from harvey.gate import autopilot_review, do_not_contact_match, pre_send_check
-from harvey.send_window import in_window, next_send_time, recipient_zone
+from harvey.send_window import in_window, next_send_time, recipient_country, recipient_zone
 from harvey.integrations.instantly import InstantlyClient
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
 from harvey.integrations.precleared import PreclearedClient, clear_hold, record_hold
@@ -114,32 +114,53 @@ class Sender:
             and self.provider is not None
         )
 
-    async def _send_zone(self, prospect, country: str = "") -> str:
+    async def _send_zone(self, prospect, country: str = "", given: str = "") -> str:
         """The time zone this recipient's send window is in: their own when
         it can be told (with recipient_timezone on), otherwise the zone in
-        usage.quiet_hours, as before."""
+        usage.quiet_hours, as before. ``country`` is the recipient's country
+        from Precleared, ``given`` the one Harvey gave the check (see
+        _recipient_country), which a cached verdict is keyed on."""
         window = send_window_of(self.config)
         if window is not None and window.recipient_timezone:
             if not country and self.precleared is not None and prospect is not None:
                 # A country Precleared already found counts on every check,
                 # not only on the one that asked it.
-                country = await self.precleared.known_country(prospect.email, self.state)
+                country = await self.precleared.known_country(prospect.email, self.state, given)
             zone = await recipient_zone(self.state, prospect, self.config, country)
             if zone:
                 return zone
         return operator_timezone(self.config)
 
-    async def _zone_or_default(self, prospect, country: str = "") -> str:
+    async def _zone_or_default(self, prospect, country: str = "", given: str = "") -> str:
         """_send_zone, but a failure to work the zone out falls back to
         usage.quiet_hours.timezone for this one email instead of stopping
         the whole drain (replies included)."""
         try:
-            return await self._send_zone(prospect, country)
+            return await self._send_zone(prospect, country, given)
         except Exception as e:
             logger.warning(
                 f"Sender: couldn't work out the time zone for "
                 f"{getattr(prospect, 'email', '?')}, using quiet_hours.timezone: {e}")
             return operator_timezone(self.config)
+
+    async def _recipient_country(self, prospect) -> str:
+        """The recipient's country when Harvey is sure of it, for the
+        compliance check (see send_window.recipient_country). A failure to
+        work it out means none for this one email, which Precleared then
+        works out itself, instead of stopping the drain."""
+        try:
+            return await recipient_country(self.state, prospect)
+        except Exception as e:
+            logger.warning(
+                f"Sender: couldn't work out the country for "
+                f"{getattr(prospect, 'email', '?')}, leaving it to Precleared: {e}")
+            return ""
+
+    async def _has_cached_verdict(self, item: dict) -> bool:
+        """Use the send loop's recipient facts when counting held email."""
+        prospect = await self.state.get_prospect(item["prospect_id"])
+        country = await self._recipient_country(prospect)
+        return await self.precleared.cached(item["to_email"], self.state, country) is not None
 
     async def cold_due_in_window(self) -> bool:
         """Quiet hours: whether a cold email is due, inside its recipient's
@@ -178,15 +199,16 @@ class Sender:
         for item in due:
             if item["kind"] != "sequence":
                 continue
+            prospect = await self.state.get_prospect(item["prospect_id"])
+            country = await self._recipient_country(prospect) if self.precleared is not None else ""
             if self.compliance_held and self.precleared is not None:
                 # New addresses wait for a drain outside quiet hours; a
                 # stored verdict still lets email go, as in the drain.
-                clearance = await self.precleared.cached(item["to_email"], self.state)
+                clearance = await self.precleared.cached(item["to_email"], self.state, country)
                 if clearance is None or not clearance.allowed:
                     continue
-            prospect = await self.state.get_prospect(item["prospect_id"])
             if prospect is not None and in_window(
-                    now, await self._zone_or_default(prospect), window):
+                    now, await self._zone_or_default(prospect, given=country), window):
                 return True
         return False
 
@@ -848,10 +870,14 @@ class Sender:
             if order:
                 await self.state.update_outbox_item(item["id"], status=order[0], error=order[1])
                 continue
+            # The recipient's country when Harvey is sure of it: it goes with
+            # the compliance check, and a cached verdict is keyed on it.
+            country = await self._recipient_country(prospect) if needs_check else ""
             # Cold email waits for the recipient's send window, however
             # late it was approved; replies don't.
             if (window is not None and item["kind"] == "sequence"
-                    and await self._outside_window(item, await self._zone_or_default(prospect), window)):
+                    and await self._outside_window(
+                        item, await self._zone_or_default(prospect, given=country), window)):
                 outside_window += 1
                 continue
 
@@ -862,7 +888,7 @@ class Sender:
                 # A stored verdict still counts once checks are paused, so
                 # people already cleared keep getting their follow-ups; only
                 # new addresses wait for the next cycle.
-                clearance = await self.precleared.cached(item["to_email"], self.state)
+                clearance = await self.precleared.cached(item["to_email"], self.state, country)
                 if clearance is None and (compliance_paused
                                           or check_seconds > CHECK_SECONDS_PER_CYCLE):
                     waiting_on_check += 1
@@ -873,7 +899,7 @@ class Sender:
                     continue
                 if clearance is None:
                     started = time.monotonic()
-                    clearance = await self.precleared.check(item["to_email"], self.state)
+                    clearance = await self.precleared.check(item["to_email"], self.state, country)
                     check_seconds += time.monotonic() - started
                 if clearance.held and not clearance.pause_checks:
                     # Possibly about this address alone: move its email back,
@@ -1027,7 +1053,7 @@ class Sender:
                 # budget; count every cold email still waiting on the check:
                 # due with no stored verdict to go on, or moved back by it.
                 waiting_on_check = max(waiting_on_check, await self.state.count_due_cold_outbox(
-                    now, stored_verdicts=self.precleared.stored_verdicts(),
+                    now, has_cached_verdict=self._has_cached_verdict,
                     moved_back_prefix=RECHECK_PREFIX))
                 await record_hold(self.state, hold, waiting_on_check)
             elif answered:

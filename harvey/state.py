@@ -11,6 +11,7 @@ upgrade cleanly in place.
 
 import json
 import uuid
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
@@ -1112,6 +1113,7 @@ class StateManager:
         due_before: str,
         stored_verdicts: tuple[str, str, str] | None = None,
         moved_back_prefix: str = "",
+        has_cached_verdict: Callable[[dict], Awaitable[bool]] | None = None,
     ) -> int:
         """Approved cold email due by ``due_before``, leaving out follow-ups
         whose previous step hasn't gone out yet (as get_outbox's
@@ -1121,7 +1123,9 @@ class StateManager:
         compliance check's stored verdicts; email to an address with one
         still usable doesn't wait on the check, so it's left out.
         moved_back_prefix: also count approved cold email whose error starts
-        with it (moved back by the check), due or not."""
+        with it (moved back by the check), due or not.
+        has_cached_verdict: optional per-recipient cache check, for facts
+        such as country that differ between recipients. Never calls an API."""
         due = "(o.send_at IS NULL OR o.send_at <= ?)"
         params: list = [due_before]
         if moved_back_prefix:
@@ -1148,8 +1152,20 @@ class StateManager:
                     "THEN julianday(json_extract(s.value, '$.checked_at')) END >= julianday(?))")
             params += list(stored_verdicts)
         async with self._connect() as db:
-            async with db.execute(sql, params) as cursor:
-                return (await cursor.fetchone())[0]
+            if has_cached_verdict is not None:
+                db.row_factory = aiosqlite.Row
+                sql = sql.replace("SELECT COUNT(*)", "SELECT o.prospect_id, o.to_email", 1)
+                async with db.execute(sql, params) as cursor:
+                    items = [dict(row) for row in await cursor.fetchall()]
+            else:
+                async with db.execute(sql, params) as cursor:
+                    return (await cursor.fetchone())[0]
+        # Close the query connection before the callback reads recipient facts.
+        waiting = 0
+        for item in items:
+            if not await has_cached_verdict(item):
+                waiting += 1
+        return waiting
 
     async def get_outbox_item(self, item_id: str) -> dict | None:
         async with self._connect() as db:

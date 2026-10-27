@@ -189,12 +189,14 @@ async def test_prospect_country_is_sent_as_a_fallback_only_when_set(state):
     without = PreclearedClient("US", transport=mock_precleared(calls, OK_BODY))
     await without.clear("jane@acme.com", state)
     assert "default_recipient_country" not in calls[0]["json"]
+    assert "recipient_country" not in calls[0]["json"]
 
     with_country = PreclearedClient(
         "US", prospect_country="US", transport=mock_precleared(calls, OK_BODY),
     )
     await with_country.clear("john@acme.com", state)
     assert calls[1]["json"]["default_recipient_country"] == "US"
+    assert "recipient_country" not in calls[1]["json"]
 
 
 @pytest.mark.asyncio
@@ -236,6 +238,135 @@ def test_prospect_country_changes_the_cache_fingerprint_only_when_set():
     base = PreclearedClient("US")._fingerprint()
     assert PreclearedClient("US", prospect_country="")._fingerprint() == base
     assert PreclearedClient("US", prospect_country="US")._fingerprint() != base
+
+
+# ── the recipient's country ──
+
+
+FOUND_GB = {**OK_BODY, "facts": {"recipient_country": "GB", "country_source": "domain"}}
+
+
+@pytest.mark.asyncio
+async def test_confident_country_is_sent_as_recipient_country(state):
+    calls = []
+    client = PreclearedClient("GB", prospect_country="GB", transport=mock_precleared(calls, OK_BODY))
+    await client.clear("jane@acme.com", state, country="US")
+    assert calls[0]["json"]["recipient_country"] == "US"
+    # Never both: the default is for when nobody knows the country.
+    assert "default_recipient_country" not in calls[0]["json"]
+    await client.clear("john@acme.com", state, country="us")
+    assert calls[1]["json"]["recipient_country"] == "US"
+
+
+def _config(geography, prospect_country=""):
+    return SimpleNamespace(
+        compliance=SimpleNamespace(precleared=PreclearedConfig(
+            enabled=True, sender_country="US", prospect_country=prospect_country)),
+        product=SimpleNamespace(description=""),
+        icp=SimpleNamespace(geography=geography, geo_coordinates={}),
+    )
+
+
+def test_icp_country_is_the_default_when_prospect_country_is_unset():
+    env = SimpleNamespace(precleared_api_key="")
+    one = PreclearedClient.from_config(_config(["Austin, TX", "Denver, Colorado"]), env)
+    assert one.default_country == "US" and one.prospect_country == ""
+    assert PreclearedClient.from_config(_config(["Austin, TX", "Toronto, ON"]), env).default_country == ""
+    assert PreclearedClient.from_config(_config([]), env).default_country == ""
+    # prospect_country wins when both exist.
+    both = PreclearedClient.from_config(_config(["Austin, TX"], prospect_country="GB"), env)
+    assert both.prospect_country == "GB" and both.default_country == "GB"
+    # Built directly (the tests' configs have no ICP), the same normalising.
+    assert PreclearedClient("US", default_country="uk").default_country == "GB"
+    assert PreclearedClient("US", prospect_country="GB", default_country="US").default_country == "GB"
+
+
+@pytest.mark.asyncio
+async def test_icp_country_is_sent_as_the_default(state):
+    calls = []
+    client = PreclearedClient("US", default_country="US", transport=mock_precleared(calls, OK_BODY))
+    await client.clear("jane@acme.com", state)
+    assert calls[0]["json"]["default_recipient_country"] == "US"
+    assert "recipient_country" not in calls[0]["json"]
+    await client.clear("john@acme.com", state, country="GB")
+    assert calls[1]["json"]["recipient_country"] == "GB"
+    assert "default_recipient_country" not in calls[1]["json"]
+
+
+def test_country_changes_the_fingerprint_only_when_set():
+    client = PreclearedClient("US")
+    base = client._fingerprint()
+    assert client._fingerprint("") == base
+    assert client._fingerprint("GB") != base
+    assert client._fingerprint("GB") != client._fingerprint("US")
+    # A default is no part of the question once the country is known.
+    assert PreclearedClient("US", prospect_country="GB")._fingerprint("US") == client._fingerprint("US")
+    # The ICP's country counts only while it stands in for prospect_country,
+    # so verdicts cached under prospect_country are untouched by it.
+    assert PreclearedClient("US", default_country="US")._fingerprint() != base
+    assert (PreclearedClient("US", prospect_country="GB", default_country="US")._fingerprint()
+            == PreclearedClient("US", prospect_country="GB")._fingerprint())
+
+
+@pytest.mark.asyncio
+async def test_a_verdict_cached_without_a_country_is_kept_when_there_is_still_none(state):
+    calls = []
+    client = PreclearedClient("US", transport=mock_precleared(calls, OK_BODY))
+    await client.clear("jane@acme.com", state)
+    await client.clear("jane@acme.com", state)
+    assert (await client.clear("jane@acme.com", state, country="")).cached
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_new_confident_country_forces_one_fresh_check_then_caches(state):
+    # OK_BODY names no country, so a country now known is a new question:
+    # one more check, then cached again.
+    calls = []
+    client = PreclearedClient("US", transport=mock_precleared(calls, OK_BODY))
+    await client.clear("jane@acme.com", state)
+    await client.clear("jane@acme.com", state, country="GB")
+    await client.clear("jane@acme.com", state, country="GB")
+    assert len(calls) == 2
+    assert calls[1]["json"]["recipient_country"] == "GB"
+
+
+@pytest.mark.asyncio
+async def test_a_verdict_precleared_decided_for_the_same_country_is_kept(state):
+    # Cached before Harvey sent countries, with the one Precleared found
+    # itself: Harvey now knowing the same one asks the same question.
+    calls = []
+    client = PreclearedClient("US", transport=mock_precleared(calls, FOUND_GB))
+    await client.clear("jane@acme.com", state)
+    again = await client.clear("jane@acme.com", state, country="GB")
+    assert again.cached and again.country == "GB" and len(calls) == 1
+    assert await client.known_country("jane@acme.com", state, "GB") == "GB"
+    # A different country is a different question.
+    await client.clear("jane@acme.com", state, country="IE")
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_known_country_uses_the_same_fingerprint_as_clear(state):
+    calls = []
+    found_us = {**OK_BODY, "facts": {"recipient_country": "US"}}
+    client = PreclearedClient("GB", transport=mock_precleared(calls, found_us))
+    await client.clear("jane@acme.com", state, country="US")
+    assert await client.known_country("jane@acme.com", state, "US") == "US"
+    assert await client.known_country("jane@acme.com", state) == ""   # a different question
+    assert await client.known_country("jane@acme.com", state, "GB") == ""
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", ["GBR", "g b", None, 12, "G1", " "])
+async def test_bad_country_values_are_dropped_not_raised(state, bad):
+    calls = []
+    client = PreclearedClient("US", transport=mock_precleared(calls, FOUND_GB))
+    assert (await client.clear("jane@acme.com", state, country=bad)).allowed
+    assert "recipient_country" not in calls[0]["json"]
+    # Treated as no country throughout, so the cached verdict is found.
+    assert await client.known_country("jane@acme.com", state, bad) == "GB"
 
 
 # ── verdicts ──

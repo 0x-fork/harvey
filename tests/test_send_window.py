@@ -1,7 +1,8 @@
 """Send windows in the recipient's own time zone (#53): working out each
 recipient's zone, the window maths (DST, weekends, windows that cross UTC
 midnight), staging and draining through the outbox, Precleared's country
-filling a gap, and quiet hours that no longer hold due mail.
+filling a gap, and quiet hours that no longer hold due mail. Also the
+country Harvey works out the same way and gives Precleared, when it is sure.
 
 No network and no real clock where it matters: the sender's clock is pinned
 with monkeypatch, and Precleared calls go to an httpx.MockTransport.
@@ -28,7 +29,8 @@ from harvey.integrations.precleared import SETTINGS_PREFIX, PreclearedClient
 from harvey.models.company import Company
 from harvey.models.prospect import Prospect
 from harvey.send_window import (
-    START_SPREAD, in_window, next_send_time, recipient_zone, zone_for,
+    START_SPREAD, country_for, icp_country, in_window, next_send_time, recipient_country,
+    recipient_zone, zone_country, zone_for,
 )
 from harvey.state import MIGRATIONS, StateManager
 from tests.test_outbox_native import FakeProvider, make_sender, seed_campaign
@@ -213,6 +215,116 @@ def test_two_letter_code_that_is_a_state_and_a_country():
 def test_code_that_is_a_region_and_a_country_is_settled_by_what_else_is_known(
         location, country, point, zone):
     assert zone_for(location, country=country, point=point) == zone
+
+
+# ── The country, for Precleared ──
+
+def test_country_for_names_a_country():
+    assert country_for("Oslo, Norway") == ("NO", True)
+    assert country_for("London, UK") == ("GB", True)
+    assert country_for("Austin, TX") == ("US", True)
+    assert country_for("Toronto, ON") == ("CA", True)
+    assert country_for("Montréal, Québec") == ("CA", True)
+    assert country_for("Sydney NSW 2000") == ("AU", True)
+    assert country_for("Perth, WA, Australia", point="-31.95,115.86") == ("AU", True)
+    assert country_for("United States") == ("US", True)
+
+
+def test_country_for_treats_a_state_and_country_code_as_a_guess():
+    # Delaware by convention, so not certain; Berlin's coordinates settle it.
+    assert country_for("Berlin, DE") == ("US", False)
+    assert country_for("Berlin, DE", point="52.52,13.40") == ("DE", True)
+    assert country_for("Dublin, CA", point="37.70,-121.94") == ("US", True)
+    assert country_for("Denver, CO") == ("US", False)       # CO is Colombia's code too
+    assert country_for("Amsterdam, NL") == ("NL", False)    # or Newfoundland
+
+
+def test_country_for_does_not_trust_coordinates_alone():
+    # The state reading is vetoed and nothing names the country.
+    assert country_for("Perth, WA", point="-31.95,115.86") == ("", False)
+    assert country_for("", point="-31.95,115.86") == ("", False)
+    # The nearest reference city to Seattle is Vancouver's: fine for the
+    # clock, wrong for the law.
+    assert country_for("Seattle", point="47.61,-122.33") == ("", False)
+
+
+def test_country_for_has_nothing_for_a_bare_city():
+    assert country_for("London") == ("", False)
+    assert country_for("Remote") == ("", False)
+    assert country_for("") == ("", False)
+
+
+def test_zone_country():
+    assert zone_country("Europe/London") == "GB"
+    assert zone_country("America/Chicago") == "US"
+    assert zone_country("Australia/Perth") == "AU"
+    assert zone_country("Nowhere/Zone") == ""
+    assert zone_country("") == ""
+    # No zone is listed under two countries, so the inversion is exact.
+    zones = [z for zones in pytz.country_timezones.values() for z in zones]
+    assert len(zones) == len(set(zones))
+
+
+def _icp(geography, coordinates=None):
+    return SimpleNamespace(icp=SimpleNamespace(geography=geography, geo_coordinates=coordinates or {}))
+
+
+def test_icp_country():
+    assert icp_country(_icp(["Denver, Colorado", "Austin, TX"])) == "US"
+    assert icp_country(_icp(["United States"])) == "US"
+    assert icp_country(_icp(["Denver, CO", "Toronto, ON"])) == ""
+    assert icp_country(_icp(["London"])) == ""
+    assert icp_country(_icp(["Austin, TX", ""])) == ""
+    assert icp_country(_icp([])) == ""
+    assert icp_country(SimpleNamespace()) == ""
+    # "CO" is Colombia's code too: a guess unless the coordinates settle it.
+    assert icp_country(_icp(["Denver, CO"])) == ""
+    assert icp_country(_icp(["Denver, CO"], {"Denver, CO": "39.7392,-104.9903,50"})) == "US"
+    assert icp_country(HarveyConfig(**{**BASE, "icp": {**BASE["icp"], "geography": ["Oslo, Norway"]}})) == "NO"
+
+
+@pytest.mark.asyncio
+async def test_recipient_country_does_not_promote_a_stored_zone_to_evidence(state):
+    # Stored zones have no provenance: they can come from approximate
+    # coordinates or a previous location, so they cannot settle the country.
+    pid = await seed_at(state, "Berlin, DE", "lena@de-acme.example")
+    assert await recipient_country(state, await state.get_prospect(pid)) == ""
+    await state.set_prospect_timezone(pid, "Europe/Berlin")
+    assert await recipient_country(state, await state.get_prospect(pid)) == ""
+    assert await recipient_country(state, None) == ""
+
+
+@pytest.mark.asyncio
+async def test_recipient_country_reads_the_location_and_the_cached_coordinates(state):
+    austin = await seed_at(state, "Austin, TX", "jane@tx-acme.com")
+    berlin = await seed_at(state, "Berlin, DE", "lena@de-acme.example")
+    nowhere = await seed_at(state, "", "sam@nowhere-acme.com")
+    assert await recipient_country(state, await state.get_prospect(austin)) == "US"
+    assert await recipient_country(state, await state.get_prospect(berlin)) == ""
+    await state.set_setting("geo:berlin, de", "52.52,13.40")
+    assert await recipient_country(state, await state.get_prospect(berlin)) == "DE"
+    assert await recipient_country(state, await state.get_prospect(nowhere)) == ""
+
+
+@pytest.mark.asyncio
+async def test_a_zone_stored_from_coordinates_alone_gives_no_country(state):
+    # "Seattle" with cached coordinates gets Vancouver's zone (the nearest
+    # reference city, over the border): the right clock, so it is stored,
+    # but not a country to tell Precleared.
+    pid = await seed_at(state, "Seattle", "sam@sea.example")
+    await state.set_setting("geo:seattle", "47.61,-122.33")
+    cfg = SimpleNamespace(compliance=None)
+    assert await recipient_zone(state, await state.get_prospect(pid), cfg) == "America/Vancouver"
+    prospect = await state.get_prospect(pid)
+    assert prospect.timezone == "America/Vancouver"
+    assert await recipient_country(state, prospect) == ""
+    # Losing the geocoding cache must not turn the approximate zone into fact.
+    await state.set_setting("geo:seattle", "-")
+    assert await recipient_country(state, prospect) == ""
+
+
+def test_faraway_coordinates_do_not_settle_an_ambiguous_country_code():
+    assert country_for("Example, IN", point="-33.87,151.21")[1] is False
 
 
 # ── The window ──
@@ -548,6 +660,76 @@ async def test_precleared_keeps_the_country_with_the_cached_verdict(state):
     assert (await odd.clear("x@y.co.uk", state)).country == ""
 
 
+# ── The country Harvey gives Precleared ──
+
+def checked_sender(state, provider, calls, body=OK_GB, **client):
+    """A sender without a window, so only the check matters, on a mocked Precleared."""
+    sender = make_sender(state, provider, require_approval=False)
+    sender.precleared = PreclearedClient(sender_country="GB", transport=precleared_mock(calls, body), **client)
+    return sender
+
+
+@pytest.mark.asyncio
+async def test_sender_passes_the_company_country_to_precleared(state):
+    pid = await seed_at(state, "Austin, TX", "jane@tx-acme.com")
+    await approved(state, pid, "jane@tx-acme.com")
+    calls, provider = [], FakeProvider()
+    ok_us = {**OK_GB, "facts": {"recipient_country": "US"}}
+    # Even with a default configured, a country Harvey is sure of goes instead.
+    await checked_sender(state, provider, calls, ok_us, prospect_country="GB")._drain_due()
+    assert [m["to"] for m in provider.sent] == ["jane@tx-acme.com"]
+    assert calls[0]["recipient_country"] == "US"
+    assert "default_recipient_country" not in calls[0]
+
+
+@pytest.mark.asyncio
+async def test_sender_falls_back_to_prospect_country_as_the_default(state):
+    pid = await seed_at(state, "", "kate@uk-acme.co.uk")
+    await approved(state, pid, "kate@uk-acme.co.uk")
+    calls = []
+    await checked_sender(state, FakeProvider(), calls, prospect_country="GB")._drain_due()
+    assert calls[0]["default_recipient_country"] == "GB"
+    assert "recipient_country" not in calls[0]
+
+
+@pytest.mark.asyncio
+async def test_sender_sends_no_country_for_a_guessed_state_code(state):
+    # "DE" is Delaware by convention and Germany by code: not sure, so nothing.
+    pid = await seed_at(state, "Wilmington, DE", "sam@de-state.example")
+    await approved(state, pid, "sam@de-state.example")
+    calls = []
+    await checked_sender(state, FakeProvider(), calls)._drain_due()
+    assert len(calls) == 1
+    assert "recipient_country" not in calls[0] and "default_recipient_country" not in calls[0]
+
+
+@pytest.mark.asyncio
+async def test_sender_settles_a_state_code_by_the_cached_coordinates(state):
+    pid = await seed_at(state, "Berlin, DE", "lena@de-acme.example")
+    await approved(state, pid, "lena@de-acme.example")
+    await state.set_setting("geo:berlin, de", "52.52,13.40")
+    calls = []
+    ok_de = {**OK_GB, "facts": {"recipient_country": "DE"}}
+    await checked_sender(state, FakeProvider(), calls, ok_de)._drain_due()
+    assert calls[0]["recipient_country"] == "DE"
+
+
+@pytest.mark.asyncio
+async def test_country_lookup_failure_does_not_stop_the_drain(state, monkeypatch):
+    pid = await seed_at(state, "Austin, TX", "jane@tx-acme.com")
+    await approved(state, pid, "jane@tx-acme.com")
+    calls, provider = [], FakeProvider()
+    sender = checked_sender(state, provider, calls)
+
+    async def boom(state, prospect):
+        raise RuntimeError("country lookup failed")
+    monkeypatch.setattr(sender_mod, "recipient_country", boom)
+    await sender._drain_due()
+    # The check still runs, without a country, and the email still sends.
+    assert [m["to"] for m in provider.sent] == ["jane@tx-acme.com"]
+    assert len(calls) == 1 and "recipient_country" not in calls[0]
+
+
 # ── Quiet hours ──
 
 class _Brain:
@@ -720,7 +902,7 @@ async def test_a_zone_that_cannot_be_worked_out_doesnt_stop_the_drain(state, mon
     provider = FakeProvider()
     sender = window_sender(state, provider, monkeypatch, operator_zone="Asia/Tokyo")
 
-    async def boom(prospect, country=""):
+    async def boom(prospect, country="", given=""):
         raise RuntimeError("zone lookup failed")
     monkeypatch.setattr(sender, "_send_zone", boom)
     pin_now(monkeypatch, WED_0200)  # 11:00 in Tokyo, the fallback zone too
