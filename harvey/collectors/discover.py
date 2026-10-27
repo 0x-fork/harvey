@@ -21,11 +21,13 @@ already learned.
 """
 
 import asyncio
+import time
 import base64
 import logging
 import re
 from html import unescape
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import date, timedelta
 from urllib.parse import urlparse
 
 import httpx
@@ -55,10 +57,8 @@ JUNK_DOMAIN_PATTERNS = tuple(re.compile(p, re.I) for p in (
     r"(^|\.)(indeed|glassdoor|ziprecruiter|craigslist|zillow|realtor)\.",
     r"(^|\.)(mapquest|foursquare|tripadvisor|trustpilot|birdeye|expertise)\.",
     r"(directory|listings?|find-?a-|top\d+|best-?of)\.",
-    # job boards & aggregators — the 2026-10-24 serper run surfaced these
-    # constantly for India B2B queries (see reports/2026-10-26-pipeline-review.md)
+    # Job boards, directories, and marketplaces.
     r"(^|\.)(naukri|jobrapido|jobsora|empleos|shine|foundit|timesjobs|freelancer|upwork)\.",
-    r"(^|\.)(jobs?|careers?|vacancies|walkins?)\.",
     # Indian directories & marketplaces
     r"(^|\.)(indiamart|justdial|tradeindia|exportersindia|sulekha|urbanpro|yet5)\.",
     r"(^|\.)(olx|quikr|flipkart|snapdeal|myntra|shopclues|etsy|ebay|alibaba|aliexpress)\.",
@@ -71,6 +71,37 @@ JUNK_DOMAIN_PATTERNS = tuple(re.compile(p, re.I) for p in (
     r"\.(edu|gov|mil)$",
     r"(hospital|healthsystem|medicalcenter)\.",
     r"health\.org$",
+    # startup databases, launch sites and tech press (the YC preset's noise)
+    r"(^|\.)(ycombinator|workatastartup|startupschool|yclist|ycdb|seedtable)\.",
+    r"(^|\.)(crunchbase|techcrunch|wellfound|angel|tracxn|pitchbook)\.",
+    r"(^|\.)(cbinsights|producthunt|f6s|dealroom|growjo|owler|zoominfo)\.",
+    r"(^|\.)github\.com$",
+    # hosted job boards: the company is whoever's board it is, not the host
+    r"(^|\.)(job-)?boards\.(eu\.)?greenhouse\.io$",
+    r"(^|\.)jobs\.(eu\.)?lever\.co$",
+    r"(^|\.)jobs\.ashbyhq\.com$",
+    r"(^|\.)(apply|jobs)\.workable\.com$",
+    r"(^|\.)(jobs|careers)\.smartrecruiters\.com$",
+    r"(^|\.)jobs\.jobvite\.com$",
+    r"(^|\.)ats\.rippling\.com$",
+    r"(^|\.)(myworkdayjobs|applytojob)\.com$",
+    # a company's board on these lives on a subdomain; the bare domain is
+    # the vendor, which may be someone's prospect
+    r"\.(icims|bamboohr|recruitee|teamtailor)\.com$",
+    r"\.breezy\.hr$",
+    r"\.jobs\.personio\.(de|com)$",
+    # job sites named for the job: jobs.com, careers.co.uk
+    r"^(jobs|careers)\.((co|com|org|net|ac)\.)?[a-z]{2,}$",
+    # accelerators' own sites (the accelerator preset's noise)
+    r"(^|\.)(techstars|antler|joinef|southparkcommons|aigrant|a16z|pioneer|plugandplaytechcenter|plugandplay)\.",
+    r"(^|\.)(500\.co|neo\.com)$",
+    # funding news, wires and round trackers (the funding preset's noise)
+    r"(^|\.)(prnewswire|businesswire|globenewswire|accesswire|einpresswire|newswire|finsmes|axios)\.",
+    r"(^|\.)(venturebeat|siliconangle|eu-startups|sifted|geekwire|thesaasnews|fortune|bloomberg)\.",
+    r"(^|\.)(reuters|wsj|cnbc|businessinsider|privco|recentfunding|pulse2|startupfundraising)\.",
+    r"(^|\.)(startupintros|openvc|siliconcanals|startupdaily|e27|similarweb|vcbacked|roundos)\.",
+    r"(^|\.)(techfundingnews|startups\.gallery)",
+    r"(^|\.)tech\.eu$",
     # infrastructure that is never a prospect
     r"(^|\.)(google|bing|yahoo|duckduckgo|amazon|apple|microsoft)\.",
     r"(wordpress|wix|squarespace|shopify|godaddy|weebly|webflow)\.com$",
@@ -328,7 +359,11 @@ class Business:
     is_claimed: bool | None = None
     has_website: bool | None = None
     rank: int | None = None          # organic rank, when the provider gives one
+    local_pack_rank: int | None = None   # slot in Google's local 3-pack (ads excluded)
+    maps_rank: int | None = None     # position in Google Maps results
+    keyword: str = ""                # the search that produced the ranks above
     external_id: str = ""            # "<provider>:<stable id>"
+    alt_ids: tuple[str, ...] = ()    # other ids the same business was stored under
     source_url: str = ""
     provider: str = ""
     raw_title: str = ""             # SERP evidence for junk filtering before normalization
@@ -347,22 +382,81 @@ class DiscoveryQuery:
     coordinate: str = ""             # "lat,lng,radius_km" for listings providers
     depth: int = 30                  # SERP depth; ignored by listings providers
     limit: int = 100                 # max records to take from one query
+    preset: str = ""                 # PRESETS key that built it, if any
 
     def keyword(self) -> str:
         return f"{self.term} {self.location}".strip()
 
 
+# DataForSEO names places "Denver,Colorado,United States" — full state name,
+# no spaces after commas. Harvey's geography is written the way people write
+# it ("Denver, CO"), so US state abbreviations are expanded here. Anything
+# else passes through with its commas tightened; a name DataForSEO doesn't
+# know comes back as a task error, which the run reports.
+US_STATES = {
+    "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas",
+    "CA": "California", "CO": "Colorado", "CT": "Connecticut", "DE": "Delaware",
+    "DC": "District of Columbia", "FL": "Florida", "GA": "Georgia", "HI": "Hawaii",
+    "ID": "Idaho", "IL": "Illinois", "IN": "Indiana", "IA": "Iowa", "KS": "Kansas",
+    "KY": "Kentucky", "LA": "Louisiana", "ME": "Maine", "MD": "Maryland",
+    "MA": "Massachusetts", "MI": "Michigan", "MN": "Minnesota", "MS": "Mississippi",
+    "MO": "Missouri", "MT": "Montana", "NE": "Nebraska", "NV": "Nevada",
+    "NH": "New Hampshire", "NJ": "New Jersey", "NM": "New Mexico", "NY": "New York",
+    "NC": "North Carolina", "ND": "North Dakota", "OH": "Ohio", "OK": "Oklahoma",
+    "OR": "Oregon", "PA": "Pennsylvania", "RI": "Rhode Island",
+    "SC": "South Carolina", "SD": "South Dakota", "TN": "Tennessee", "TX": "Texas",
+    "UT": "Utah", "VT": "Vermont", "VA": "Virginia", "WA": "Washington",
+    "WV": "West Virginia", "WI": "Wisconsin", "WY": "Wyoming",
+}
+_US_STATE_NAMES = {v.lower(): v for v in US_STATES.values()}
+
+# DataForSEO requires a location on every SERP task. A search with no place
+# at all (the non-local YC preset) is a United States search.
+DEFAULT_LOCATION_CODE = 2840
+
+
+def dataforseo_location_name(place: str) -> str:
+    """"Denver, CO" -> "Denver,Colorado,United States"."""
+    parts = [p.strip() for p in (place or "").split(",") if p.strip()]
+    if len(parts) == 2:
+        state = US_STATES.get(parts[1].upper()) or _US_STATE_NAMES.get(parts[1].lower())
+        if state:
+            return f"{parts[0]},{state},United States"
+    return ",".join(parts)
+
+
+def _dfs_location(query: "DiscoveryQuery", point_suffix: str) -> dict:
+    """The location fields for a DataForSEO SERP task.
+
+    A geocoded point wins: rank depends on where the searcher stands, and a
+    city-centre point is the reproducible version of "searching from Denver".
+    The stored coordinate's third part is the listings radius in km, which
+    means nothing here, so only lat,lng are kept.
+    """
+    if query.coordinate:
+        lat, lng = (query.coordinate.split(",") + [""])[:2]
+        if lat.strip() and lng.strip():
+            return {"location_coordinate": f"{lat.strip()},{lng.strip()},{point_suffix}"}
+    if query.location:
+        return {"location_name": dataforseo_location_name(query.location)}
+    return {"location_code": DEFAULT_LOCATION_CODE}
+
+
 # ── Provider adapters ─────────────────────────────────────────────────
 
 
-# Values users paste straight from .env.example. Deliberately narrow — none
-# of these can appear in a live key (a Serper key is opaque alphanumerics),
-# and "example[_-]" needs the separator so a real DataForSEO login like
-# you@example.com is not flagged.
+# Match whole placeholder values, never substrings of opaque credentials.
 _PLACEHOLDER_RE = re.compile(
-    r"(?i)(placeholder|change[-_]?me|your[_-]|_here\b|paste[_-]"
-    r"|xxx{2,}|<[a-z_ -]+>|todo|fixme|example[_-])"
+    r"(?i)(placeholder|change[-_]?me|your[_-](?:api[_-])?key(?:[_-]here)?"
+    r"|paste[_-](?:api[_-])?key(?:[_-]here)?|x{4,}|<[a-z_ -]+>"
+    r"|todo|fixme|example[_-](?:api[_-])?key)"
 )
+
+
+class ProviderExhausted(RuntimeError):
+    """This provider can take no more searches in this run: its allowance or
+    rate limit is used up, or it refused the key. The run stops and says why,
+    rather than failing every remaining phrase the same way."""
 
 
 class DiscoveryProvider:
@@ -382,6 +476,12 @@ class DiscoveryProvider:
     signup_url: str = ""
     env_keys: tuple[str, ...] = ()
     caveat: str = ""
+    # Geocode cities before the run (listings search a radius; the
+    # DataForSEO rank providers search from a point).
+    needs_coordinates: bool = False
+    # Rank signals this provider measures. For each one, a search that no
+    # longer finds a business it found before records that, per phrase.
+    rank_codes: tuple[str, ...] = ()
 
     def missing_keys(self, env: dict) -> list[str]:
         """Env keys that are absent, empty, or still the template placeholder.
@@ -395,7 +495,7 @@ class DiscoveryProvider:
             if not isinstance(value, str):
                 return not value
             value = value.strip()
-            return (not value) or bool(_PLACEHOLDER_RE.search(value))
+            return (not value) or bool(_PLACEHOLDER_RE.fullmatch(value))
 
         return [k for k in self.env_keys if _missing(env.get(k))]
 
@@ -426,6 +526,7 @@ class DataForSEOListings(DiscoveryProvider):
     key = "dataforseo_listings"
     label = "DataForSEO Business Listings"
     kind = "listings"
+    needs_coordinates = True
     blurb = ("Enumerate every business of a type within a radius, with phone, "
              "domain, rating and whether the listing is claimed. Best choice "
              "for local trades, clinics and contractors.")
@@ -496,34 +597,48 @@ class DataForSEOListings(DiscoveryProvider):
             review_count=rating.get("votes_count"),
             is_claimed=item.get("is_claimed"),
             has_website=bool(url),
-            external_id=f"dataforseo:{item['place_id']}" if item.get("place_id") else "",
+            external_id=_gbp_ids(item)[0],
+            alt_ids=_gbp_ids(item)[1],
             source_url=item.get("check_url") or "",
             provider=self.key,
         )
 
 
 class DataForSEOSerp(DiscoveryProvider):
-    """Organic rank as the buying signal.
+    """Organic rank — and the local 3-pack above it — as the buying signal.
 
     Buy the rank, not the list. A business sitting at 11-30 for its own core
     search is visible enough to have tried and is losing — the single most
-    useful thing you can know before writing to them.
+    useful thing you can know before writing to them. The same response
+    carries the local pack, so who holds those three slots comes free.
     """
 
     key = "dataforseo_serp"
     label = "DataForSEO SERP (organic rank)"
     kind = "serp"
-    blurb = ("Search '<service> <city>' and record where each business ranks. "
-             "Discovers businesses you didn't have AND scores the ones you did.")
-    cost_note = "$0.0006 per 10 results — depth 30 costs $0.0018 a search"
+    needs_coordinates = True
+    blurb = ("Search '<service> <city>' from the city centre and record where "
+             "each business ranks, plus who holds the local 3-pack. Discovers "
+             "businesses you didn't have AND scores the ones you did.")
+    cost_note = "$0.002 per 10 results (Live) — depth 30 costs $0.006 a search"
     free_tier = "$1 signup credit; free sandbox; $50 minimum deposit to go live"
     signup_url = "https://app.dataforseo.com/api-access"
     env_keys = ("dataforseo_login", "dataforseo_password")
     caveat = ("Google removed 100-results-per-page in September 2025, so depth "
               "100 now costs 10x depth 10. Depth 20-30 is the sweet spot; "
-              "below rank 30 it is mostly directories anyway.")
+              "below rank 30 it is mostly directories anyway. Rank depends on "
+              "where the searcher stands — this is the view from the city centre.")
 
-    PAGE_COST = 0.0006
+    # Live mode. The standard queue is $0.0006 but asynchronous (post a task,
+    # poll for it minutes later); the run loop checks the spend cap between
+    # synchronous calls, so Live keeps that check honest.
+    PAGE_COST = 0.002
+    # The radius of the search point. DataForSEO documents it in mm
+    # (199-199999), so 2000 is 2 m: a pinpoint at the city centre, which is
+    # what "when we searched from downtown Denver" means. Chosen so that if
+    # the unit were metres it would still be 2 km, still downtown.
+    POINT_RADIUS = "2000"
+    rank_codes = ("SERP_RANK", "IN_LOCAL_PACK")
 
     def estimate(self, queries):
         # Billing is base price x number of pages, 10 results to a page.
@@ -532,39 +647,151 @@ class DataForSEOSerp(DiscoveryProvider):
     _auth = DataForSEOListings._auth
     base_url = DataForSEOListings.base_url
 
-    async def fetch(self, client, env, query):
+    async def _post(self, client, env, endpoint, task):
         r = await client.post(
-            f"{self.base_url(env)}/serp/google/organic/live/advanced",
+            f"{self.base_url(env)}/{endpoint}",
             headers={"Authorization": f"Basic {self._auth(env)}",
                      "Content-Type": "application/json"},
-            json=[{"keyword": query.keyword(), "language_code": "en",
-                   "depth": query.depth, "device": "desktop"}],
+            json=[task],
         )
         r.raise_for_status()
         data = r.json()
         self.last_cost = float(data.get("cost") or 0.0)
+        return _dfs_items(data)
 
-        out = []
-        for item in _dfs_items(data):
-            if item.get("type") != "organic":
-                continue
-            domain = normalize_domain(item.get("domain") or item.get("url") or "")
-            if not domain:
-                continue
-            out.append(Business(
-                name=business_name(item.get("title") or "", domain),
-                raw_title=item.get("title") or "",
-                domain=domain,
-                website=item.get("url") or "",
-                location=query.location,
+    async def fetch(self, client, env, query):
+        keyword = query.keyword()
+        items = await self._post(client, env, "serp/google/organic/live/advanced", {
+            "keyword": keyword, "language_code": "en", "depth": query.depth,
+            "device": "desktop", **_dfs_location(query, self.POINT_RADIUS)})
+
+        # One Business per identity: a company in the pack AND at organic 14
+        # is one prospect with two facts, not two prospects.
+        found: dict[str, Business] = {}
+        for item in items:
+            kind = item.get("type")
+            if kind == "organic":
+                domain = normalize_domain(item.get("domain") or item.get("url") or "")
+                if not domain:
+                    continue
+                biz = found.setdefault(domain, Business(
+                    name=business_name(item.get("title") or "", domain),
+                    raw_title=item.get("title") or "",
+                    domain=domain, website=item.get("url") or "",
+                    location=query.location, has_website=True,
+                    source_url=item.get("url") or "",
+                    provider=self.key, keyword=keyword))
                 # rank_group is position within organic results.
                 # `position` in this payload means left/right column, NOT rank.
-                rank=item.get("rank_group"),
-                has_website=True,
-                source_url=item.get("url") or "",
-                provider=self.key,
+                biz.rank = _best(biz.rank, item.get("rank_group"))
+            elif kind == "local_pack" and not item.get("is_paid"):
+                domain = normalize_domain(item.get("domain") or item.get("url") or "")
+                cid = item.get("cid") or ""
+                ident = domain or (f"dataforseo:cid:{cid}" if cid else "")
+                if not ident:
+                    continue
+                rating = item.get("rating") or {}
+                biz = found.get(ident)
+                if biz is None:
+                    biz = found[ident] = Business(
+                        name=item.get("title") or "", raw_title=item.get("title") or "",
+                        domain=domain, website=item.get("url") or "",
+                        location=query.location,
+                        # No website button in the pack is not proof there
+                        # is no website, so this stays unknown.
+                        has_website=True if domain else None,
+                        external_id="" if domain else ident,
+                        source_url=item.get("url") or "",
+                        provider=self.key, keyword=keyword)
+                biz.phone = biz.phone or item.get("phone") or ""
+                if rating.get("value") is not None:
+                    biz.rating = rating.get("value")
+                    biz.review_count = rating.get("votes_count")
+                biz.local_pack_rank = _best(biz.local_pack_rank, item.get("rank_group"))
+        return list(found.values())
+
+
+class DataForSEOMaps(DataForSEOSerp):
+    """Google Maps rank — the map results a local searcher actually scrolls.
+
+    Every result is a Google Business Profile, so it carries a phone, a
+    category, a rating, whether the listing is claimed and whether there is a
+    website at all. Businesses with no site are kept by their place_id.
+    """
+
+    key = "dataforseo_maps"
+    label = "DataForSEO Google Maps (map rank)"
+    kind = "serp"
+    blurb = ("Search Google Maps for '<service> <city>' and record each "
+             "business's map position, rating, category and claimed status — "
+             "including businesses with no website at all.")
+    cost_note = "$0.002 per search of up to 100 results (Live)"
+    caveat = ("Map rank depends heavily on where the searcher stands; Harvey "
+              "searches from the city centre at city zoom. Treat it as 'when we "
+              "searched from downtown', not an absolute position.")
+
+    SERP_COST = 0.002     # per SERP of up to 100 results
+    rank_codes = ("MAPS_RANK",)
+    # City-wide zoom; DataForSEO accepts 3z-21z and defaults to 17z (a few
+    # streets), which would rank only whoever is closest to the pin.
+    ZOOM = "12z"
+
+    def estimate(self, queries):
+        return sum(self.SERP_COST * max(1, -(-q.depth // 100)) for q in queries)
+
+    async def fetch(self, client, env, query):
+        keyword = query.keyword()
+        items = await self._post(client, env, "serp/google/maps/live/advanced", {
+            "keyword": keyword, "language_code": "en", "depth": query.depth,
+            **_dfs_location(query, self.ZOOM)})
+        out = []
+        for item in items:
+            # maps_paid_item is an ad; only organic map results have a rank.
+            if item.get("type") != "maps_search":
+                continue
+            url = item.get("url") or ""
+            domain = normalize_domain(item.get("domain") or url)
+            external, alt_ids = _gbp_ids(item)
+            if not (domain or external):
+                continue
+            rating = item.get("rating") or {}
+            addr = item.get("address_info") or {}
+            out.append(Business(
+                name=item.get("title") or "", raw_title=item.get("title") or "",
+                domain=domain, website=url, phone=item.get("phone") or "",
+                address=item.get("address") or "",
+                location=", ".join(x for x in (addr.get("city"), addr.get("region")) if x)
+                         or query.location,
+                category=item.get("category") or "",
+                rating=rating.get("value"), review_count=rating.get("votes_count"),
+                is_claimed=item.get("is_claimed"),
+                has_website=bool(url or domain),
+                maps_rank=item.get("rank_group"),
+                external_id=external, alt_ids=alt_ids, source_url=url,
+                provider=self.key, keyword=keyword,
             ))
         return out
+
+
+def _gbp_ids(item: dict) -> tuple[str, tuple[str, ...]]:
+    """(external_id, aliases) for a Google Business Profile result.
+
+    Keyed on cid: it is the one id the organic local pack carries too, so a
+    websiteless business seen in the pack and then on Maps is one company.
+    place_id stays an alias, because companies were stored by it before.
+    """
+    place = item.get("place_id") or ""
+    cid = str(item.get("cid") or "")
+    if cid:
+        return f"dataforseo:cid:{cid}", ((f"dataforseo:{place}",) if place else ())
+    return (f"dataforseo:{place}" if place else ""), ()
+
+
+def _best(current: int | None, new) -> int | None:
+    """The better (lower) of two ranks, ignoring missing ones."""
+    if not isinstance(new, int):
+        return current
+    return new if current is None else min(current, new)
 
 
 class Serper(DiscoveryProvider):
@@ -577,17 +804,18 @@ class Serper(DiscoveryProvider):
     key = "serper"
     label = "Serper"
     kind = "serp"
+    rank_codes = ("SERP_RANK",)
     blurb = ("Fast Google search with rank positions. The easiest one to try: "
              "2,500 free queries, no credit card, one API key.")
     cost_note = "~$0.30-$1.00 per 1,000 searches depending on plan"
     free_tier = "2,500 queries free, no card required"
     signup_url = "https://serper.dev"
     env_keys = ("serper_api_key",)
-    caveat = "Paid plans start at a $50 prepaid pack; credits expire after 6 months."
+    caveat = "Returns at most 10 results per query, including when a greater depth is requested."
 
     def estimate(self, queries):
-        # One credit per 10 results on the standard plan.
-        return sum(0.001 * max(1, -(-q.depth // 10)) for q in queries)
+        # One request per query, capped at ten results for free-account compatibility.
+        return 0.001 * len(queries)
 
     async def fetch(self, client, env, query):
         r = await client.post(
@@ -596,7 +824,7 @@ class Serper(DiscoveryProvider):
                      "Content-Type": "application/json"},
             # Free accounts reject num > 10 (HTTP 400 "Query pattern not
             # allowed for free accounts"), verified 2026-10-26.
-            json={"q": query.keyword(), "num": min(query.depth, 10)},
+            json={"q": query.keyword(), "num": max(1, min(query.depth, 10))},
         )
         r.raise_for_status()
         data = r.json()
@@ -619,6 +847,171 @@ class Serper(DiscoveryProvider):
         return out
 
 
+class TinyFish(DiscoveryProvider):
+    """TinyFish web search: free with a key, at 30 searches a minute and
+    500 an hour. Results are TinyFish's own ordering for the phrase, from
+    no particular place, so they find businesses but are not recorded as a
+    Google rank (SERP_RANK means a Google position searched from a point).
+    """
+    key = "tinyfish"
+    label = "TinyFish"
+    kind = "serp"
+    rank_codes = ()
+    blurb = ("Free web search with a key. Finds businesses by phrase; it "
+             "records no search rank, since its ordering isn't Google's.")
+    cost_note = "free"
+    free_tier = "free with a key, no card: 30 searches a minute, 500 an hour"
+    signup_url = "https://agent.tinyfish.ai/api-keys"
+    env_keys = ("tinyfish_api_key",)
+    caveat = ("Needs TINYFISH_API_KEY in .env. Harvey paces itself to 30 searches "
+              "a minute; a depth-30 phrase is 3 searches, so about 160 phrases an "
+              "hour fit in the 500. No SERP_RANK: use Serper or DataForSEO SERP "
+              "for rank signals.")
+
+    ENDPOINT = "https://api.search.tinyfish.ai"
+    # 30 a minute, with a little room, and a little under 500 an hour.
+    MIN_INTERVAL = 2.1
+    HOURLY_LIMIT = 490
+
+    def __init__(self):
+        self._last_call = 0.0
+        self._calls: list[float] = []      # this hour's, oldest first
+        self._lock: tuple | None = None     # (event loop, its lock)
+
+    async def _pace(self):
+        """Wait for the next free slot, or stop before the hour's allowance
+        is spent. Per process: a CLI run and a dashboard run at the same
+        time each keep their own count."""
+        loop = asyncio.get_running_loop()
+        if self._lock is None or self._lock[0] is not loop:
+            # One shared instance serves every run; a lock belongs to one loop.
+            self._lock = (loop, asyncio.Lock())
+        async with self._lock[1]:
+            now = time.monotonic()
+            self._calls = [t for t in self._calls if now - t < 3600]
+            if len(self._calls) >= self.HOURLY_LIMIT:
+                minutes = int((3600 - (now - self._calls[0])) // 60) + 1
+                raise ProviderExhausted(
+                    f"TinyFish allows 500 searches an hour and this hour's are used up. "
+                    f"Run again in about {minutes} minutes.")
+            wait = self._last_call + self.MIN_INTERVAL - now
+            if self._last_call and wait > 0:
+                await asyncio.sleep(wait)
+            self._last_call = time.monotonic()
+            self._calls.append(self._last_call)
+
+    def estimate(self, queries: list[DiscoveryQuery]) -> float:
+        return 0.0
+
+    async def fetch(self, client: httpx.AsyncClient, env: dict,
+                    query: DiscoveryQuery) -> list[Business]:
+        api_key = env.get("tinyfish_api_key", "").strip()
+        if not api_key:
+            raise RuntimeError("TinyFish needs TINYFISH_API_KEY in .env")
+
+        headers = {
+            "X-API-Key": api_key,
+            "Accept": "application/json",
+        }
+
+        # TinyFish returns up to 10 results per page, with page index 0..10.
+        # depth 30 = 3 pages (pages 0, 1, 2). Max supported page is 10.
+        pages_needed = max(1, min(11, -(-query.depth // 10)))
+        out: list[Business] = []
+
+        for page in range(pages_needed):
+
+            params = {
+                "query": query.keyword(),
+                "page": page,
+            }
+
+            r = None
+            for attempt in range(2):
+                await self._pace()
+                try:
+                    r = await client.get(self.ENDPOINT, headers=headers, params=params)
+                except httpx.HTTPError as e:
+                    if attempt == 0:
+                        await asyncio.sleep(1.0)
+                        continue
+                    raise RuntimeError(f"TinyFish search unreachable: {e}") from e
+
+                if r.status_code == 429:
+                    retry_after = 2.0
+                    try:
+                        retry_after = float(r.headers.get("Retry-After", "2"))
+                    except (ValueError, TypeError):
+                        pass
+                    if attempt == 0:
+                        await asyncio.sleep(min(60.0, max(1.0, retry_after)))
+                        continue
+                    raise ProviderExhausted(
+                        "TinyFish: rate limited (it allows 30 searches a minute and 500 an "
+                        "hour). Try again later, or with fewer phrases.")
+                break
+
+            if r is None:
+                raise RuntimeError("TinyFish: Request failed.")
+
+            if r.status_code == 401:
+                raise ProviderExhausted(
+                    "TinyFish: Invalid or missing API key (HTTP 401). "
+                    "Check TINYFISH_API_KEY in .env or get a free key at https://agent.tinyfish.ai/api-keys")
+            if r.status_code == 402:
+                err_msg = ""
+                try:
+                    err_data = r.json()
+                    err = err_data.get("error")
+                    if isinstance(err, dict):
+                        err_msg = err.get("message", "")
+                    elif isinstance(err, str):
+                        err_msg = err
+                except Exception:
+                    pass
+                raise ProviderExhausted(
+                    f"TinyFish refused the search (HTTP 402). {err_msg}".strip())
+            r.raise_for_status()
+
+            try:
+                data = r.json()
+            except ValueError as e:
+                raise RuntimeError("TinyFish sent an unexpected answer (not JSON)") from e
+            if not isinstance(data, dict):
+                raise RuntimeError("TinyFish sent an unexpected answer (not an object)")
+            items = data.get("results") or []
+            if not isinstance(items, list) or not items:
+                break
+
+            keyword = query.keyword()
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                url = item.get("url") or ""
+                domain = normalize_domain(url) if isinstance(url, str) else ""
+                if not domain:
+                    continue
+                title = item.get("title") or ""
+                out.append(Business(
+                    name=business_name(title, domain),
+                    raw_title=title,
+                    domain=domain,
+                    website=url,
+                    location=query.location,
+                    rank=None,
+                    has_website=True,
+                    source_url=url,
+                    provider=self.key,
+                    keyword=keyword,
+                ))
+
+            # If this page returned fewer than 10 results, no more pages exist.
+            if len(items) < 10:
+                break
+
+        return out
+
+
 class OpenStreetMap(DiscoveryProvider):
     """Genuinely free, no account, no key. Honest about what that costs you.
 
@@ -631,6 +1024,7 @@ class OpenStreetMap(DiscoveryProvider):
     key = "osm"
     label = "OpenStreetMap (Overpass)"
     kind = "listings"
+    needs_coordinates = True
     blurb = ("Free public map data. No signup, no key, no card. Try the whole "
              "pipeline for nothing before you pay anyone.")
     cost_note = "free"
@@ -760,13 +1154,18 @@ class OpenStreetMap(DiscoveryProvider):
 PROVIDERS: dict[str, DiscoveryProvider] = {
     p.key: p for p in (
         OpenStreetMap(),
+        TinyFish(),
         DataForSEOListings(),
         DataForSEOSerp(),
+        DataForSEOMaps(),
         Serper(),
     )
 }
 
 DEFAULT_PROVIDER = "osm"
+
+
+NO_SEARCH_RESULTS = 40102
 
 
 def _dfs_items(payload: dict) -> list[dict]:
@@ -783,6 +1182,9 @@ def _dfs_items(payload: dict) -> list[dict]:
     if not tasks:
         return []
     task = tasks[0]
+    if task.get("status_code") == NO_SEARCH_RESULTS:
+        # A real answer — nobody ranks for this search here — not a failure.
+        return []
     if task.get("status_code") not in (20000, None):
         raise RuntimeError(
             f"DataForSEO task {task.get('status_code')}: "
@@ -802,11 +1204,17 @@ class DiscoveryReport:
 
     provider: str = ""
     queries: int = 0
-    queries_ran: int = 0     # attempts made — 0 means nothing was collected
+    queries_ran: int = 0     # attempted provider requests
+    queries_succeeded: int = 0
     estimated_cost: float = 0.0
     actual_cost: float = 0.0
     found: int = 0
     junk: int = 0
+    # Counted apart from `junk` on purpose: junk is a judgement about whether
+    # a result is a business at all, this is a company the operator has
+    # forbidden. Folding them together would hide a do-not-contact list that
+    # has grown too broad inside a number nobody questions.
+    excluded: int = 0
     new_companies: int = 0
     known_companies: int = 0
     observations: int = 0
@@ -818,9 +1226,11 @@ class DiscoveryReport:
         return {
             "provider": self.provider, "queries": self.queries,
             "queries_ran": self.queries_ran,
+            "queries_succeeded": self.queries_succeeded,
             "estimated_cost": round(self.estimated_cost, 4),
             "actual_cost": round(self.actual_cost, 4),
             "found": self.found, "junk": self.junk,
+            "excluded": self.excluded,
             "new_companies": self.new_companies,
             "known_companies": self.known_companies,
             "observations": self.observations,
@@ -829,22 +1239,142 @@ class DiscoveryReport:
         }
 
 
+# Built-in searches beyond "your ICP". Each says how to turn an industry into
+# a search, and which kind of provider can run it.
+PRESETS = {
+    # Startups that say on their own site they're YC-backed. Never
+    # ycombinator.com itself, whose terms forbid scraping and harvesting
+    # contacts; its pages and the startup databases are excluded too.
+    "yc": {
+        "label": "YC startups",
+        "kinds": ("serp",),
+        "term": ('"backed by Y Combinator" {industry} -site:ycombinator.com '
+                 "-site:workatastartup.com -site:startupschool.org "
+                 "-site:linkedin.com -site:crunchbase.com"),
+        "local": False,
+    },
+    # Companies hiring for one of your hiring_signals roles (else ICP titles),
+    # found by their OWN careers pages. The hosted boards are excluded: a
+    # boards.greenhouse.io hit names a board, not a website to profile.
+    # Profiling then reads the board their site links to and records the
+    # role (HIRING_ROLE); the search hit alone records nothing.
+    "hiring": {
+        "label": "Companies hiring for your roles",
+        "kinds": ("serp",),
+        "term": ('"{role}" careers {industry} -site:greenhouse.io -site:lever.co '
+                 "-site:ashbyhq.com -site:workable.com -site:smartrecruiters.com "
+                 "-site:jobvite.com -site:icims.com -site:bamboohr.com -site:recruitee.com "
+                 "-site:teamtailor.com -site:personio.de -site:breezy.hr -site:applytojob.com "
+                 "-site:myworkdayjobs.com -site:ats.rippling.com -site:linkedin.com "
+                 "-site:indeed.com -site:glassdoor.com -site:ziprecruiter.com"),
+        "local": False,
+    },
+    # Startups that say on their own site an accelerator backed them. Two
+    # searches per industry, because Google reads only the first 32 words.
+    "accelerator": {
+        "label": "Accelerator startups",
+        "kinds": ("serp",),
+        "terms": (
+            '{industry} ("backed by Techstars" OR "backed by Antler" OR "backed by Entrepreneur First" '
+            'OR "backed by South Park Commons" OR "backed by 500 Global") '
+            "-site:linkedin.com -site:crunchbase.com",
+            # Not "backed by Pioneer": it finds Pioneer Square Labs and Pioneer
+            # Fund (the profile still reads a Pioneer claim on the page).
+            '{industry} ("backed by Neo" OR "backed by AI Grant" OR "a16z speedrun" '
+            'OR "backed by Plug and Play") '
+            "-site:linkedin.com -site:crunchbase.com -site:a16z.com -site:neo.com",
+        ),
+        "local": False,
+    },
+    # Companies announcing their own raise, from the last ~18 months. The
+    # news sites and databases are excluded here and filtered as junk.
+    "funding": {
+        "label": "Recently funded",
+        "kinds": ("serp",),
+        "term": ('{industry} ("we raised" OR "we\'ve raised" OR announces OR raises) '
+                 '("seed round" OR "Series A" OR "Series B") after:{since} '
+                 "-site:techcrunch.com -site:crunchbase.com -site:pitchbook.com -site:linkedin.com "
+                 "-site:prnewswire.com -site:businesswire.com -site:globenewswire.com"),
+        "local": False,
+    },
+}
+FUNDING_LOOKBACK_DAYS = 548       # ~18 months: older raises aren't news
+
+
+def preset_templates(spec: dict) -> tuple[str, ...]:
+    """A preset's search templates: one ``term``, or several ``terms``."""
+    return tuple(spec.get("terms") or (spec["term"],))
+
+# A hit on careers.acme.com is acme.com's careers page.
+_CAREERS_HOST = re.compile(r"^(careers|jobs|join|work|apply|hiring)\.", re.I)
+_SECOND_LEVEL_SUFFIX = {"co", "com", "org", "net", "ac", "gov", "edu", "ltd", "plc", "or", "ne", "go"}
+
+
+def company_host(domain: str) -> str:
+    """careers.acme.com → acme.com. Never down to a public suffix: jobs.co.uk
+    stays jobs.co.uk (and is junk), not co.uk."""
+    stripped = _CAREERS_HOST.sub("", domain)
+    labels = stripped.split(".")
+    if stripped == domain or len(labels) < 2:
+        return domain
+    if len(labels) == 2 and labels[0] in _SECOND_LEVEL_SUFFIX and len(labels[1]) == 2:
+        return domain
+    return stripped
+
+
+def preset_problem(preset: str, provider_key: str, config=None) -> str | None:
+    """Why ``preset`` can't run on ``provider_key`` (with ``config``), or None."""
+    if not preset:
+        return None
+    spec = PRESETS.get(preset)
+    if spec is None:
+        return f"Unknown preset {preset!r}. Presets: {', '.join(PRESETS)}."
+    provider = PROVIDERS.get(provider_key)
+    if provider is None or provider.kind not in spec["kinds"]:
+        names = ", ".join(k for k, p in PROVIDERS.items() if p.kind in spec["kinds"])
+        return (f"The {spec['label']} preset is a web search, so it needs a search "
+                f"provider ({names}), not {provider_key}.")
+    if any("{role}" in tpl for tpl in preset_templates(spec)) and config is not None:
+        from harvey.collectors.ats import role_keywords
+        if not role_keywords(getattr(config, "icp", None)):
+            return (f"The {spec['label']} preset searches for roles, and harvey.yaml has "
+                    "none: set icp.hiring_signals (or icp.titles).")
+    return None
+
+
 def build_queries(config, cities: list[str] | None = None,
-                  depth: int = 30, limit: int = 100) -> list[DiscoveryQuery]:
+                  depth: int = 30, limit: int = 100, preset: str = "") -> list[DiscoveryQuery]:
     """Turn the configured ICP into a concrete query list.
 
-    One query per (industry x city). Coordinates come from
+    One query per (industry or keyword variant x city). Coordinates come from
     ``icp.geo_coordinates`` when present, because listings providers need a
-    radius, not a place name.
+    radius, not a place name. A ``preset`` (PRESETS) rewrites each industry
+    into its search; a non-local one only uses cities you pass.
     """
     icp = config.icp
     terms = list(icp.industries) or [config.product.name]
-    places = cities if cities is not None else list(icp.geography) or [""]
+    spec = PRESETS.get(preset) if preset else None
+    if spec:
+        templates = preset_templates(spec)
+        since = (date.today() - timedelta(days=FUNDING_LOOKBACK_DAYS)).isoformat()
+        from harvey.collectors.ats import role_keywords
+        roles = role_keywords(icp) if any("{role}" in tpl for tpl in templates) else [""]
+        terms = [tpl.format(industry=t, role=r, since=since)
+                 for r in roles for t in terms for tpl in templates]
+        places = cities if cities is not None else ([""] if not spec["local"] else list(icp.geography) or [""])
+    else:
+        # "roofing contractor" is one way to search for a roofer. Each
+        # configured variant is another search in every city — ranks differ
+        # by phrasing, and the email should quote the phrase that was used.
+        variants = getattr(icp, "keyword_variants", {}) or {}
+        terms = list(dict.fromkeys(
+            v.strip() for t in terms for v in [t, *variants.get(t, [])] if v.strip()))
+        places = cities if cities is not None else list(icp.geography) or [""]
     coords = getattr(icp, "geo_coordinates", {}) or {}
 
     return [
         DiscoveryQuery(term=term, location=place, depth=depth, limit=limit,
-                       coordinate=coords.get(place, ""))
+                       coordinate=coords.get(place, ""), preset=preset if spec else "")
         for term in terms
         for place in places
     ]
@@ -870,7 +1400,8 @@ async def run_discovery(
     every time: the first small trial is what exposes the data-quality
     problems that would otherwise poison every market you scale to.
     """
-    from harvey.config import load_env
+    from harvey.config import live_do_not_contact, load_env
+    from harvey.gate import do_not_contact_domain_match
     from harvey.signals import seed_signal_catalog
 
     provider = PROVIDERS.get(provider_key)
@@ -878,7 +1409,7 @@ async def run_discovery(
         raise ValueError(f"unknown discovery provider: {provider_key!r}")
 
     queries = queries or build_queries(config)
-    if provider.kind == "listings":
+    if provider.needs_coordinates:
         queries = await resolve_coordinates(state, queries)
     report = DiscoveryReport(provider=provider_key, queries=len(queries))
     report.estimated_cost = provider.estimate(queries)
@@ -917,7 +1448,17 @@ async def run_discovery(
         params={"queries": len(queries), "estimate": report.estimated_cost},
     )
 
+    # Resolved once per run, not per result: the list may live in a file, and
+    # re-reading it a few hundred times would turn a config lookup into I/O
+    # inside the hot loop.
+    do_not_contact = live_do_not_contact(config)
+
+    # Each business's base facts are written once per run; its ranks once per
+    # (business, keyword), and again only if a repeat search ranks it better.
     seen: set[str] = set()
+    best_ranks: dict[tuple[str, str], tuple] = {}
+    company_ids: dict[str, str] = {}
+    ranked_in_run: dict[tuple[str, str], set[str]] = {}
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True) as client:
             for i, query in enumerate(queries):
@@ -936,7 +1477,12 @@ async def run_discovery(
                     report.queries_ran += 1
                     provider.last_cost = 0.0
                     found = await provider.fetch(client, env, query)
+                    report.queries_succeeded += 1
                     report.actual_cost += provider.last_cost
+                except ProviderExhausted as e:
+                    logger.warning("discover: %s stopped: %s", provider_key, e)
+                    report.stopped = str(e)
+                    break
                 except Exception as e:
                     # A failure is an observation about the run, not a reason
                     # to lose the queries that already succeeded.
@@ -948,21 +1494,77 @@ async def run_discovery(
                 report.found += len(found)
                 batch = []
                 for biz in found:
+                    if query.preset == "hiring" and biz.domain and not is_junk(biz.domain):
+                        # Judged on the host as found first: jobs.lever.co
+                        # stripped would be lever.co, a vendor, not junk.
+                        biz.domain = company_host(biz.domain)
                     if is_junk(biz.domain, biz.raw_title or biz.name):
                         report.junk += 1
                         continue
-                    ident = biz.identity()
-                    if not ident or ident in seen:
+                    # Before the upsert, so a forbidden company never becomes a
+                    # row and never reaches profiling. Checking it at send time
+                    # alone still lets one through discovery, where it costs
+                    # credits to enrich and sits in every cohort until somebody
+                    # notices it by eye.
+                    if do_not_contact_domain_match(biz.domain, do_not_contact):
+                        report.excluded += 1
                         continue
-                    seen.add(ident)
+                    ident = biz.identity()
+                    if not ident:
+                        continue
+                    first = ident not in seen
+                    if first:
+                        seen.add(ident)
+                        company_id, is_new = await _upsert(state, biz, query)
+                        if is_new:
+                            report.new_companies += 1
+                        else:
+                            report.known_companies += 1
+                        company_ids[ident] = company_id
+                    company_id = company_ids[ident]
+                    phrase = biz.keyword or query.keyword()
+                    for code, value in zip(RANK_CODES, _rank_tuple(biz)):
+                        if value is not None:
+                            ranked_in_run.setdefault((code, phrase), set()).add(company_id)
 
-                    company_id, is_new = await _upsert(state, biz, query)
-                    if is_new:
-                        report.new_companies += 1
-                    else:
-                        report.known_companies += 1
+                    rank_key = (ident, phrase.lower())
+                    ranks = _rank_tuple(biz)
+                    previous = best_ranks.get(rank_key)
+                    improved = previous is None or any(
+                        new is not None and (old is None or new < old)
+                        for new, old in zip(ranks, previous))
+                    if not first and not improved:
+                        continue
+                    if previous is not None:
+                        # A repeat of the same search: record only the ranks
+                        # it improved, so a worse one never becomes "latest".
+                        biz = replace(biz, **{
+                            name: (new if new is not None and (old is None or new < old)
+                                   else None)
+                            for name, new, old in zip(RANK_FIELDS, ranks, previous)})
+                    if improved:
+                        best_ranks[rank_key] = tuple(
+                            _best(old, new) for new, old in
+                            zip(ranks, previous or (None,) * len(ranks)))
                     batch.extend(_observations(biz, company_id, confirmed,
-                                               report.run_id))
+                                               report.run_id, query=query,
+                                               ranks_only=not first))
+
+                # A business this phrase ranked before, and that no search for
+                # it this run has found, is no longer ranked (within depth) or
+                # no longer in the pack. Say so, so the latest reading is true.
+                phrase = query.keyword()
+                for code in provider.rank_codes:
+                    if code not in confirmed:
+                        continue
+                    found_now = ranked_in_run.setdefault((code, phrase), set())
+                    for gone in await state.ranked_company_ids(code, phrase) - found_now:
+                        batch.append({
+                            "company_id": gone, "signal_code": code,
+                            "collector": "discover", "value_num": 0.0,
+                            "value_text": phrase, "confidence": 1.0,
+                            "evidence_url": "", "run_id": report.run_id,
+                        })
 
                 # Flush every batch. The observations are the asset; buffering
                 # them until some threshold means a run that dies loses them.
@@ -989,8 +1591,9 @@ async def _upsert(state, biz: Business, query: DiscoveryQuery) -> tuple[str, boo
     existing = None
     if biz.domain:
         existing = await state.get_company_by_domain(biz.domain)
-    if existing is None and biz.external_id:
-        existing = await state.get_company_by_external_id(biz.external_id)
+    for external in (biz.external_id, *biz.alt_ids):
+        if existing is None and external:
+            existing = await state.get_company_by_external_id(external)
     if existing:
         return existing.id, False
 
@@ -1008,9 +1611,23 @@ async def _upsert(state, biz: Business, query: DiscoveryQuery) -> tuple[str, boo
     return await state.add_company(company), True
 
 
+RANK_FIELDS = ("rank", "local_pack_rank", "maps_rank")
+RANK_CODES = ("SERP_RANK", "IN_LOCAL_PACK", "MAPS_RANK")      # same order
+
+
+def _rank_tuple(biz: Business) -> tuple:
+    return tuple(getattr(biz, name) for name in RANK_FIELDS)
+
+
 def _observations(biz: Business, company_id: str, confirmed: set[str],
-                  run_id: str) -> list[dict]:
-    """Every fact this business gave us, as rows — and only the confirmed ones."""
+                  run_id: str, query: DiscoveryQuery | None = None,
+                  ranks_only: bool = False) -> list[dict]:
+    """Every fact this business gave us, as rows — and only the confirmed ones.
+
+    Rank rows carry the search phrase in ``value_text``: "#14 for 'roofer
+    Denver, CO'" is a fact; "#14" on its own isn't. ``ranks_only`` is for a
+    business already recorded this run, found again by another search.
+    """
     rows: list[dict] = []
 
     def add(code, *, num=None, text="", conf=1.0):
@@ -1022,9 +1639,17 @@ def _observations(biz: Business, company_id: str, confirmed: set[str],
                 "run_id": run_id,
             })
 
-    add("FOUND_IN_SERP", text=biz.provider)
+    keyword = biz.keyword or (query.keyword() if query is not None else "")
     if biz.rank is not None:
-        add("SERP_RANK", num=float(biz.rank))
+        add("SERP_RANK", num=float(biz.rank), text=keyword)
+    if biz.local_pack_rank is not None:
+        add("IN_LOCAL_PACK", num=float(biz.local_pack_rank), text=keyword)
+    if biz.maps_rank is not None:
+        add("MAPS_RANK", num=float(biz.maps_rank), text=keyword)
+    if ranks_only:
+        return rows
+
+    add("FOUND_IN_SERP", text=biz.provider)
     if biz.has_website is False:
         add("NO_WEBSITE", num=1.0)
     if biz.is_claimed is False:
@@ -1033,6 +1658,16 @@ def _observations(biz: Business, company_id: str, confirmed: set[str],
         add("REVIEW_RATING", num=float(biz.rating))
     if biz.review_count is not None:
         add("REVIEW_COUNT", num=float(biz.review_count))
+    if query is not None and query.preset == "yc":
+        # The search matched "backed by Y Combinator" on a page of their own
+        # site (third-party sites are filtered out above). Short of reading
+        # that page ourselves, so below the homepage's own claim.
+        add("YC_BACKED", num=1.0, conf=0.7)
+    if query is not None and query.preset == "accelerator":
+        # Same, for the other programs; which one isn't known until the
+        # profile reads their pages. A funding hit isn't recorded: the
+        # raise's date matters, so the profile reads the hit page itself.
+        add("ACCELERATOR", num=1.0, conf=0.6)
     return rows
 
 

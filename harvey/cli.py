@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 
@@ -202,12 +203,58 @@ def cmd_status(args):
         print("\n  Harvey Pipeline Status")
         print("  " + "=" * 40)
         print(f"  Prospects:            {summary['prospects']}")
+        print(f"  Ready to write for:   {summary.get('writable_prospects', 0)} "
+              "(new, with a verified or catch-all email)")
+        write_failed = (summary.get("prospects") or {}).get("write_failed", 0)
+        if write_failed:
+            print(f"  Couldn't write for:   {write_failed} (the model's drafts kept coming back "
+                  "unusable; `harvey retry-writes` tries again)")
         print(f"  Draft campaigns:      {summary['draft_campaigns']}")
         print(f"  Active campaigns:     {summary['active_campaigns']}")
         print(f"  Open conversations:   {summary['open_conversations']}")
         by_provider = summary.get("usage_today_by_provider", {})
         print(f"  Claude calls today:   {by_provider.get('claude', summary['usage_today'])}")
         print(f"  Codex calls today:    {by_provider.get('codex', 0)}")
+        from harvey.config import compliance_notice, load_config, sending_notice
+        loaded = None
+        try:
+            loaded = load_config()
+            notice = sending_notice(loaded)
+            address_notice = compliance_notice(loaded)
+        except Exception:
+            # Status must still print when harvey.yaml is broken; that's
+            # when people run it. The --check path reports config errors.
+            notice = address_notice = ""
+        from harvey.main import unusable_backlog_notice
+        backlog = unusable_backlog_notice(summary)
+        if backlog:
+            print("  Prospecting:          PAUSED")
+            print(textwrap.fill(backlog, width=72, initial_indent="                        ",
+                                subsequent_indent="                        "))
+        if notice:
+            print("  Sending:              HELD")
+            print(textwrap.fill(notice, width=72, initial_indent="                        ",
+                                subsequent_indent="                        "))
+        hold = await state.current_sends_held()
+        if hold:
+            from harvey.sending_mode import held_message
+            waiting = len(await state.get_outbox(status="approved", limit=500))
+            _, detail = held_message(hold, waiting=waiting)
+            print("  Sending:              NOT SENDING (couldn't read your inbox)")
+            print(textwrap.fill(detail, width=72, initial_indent="                        ",
+                                subsequent_indent="                        "))
+        from harvey.integrations.precleared import current_hold, hold_message
+        precleared_hold = await current_hold(state, loaded)
+        if precleared_hold:
+            message = hold_message(precleared_hold)
+            print(f"  Precleared:           HOLDING COLD EMAIL since {precleared_hold.get('since', '?')}")
+            print(textwrap.fill(f"{message['title']}. {message['detail']}", width=72,
+                                initial_indent="                        ",
+                                subsequent_indent="                        "))
+        if address_notice:
+            print("  Postal address:       MISSING")
+            print(textwrap.fill(address_notice, width=72, initial_indent="                        ",
+                                subsequent_indent="                        "))
         from harvey.brain import BRAIN_STATUS_KEY, Brain, active_brain_status
         from harvey.config import ConfigError, load_brain_config
         try:
@@ -433,15 +480,20 @@ def cmd_outbox(args):
 
         if args.approve_all:
             n = await state.approve_outbox()
-            print(f"\n  Approved {n} email(s). They'll send on schedule.\n")
+            print(f"\n  Approved {n} email(s). They'll send on schedule.")
+            held = await state.count_held_for_review()
+            if held:
+                print(f"  {held} email(s) Harvey held for review were left out: read each one,")
+                print("  then approve it with --approve <id>.")
+            print()
             return
         if args.approve:
             n = await state.approve_outbox(args.approve)
             print(f"\n  {'Approved.' if n else 'No pending item with that id.'}\n")
             return
         if args.reject:
-            await state.update_outbox_item(args.reject, status="rejected")
-            print("\n  Rejected.\n")
+            n = await state.reject_outbox_item(args.reject)
+            print(f"\n  {'Rejected.' if n else 'Nothing waiting to send with that id (already sending or sent?).'}\n")
             return
 
         paused = await state.get_setting("sending_paused")
@@ -487,8 +539,13 @@ def cmd_profile(args):
 
         print(f"\n  {pending} companies need profiling. Reading up to "
               f"{args.limit}...\n")
+        try:
+            from harvey.config import load_config
+            config = load_config()
+        except Exception:
+            config = None   # still profiles; no role is singled out as hiring intent
         companies, observations, _ = await run_profile_stage(
-            state, limit=args.limit, stale_days=args.stale_days)
+            state, limit=args.limit, stale_days=args.stale_days, config=config)
         print(f"  Read {companies} sites → {observations} observations (free)")
         print("\n  See what turned up: harvey dashboard → Signals\n")
 
@@ -500,14 +557,14 @@ def cmd_discover(args):
     from harvey.state import StateManager
     from harvey.config import load_config, load_env
     from harvey.collectors.discover import (
-        PROVIDERS, build_queries, provider_menu, run_discovery,
+        PROVIDERS, build_queries, preset_problem, provider_menu, run_discovery,
     )
 
     async def _discover():
         if args.providers:
             print("\n  Discovery providers")
             print("  " + "=" * 68)
-            for m in provider_menu():
+            for m in provider_menu(load_env().model_dump()):
                 mark = "ready" if m["configured"] else "needs setup"
                 print(f"\n  {m['label']}  [{m['key']}]  ({mark})")
                 print(f"    {m['blurb']}")
@@ -525,13 +582,13 @@ def cmd_discover(args):
                   f"See: harvey discover --providers\n")
             return
 
-        # Fail loudly at startup - before the estimate, before any call.
+        # Fail before collection; estimates need no credentials.
         # An unconfigured provider used to end in one quiet "stopped
         # early" line and exit code 0: a silent no-op that reads as
-        # success (2026-10-24: empty SERPER_API_KEY; ClickUp 14ypx6242jj).
+        # success.
         provider = PROVIDERS[args.provider]
         missing = provider.missing_keys(load_env().model_dump())
-        if missing:
+        if missing and not args.estimate:
             names = ", ".join(k.upper() for k in missing)
             print("\n  " + "!" * 68)
             print(f"  ERROR: provider skipped: missing key - "
@@ -542,15 +599,20 @@ def cmd_discover(args):
             print("  All providers and their keys: harvey discover --providers")
             print("  " + "!" * 68 + "\n")
             raise SystemExit(1)
-        
+
         config = load_config()
         state = StateManager()
         await state.init_db()
 
         # Semicolons, not commas: "Denver, CO" is one city, not two.
         cities = [c.strip() for c in args.city.split(";") if c.strip()] or None
+        preset = getattr(args, "preset", "") or ""
+        problem = preset_problem(preset, args.provider, config=config)
+        if problem:
+            print(f"\n  {problem}\n")
+            sys.exit(2)
         queries = build_queries(config, cities=cities,
-                                depth=args.depth, limit=args.limit)
+                                depth=args.depth, limit=args.limit, preset=preset)
 
         report = await run_discovery(state, config, args.provider, queries,
                                      max_spend=args.max_spend, dry_run=True)
@@ -581,6 +643,10 @@ def cmd_discover(args):
         print(f"    {r.get('new_companies', 0)} new companies, "
               f"{r.get('known_companies', 0)} already known")
         print(f"    {r.get('junk', 0)} filtered out as directories/aggregators")
+        # Only when it happened: a "0 skipped" line every run teaches people to
+        # stop reading the block, and this is the line worth noticing.
+        if r.get("excluded"):
+            print(f"    {r['excluded']} skipped — on your do-not-contact list")
         print(f"    {r.get('observations', 0)} observations recorded")
         print(f"    actual cost: ${r.get('actual_cost', 0):.4f}")
         if r.get("stopped"):
@@ -595,13 +661,11 @@ def cmd_discover(args):
         for err in result.errors[:5]:
             print(f"    ! {err}")
 
-        # 0 queries ran means nothing was collected and nothing will be on
-        # this config — that is a failure, not a quiet success, so exit
-        # non-zero. (A mid-run stop with queries already executed keeps
-        # exit 0: the partial data was recorded and the run is resumable.)
-        if ran == 0:
+        # Empty successful searches are valid; no successful requests is not.
+        # Partial success remains usable and exits zero.
+        if r.get("queries_succeeded", 0) == 0:
             print("\n  " + "=" * 68)
-            print(f"  DISCOVERY RAN NOTHING ({r.get('stopped') or 'no queries executed'})"
+            print(f"  DISCOVERY COMPLETED NO QUERIES ({r.get('stopped') or 'no queries succeeded'})"
                   " — exiting non-zero")
             for err in (r.get("errors") or [])[:3]:
                 print(f"    - {err}")
@@ -676,6 +740,187 @@ def cmd_signals(args):
     asyncio.run(_signals())
 
 
+def cmd_retry_writes(args):
+    """Put prospects the Writer gave up on back in line for another try."""
+    from harvey.agents.writer import MAX_WRITE_ATTEMPTS
+    from harvey.state import StateManager
+
+    async def _run():
+        state = StateManager()
+        await state.init_db()
+        count = await state.retry_write_failed()
+        if count:
+            print(f"\n  {count} prospect(s) are back in line. The Writer will try each "
+                  f"up to {MAX_WRITE_ATTEMPTS} more times.\n")
+        else:
+            print("\n  No prospects are waiting on a retry.\n")
+
+    asyncio.run(_run())
+
+
+def cmd_warmup(args):
+    """Check whether the sending domain is ready for cold email."""
+    import os
+
+    from dotenv import load_dotenv
+
+    from harvey import deliverability as d
+    from harvey.agents.handler import BOUNCE_COUNT_KEY
+    from harvey.config import ConfigError, load_config
+    from harvey.paths import PROJECT_ROOT
+    from harvey.state import StateManager
+
+    load_dotenv(PROJECT_ROOT / ".env")
+    try:
+        config = load_config()
+    except ConfigError as e:
+        print(f"\n  {e}\n")
+        raise SystemExit(1)
+    email = config.channels.email
+    smtp_user = os.getenv("SMTP_USERNAME", "").strip() if email.provider == "smtp" else ""
+    sender = smtp_user if "@" in smtp_user else config.persona.email
+    domain = (args.domain or sender.rpartition("@")[2]).strip().lower().rstrip(".")
+    if not d.DOMAIN_RE.match(domain):
+        print("\n  No valid sending domain found. Pass one: harvey warmup yourdomain.com\n")
+        raise SystemExit(1)
+
+    async def _history():
+        state = StateManager()
+        await state.init_db()
+        return (await state.count_outbox_sent(),
+                int(await state.get_setting(BOUNCE_COUNT_KEY) or 0))
+
+    smtp_host = os.getenv("SMTP_HOST", "").strip() if email.provider == "smtp" else ""
+    print(f"\n  Deliverability check - {domain}")
+    print("  " + "=" * 56)
+    sections = [
+        ("Authentication", [d.check_mx(domain), d.check_spf(domain),
+                            d.check_dkim(domain, email.warmup.dkim_selector),
+                            d.check_dmarc(domain)]),
+        ("Reputation", [d.check_domain_age(domain), *d.check_domain_blocklists(domain)]
+         + (d.check_ip_blocklists(smtp_host) if smtp_host else [])),
+        ("Warmup & sending", [d.check_warmup(email.warmup, email.max_daily_sends,
+                                             provider=email.provider),
+                              _warmup_service_check(sender, email.warmup),
+                              d.check_send_history(*asyncio.run(_history()))]),
+    ]
+    icons = {d.OK: "OK  ", d.WARN: "WARN", d.FAIL: "FAIL", d.INFO: "info"}
+    failed = warned = unknown = 0
+    for title, checks in sections:
+        print(f"\n  {title}")
+        for c in checks:
+            failed += c.status == d.FAIL
+            warned += c.status == d.WARN
+            unknown += c.unknown and title == "Authentication"
+            print(f"    [{icons[c.status]}] {c.name:<26} {c.detail}")
+
+    print("\n  " + "=" * 56)
+    if failed:
+        print(f"  NOT READY - fix the {failed} FAIL item(s) before any cold email.")
+    elif unknown:
+        print(f"  NOT CHECKED - {unknown} authentication lookup(s) failed; run again.")
+    elif warned:
+        print(f"  READY WITH CAVEATS - {warned} warning(s); keep volume low.")
+    else:
+        print("  READY - send within today's cap and watch bounces.")
+    print("\n  What DNS can't tell you (the real reputation signal):")
+    print("    - Google Postmaster Tools: https://postmaster.google.com - add the domain;")
+    print("      it shows Gmail's spam rate and domain reputation once you send volume.")
+    print("    - Inbox placement: send one email to a seed test (mail-tester.com is free)")
+    print("      and aim for 9/10+. TrulyInbox shows the warmup inbox rate, and with it")
+    print("      connected (harvey trulyinbox connect) Harvey reads it into this report.")
+    print("      Wait for ~95%+ inbox for a week before relying on cold sends.\n")
+    if failed or unknown:
+        raise SystemExit(1)
+
+
+def _warmup_service_check(address: str, warmup):
+    """The 'Warmup service' line: TrulyInbox's view of the mailbox, or the recommendation."""
+    from harvey import deliverability as d
+    from harvey.integrations import trulyinbox as ti
+    from harvey.state import StateManager
+
+    async def _run():
+        state = StateManager()
+        await state.init_db()
+        health, error = await ti.current_health(address)
+        other = health is None and not error and await ti.get_choice(state) == "other"
+        return d.check_warmup_service(health, warmup, error=error, other_service=other)
+    return asyncio.run(_run())
+
+
+def cmd_trulyinbox(args):
+    """Connect TrulyInbox, record another warmup service, or show the status."""
+    import getpass
+
+    from dotenv import load_dotenv
+
+    from harvey import deliverability as d
+    from harvey.config import ConfigError, load_config
+    from harvey.integrations import trulyinbox as ti
+    from harvey.paths import PROJECT_ROOT
+    from harvey.state import StateManager
+
+    load_dotenv(PROJECT_ROOT / ".env")
+    try:
+        config = load_config()
+    except ConfigError as e:
+        print(f"\n  {e}\n")
+        raise SystemExit(1)
+    address = ti.sending_address(config)
+    warmup = config.channels.email.warmup
+
+    async def _run():
+        state = StateManager()
+        await state.init_db()
+        if args.trulyinbox_action == "other":
+            await ti.set_choice(state, "other")
+            print("\n  Noted: you use another warmup service. Harvey won't ask about "
+                  "TrulyInbox again.\n")
+            return 0
+        if args.trulyinbox_action == "connect":
+            print(f"\n  Connect TrulyInbox. Don't have it yet? {ti.AFFILIATE_URL} {ti.AFFILIATE_TAG}")
+            print("  You need Starter or higher. In TrulyInbox, open Settings > API keys and")
+            print("  create a workspace key with accounts:read, warmup:read, analytics:read")
+            print("  and workspace:read.\n")
+            if not address:
+                print(f"\n  {ti.NO_ADDRESS}\n")
+                return 1
+            key = getpass.getpass("  TrulyInbox API key (hidden): ").strip()
+            if not key:
+                print("\n  No key entered.\n")
+                return 1
+            workspace = ti.key_from_env()[1]
+            ti.forget_rejected(key)
+            try:
+                client = ti.TrulyInbox(key, workspace)
+                health = await client.mailbox_health(address)
+            except ti.TrulyInboxError as e:
+                print(f"\n  {e}\n")
+                return 1
+            from harvey.dashboard import _write_env_file
+            updates = {"TRULYINBOX_API_KEY": key}
+            if not workspace:
+                updates["TRULYINBOX_WORKSPACE_ID"] = client.workspace_id
+            try:
+                _write_env_file(updates)
+            except OSError as e:
+                print(f"\n  The key works, but Harvey couldn't save it to .env: {e}\n")
+                return 1
+            await ti.set_choice(state, "connected")
+            print("\n  Connected. " + d.check_warmup_service(health, warmup).detail + "\n")
+            return 0
+        choice = await ti.get_choice(state)
+        health, error = await ti.current_health(address)
+        print(f"\n  TrulyInbox: {ti.describe_status(health, error, choice)}")
+        check = d.check_warmup_service(health, warmup, error=error,
+                                       other_service=choice == "other")
+        print(f"  {check.detail}\n")
+        return 0
+
+    raise SystemExit(asyncio.run(_run()))
+
+
 def cmd_sending(args):
     """Pause/resume the sending kill switch."""
     from harvey.state import StateManager
@@ -698,6 +943,8 @@ def cmd_sending(args):
 
 
 def main():
+    from harvey.textio import utf8_stdio
+    utf8_stdio()
     from harvey.paths import PROJECT_ROOT
     project_root = str(PROJECT_ROOT)
 
@@ -769,8 +1016,8 @@ def main():
         help="Comma-separated statuses to include (default: verified,risky)",
     )
     sub.add_argument("--min-score", type=int, default=0, help="Minimum ICP score")
-    sub.add_argument("--status", default="", help="Comma-separated pipeline statuses (e.g. new,queued)")
-    sub.add_argument("--all", action="store_true", help="Export everything, no filters")
+    sub.add_argument("--status", default="", help="Comma-separated pipeline statuses (e.g. new,queued); opted-out contacts stay excluded")
+    sub.add_argument("--all", action="store_true", help="Export the raw list without filters, including opted-out contacts (not for outreach)")
     sub.set_defaults(func=cmd_export)
 
     # harvey gmail auth|test
@@ -809,6 +1056,15 @@ def main():
                      help="Max records per query (default: 100)")
     sub.add_argument("--max-spend", type=float, default=1.0,
                      help="Hard cap in dollars (default: 1.00)")
+    sub.add_argument("--preset", default="", choices=["", "yc", "hiring", "accelerator", "funding"],
+                     help="A built-in search instead of your ICP's industries "
+                          "(each needs a search provider like tinyfish, serper or dataforseo_serp). "
+                          "yc: startups whose own site says they're YC-backed; "
+                          "hiring: companies whose own careers pages list one of "
+                          "your hiring_signals roles (else ICP titles); "
+                          "accelerator: ones backed by Techstars, Antler, EF, SPC, 500 Global, "
+                          "Neo, AI Grant, a16z speedrun or Plug and Play; "
+                          "funding: companies announcing a raise on their own site in the last 18 months")
     sub.add_argument("--no-profile", action="store_true",
                      help="Don't profile what was found (profiling is free)")
     sub.set_defaults(func=cmd_discover)
@@ -829,10 +1085,28 @@ def main():
                      help="Comma-separated codes to turn off")
     sub.set_defaults(func=cmd_signals)
 
+    sub = subparsers.add_parser(
+        "retry-writes", help="Retry prospects the Writer couldn't write an email for")
+    sub.set_defaults(func=cmd_retry_writes)
+
     sub = subparsers.add_parser("sending", help="Kill switch: pause/resume sending")
     sub.add_argument("sending_action", nargs="?", default="status",
                      choices=["pause", "resume", "status"])
     sub.set_defaults(func=cmd_sending)
+
+    sub = subparsers.add_parser(
+        "warmup", help="Check if your sending domain is set up and warmed up for cold email")
+    sub.add_argument("domain", nargs="?", default="",
+                     help="Domain to check (default: your sending mailbox's domain)")
+    sub.set_defaults(func=cmd_warmup)
+
+    sub = subparsers.add_parser(
+        "trulyinbox", help="Warmup service: connect TrulyInbox so Harvey can read the inbox rate")
+    sub.add_argument("trulyinbox_action", nargs="?", default="status",
+                     choices=["status", "connect", "other"],
+                     help="connect a key, 'other' if you use another warmup service, "
+                          "or show the status (default)")
+    sub.set_defaults(func=cmd_trulyinbox)
 
     # harvey usage
     sub = subparsers.add_parser("usage", help="Show brain usage and quota (Claude or Codex)")

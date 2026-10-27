@@ -19,6 +19,7 @@ from harvey.state import StateManager
 logger = logging.getLogger("harvey.brain")
 
 from harvey.paths import PROJECT_ROOT
+from harvey.textio import read_user_text
 
 PROMPTS_DIR = PROJECT_ROOT / "prompts"
 SKILLS_DIR = PROJECT_ROOT / "skills"
@@ -87,6 +88,10 @@ class Brain:
         self.provider = self.config.provider
         self.model = self.config.model
         self.codex = None
+        # Whether the last think_json got no reply at all (an outage, logout,
+        # rate limit or timeout), as opposed to a reply that wasn't valid
+        # JSON. Callers that count model failures must not count outages.
+        self.last_reply_empty = False
         # Codex health (unused for Claude, whose behaviour is unchanged).
         self.unavailable = ""
         self._unavailable_at = 0.0
@@ -369,12 +374,21 @@ class Brain:
                 except Exception as e:
                     logger.warning(f"Failed to record usage event: {e}")
 
+                if payload and payload.get("is_error"):
+                    # The CLI reported an API error (overloaded, rate limited)
+                    # inside a successful exit. That text is not the model's
+                    # answer, so no caller may use it as one: retry like any
+                    # other transient failure.
+                    logger.error(f"Claude reported an error: {response[:300]}")
+                    last_error = response
+                    continue
+
                 logger.debug(f"Brain response: {response[:200]}...")
                 return response
 
             except FileNotFoundError:
                 logger.error(
-                    "Claude CLI not found. Install it: https://claude.com/download"
+                    "Claude CLI not found. Install it: https://code.claude.com/docs/en/setup"
                 )
                 return ""  # not retryable
             except asyncio.CancelledError:
@@ -573,6 +587,7 @@ class Brain:
         response = await self.think(
             full_prompt, session_id=session_id, agent=agent, task=task
         )
+        self.last_reply_empty = not response
         if not response:
             return None
         parsed = self._extract_json(response)
@@ -661,7 +676,7 @@ class Brain:
         """Load a prompt template from the prompts/ directory and fill in variables."""
         prompt_file = PROMPTS_DIR / f"{prompt_name}.md"
         try:
-            template = prompt_file.read_text()
+            template = read_user_text(prompt_file)
         except FileNotFoundError:
             logger.warning(f"Prompt file not found: {prompt_file}")
             return ""
@@ -682,7 +697,7 @@ class Brain:
         """Load a skill knowledge file from the skills/ directory."""
         skill_file = SKILLS_DIR / f"{skill_name}.md"
         try:
-            return skill_file.read_text()
+            return read_user_text(skill_file)
         except FileNotFoundError:
             logger.warning(f"Skill file not found: {skill_file}")
             return ""
